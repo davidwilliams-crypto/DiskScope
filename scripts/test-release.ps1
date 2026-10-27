@@ -28,6 +28,23 @@ try {
     Write-FixtureChecksums
     Assert-True (@(Assert-ReleasePayload $payload '1.2.3').Count -eq 7) 'Valid payload rejected.'
     Assert-Rejected { Assert-ReleasePayload $payload '9.9.9' } 'Version mismatch accepted.'
+    # build.ps1 runs this same check on the source README before compiling.
+    $payloadReadme = Join-Path $payload 'README.txt'
+    Assert-ReleaseReadmeVersion $payloadReadme '1.2.3'
+    $script:checks++
+    Assert-Rejected { Assert-ReleaseReadmeVersion $payloadReadme '1.2' } 'README version prefix accepted.'
+    Assert-Rejected { Assert-ReleaseReadmeVersion $payloadReadme '1.2.34' } 'README accepted for a longer version.'
+    $longerVersion = Join-Path $fixture 'longer-version-README.txt'
+    [IO.File]::WriteAllText($longerVersion, 'DiskScope 1.2.30 preview - Windows x64')
+    Assert-Rejected { Assert-ReleaseReadmeVersion $longerVersion '1.2.3' } 'README naming a longer version accepted.'
+    $laterLine = Join-Path $fixture 'later-line-README.txt'
+    [IO.File]::WriteAllText($laterLine, "Release notes`nDiskScope 1.2.3 preview - Windows x64")
+    Assert-Rejected { Assert-ReleaseReadmeVersion $laterLine '1.2.3' } 'README version outside the first line accepted.'
+    Assert-Rejected { Assert-ReleaseReadmeVersion (Join-Path $fixture 'absent-README.txt') '1.2.3' } 'Missing README accepted.'
+    # The shipped README must name the shipped version; a version bump that
+    # forgets scripts\portable-readme.txt fails here instead of after a release build.
+    Assert-ReleaseReadmeVersion (Join-Path $PSScriptRoot 'portable-readme.txt') (Get-ReleaseVersion $projectRoot)
+    $script:checks++
     $manifest = Join-Path $payload 'SHA256SUMS.txt'
     $original = [IO.File]::ReadAllText($manifest)
     $exe = Join-Path $payload 'DiskScope.exe'

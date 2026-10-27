@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod cli;
 pub mod diagnostics;
 pub mod engine;
 pub mod file_actions;

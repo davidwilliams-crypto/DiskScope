@@ -20,6 +20,19 @@ function Get-ReleaseVersion {
     return $version.Groups['v'].Value
 }
 
+# The first line of the portable README names the release ("DiskScope 0.3.0 ...").
+# build.ps1 checks scripts\portable-readme.txt with this before compiling, and
+# Assert-ReleasePayload checks the README.txt copied into the payload, so the
+# early check cannot accept a file the final check would reject.
+function Assert-ReleaseReadmeVersion {
+    param([string]$Path, [string]$Version)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "README is missing: $Path" }
+    $firstLine = Get-Content -LiteralPath $Path -TotalCount 1
+    if ($firstLine -notmatch ('^DiskScope ' + [regex]::Escape($Version) + '(?:\s|$)')) {
+        throw "README must start with 'DiskScope $Version' (the Cargo.toml version): $Path"
+    }
+}
+
 function Get-ReleaseFiles {
     param([string]$Directory)
     $root = Get-Item -LiteralPath $Directory -Force -ErrorAction Stop
@@ -56,8 +69,7 @@ function Assert-ReleasePayload {
         if (-not $actual.ContainsKey($required)) { throw "Required payload file missing: $required" }
     }
     if (-not @($actual.Keys | Where-Object { $_ -like 'licenses/*' }).Count) { throw 'Dependency license files are missing.' }
-    $readme = Get-Content -LiteralPath $actual['README.txt'].FullName -TotalCount 1
-    if ($readme -notmatch ('^DiskScope ' + [regex]::Escape($Version) + '(?:\s|$)')) { throw 'Payload README version does not match Cargo.toml.' }
+    Assert-ReleaseReadmeVersion -Path $actual['README.txt'].FullName -Version $Version
     $seen = @{}
     foreach ($line in Get-Content -LiteralPath $actual['SHA256SUMS.txt'].FullName) {
         if ($line -notmatch '^([a-fA-F0-9]{64})  (.+)$') { throw 'Malformed payload checksum entry.' }
