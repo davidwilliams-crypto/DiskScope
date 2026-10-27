@@ -1,10 +1,48 @@
 use diskscope::{history::*, model::*};
 use std::{
-    path::PathBuf,
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
+
+// The on-disk identity words every snapshot starts with: "DSHIST02", schema 2,
+// accounting policy 1. Spelled out here so a change to them fails loudly.
+const MAGIC: &[u8; 8] = b"DSHIST02";
+const SCHEMA: u32 = 2;
+const POLICY: u32 = 1;
+
+fn header(magic: &[u8; 8], schema: u32, policy: u32) -> Vec<u8> {
+    let mut bytes = magic.to_vec();
+    bytes.extend(schema.to_le_bytes());
+    bytes.extend(policy.to_le_bytes());
+    bytes
+}
+fn snapshot_path(store: &Path, id: u64) -> PathBuf {
+    store.join(format!("diskscope-{id:016x}.dsh"))
+}
+fn staging_path(store: &Path, id: u64) -> PathBuf {
+    store.join(format!("diskscope-{id:016x}.tmp"))
+}
+/// A file that starts with `head` and is `len` bytes long. The rest is a hole,
+/// so a "huge" file costs no disk.
+fn write_sparse(path: &Path, head: &[u8], len: u64) {
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(head).unwrap();
+    file.set_len(len).unwrap();
+}
+fn files_with_extension(store: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut files: Vec<_> = fs::read_dir(store)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|x| x == extension))
+        .collect();
+    files.sort();
+    files
+}
 
 fn model(root: PathBuf, entries: &[(&str, u64, u8)]) -> Arc<Model> {
     let mut m = Model::new(root);
@@ -50,7 +88,7 @@ fn wait(
 }
 #[test]
 fn successful_metadata_roundtrip_never_reuses_live_generation() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("scan");
     let store = dir.path().join("history");
     let service = HistoryService::new(store.clone());
@@ -75,7 +113,7 @@ fn successful_metadata_roundtrip_never_reuses_live_generation() {
 
 #[test]
 fn comparison_matches_paths_then_only_unambiguous_identity_moves() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("scan");
     let service = HistoryService::new(dir.path().join("history"));
     wait(&service, |s| !s.busy);
@@ -125,7 +163,7 @@ fn comparison_matches_paths_then_only_unambiguous_identity_moves() {
 
 #[test]
 fn comparison_matches_native_hierarchy_independently_of_enumeration_order() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("scan");
     let service = HistoryService::new(dir.path().join("history"));
     wait(&service, |s| !s.busy);
@@ -190,7 +228,7 @@ fn comparison_matches_native_hierarchy_independently_of_enumeration_order() {
 
 #[test]
 fn partial_cancelled_errors_and_overflow_never_become_baselines() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let service = HistoryService::new(dir.path().join("history"));
     wait(&service, |s| !s.busy);
     for state in [
@@ -232,7 +270,7 @@ fn partial_cancelled_errors_and_overflow_never_become_baselines() {
 
 #[test]
 fn retains_five_and_clear_leaves_unrelated_files_and_links() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join("history");
     let service = HistoryService::new(storage.clone());
     wait(&service, |s| !s.busy);
@@ -276,7 +314,7 @@ fn wait_snapshot_count(service: &HistoryService, count: usize) -> Arc<HistorySna
 
 #[test]
 fn different_roots_are_incompatible_and_rows_are_capped() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let service = HistoryService::new(dir.path().join("history"));
     wait(&service, |s| !s.busy);
     service.capture().submit(
@@ -332,7 +370,7 @@ fn different_roots_are_incompatible_and_rows_are_capped() {
 
 #[test]
 fn corrupted_metadata_never_becomes_a_complete_baseline() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     let service = HistoryService::new(store.clone());
     wait(&service, |s| !s.busy);
@@ -360,6 +398,10 @@ fn corrupted_metadata_never_becomes_a_complete_baseline() {
     let s = wait(&loaded, |s| !s.busy);
     assert!(s.scans.is_empty());
     assert!(s.message.contains("corrupt"));
+    // A file this build can never read is reclaimed and reported, not left to
+    // occupy the disk budget until the user clears everything.
+    assert!(s.message.contains("Removed 1 unreadable history file"));
+    assert!(!file.exists());
     drop(loaded);
     std::fs::write(&file, &original[..original.len() / 2]).unwrap();
     let loaded = HistoryService::new(store);
@@ -376,7 +418,7 @@ fn supports_practical_drive_metadata_budget() {
 
 #[test]
 fn ntfs_preview_and_normal_accounting_are_not_interchangeable_baselines() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let service = HistoryService::new(dir.path().join("history"));
     wait(&service, |s| !s.busy);
     let root = dir.path().join("root");
@@ -414,7 +456,7 @@ fn ntfs_preview_and_normal_accounting_are_not_interchangeable_baselines() {
 
 #[test]
 fn clear_removes_only_own_staging_and_metadata_not_neighbor_files() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     let service = HistoryService::new(store.clone());
     wait(&service, |s| !s.busy);
@@ -432,7 +474,7 @@ fn clear_removes_only_own_staging_and_metadata_not_neighbor_files() {
 
 #[test]
 fn replacing_history_directory_never_redirects_clear_to_new_contents() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     let service = HistoryService::new(store.clone());
     wait(&service, |s| !s.busy);
@@ -458,7 +500,7 @@ fn replacing_history_directory_never_redirects_clear_to_new_contents() {
 
 #[test]
 fn competing_owners_cannot_exceed_retention_or_clear_each_others_history() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     let first = HistoryService::new(store.clone());
     wait(&first, |s| !s.busy);
@@ -514,7 +556,7 @@ fn competing_owners_cannot_exceed_retention_or_clear_each_others_history() {
 
 #[test]
 fn ownership_is_released_after_detached_shutdown_for_immediate_reopen() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     for _ in 0..12 {
         let service = HistoryService::new(store.clone());
@@ -527,7 +569,7 @@ fn ownership_is_released_after_detached_shutdown_for_immediate_reopen() {
 #[test]
 #[cfg(windows)]
 fn unsafe_hardlinked_ownership_slot_is_rejected_without_changing_target() {
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     std::fs::create_dir(&store).unwrap();
     let target = dir.path().join("keep.txt");
@@ -544,7 +586,7 @@ fn unsafe_hardlinked_ownership_slot_is_rejected_without_changing_target() {
 #[test]
 fn native_unpaired_utf16_names_and_hierarchy_survive_history() {
     use std::os::windows::ffi::OsStringExt;
-    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("history");
     let root = dir.path().join("scan");
     let make = |bytes| {
@@ -605,5 +647,245 @@ fn native_unpaired_utf16_names_and_hierarchy_survive_history() {
         c.folder_changes
             .iter()
             .any(|f| f.path.ends_with("folder") && f.delta == 10)
+    );
+}
+
+#[test]
+fn unreadable_files_are_reclaimed_and_reported_so_saving_is_not_wedged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("history");
+    fs::create_dir(&store).unwrap();
+    // Five files of an older schema that together fill the whole 768 MiB budget,
+    // plus the staging file of an interrupted write.
+    let old_schema = header(MAGIC, SCHEMA - 1, POLICY);
+    for id in 1..=5 {
+        write_sparse(&snapshot_path(&store, id), &old_schema, MAX_DISK_BYTES / 5);
+    }
+    fs::write(staging_path(&store, 9), b"interrupted").unwrap();
+    fs::write(store.join("keep.txt"), b"unrelated").unwrap();
+
+    let service = HistoryService::new(store.clone());
+    let loaded = wait(&service, |s| !s.busy);
+
+    assert!(
+        loaded
+            .message
+            .contains("Removed 5 unreadable history files"),
+        "{}",
+        loaded.message
+    );
+    assert!(
+        loaded
+            .message
+            .contains("Removed 1 interrupted history write")
+    );
+    assert!(loaded.scans.is_empty());
+    assert!(files_with_extension(&store, "dsh").is_empty());
+    assert!(!staging_path(&store, 9).exists());
+    assert!(store.join("keep.txt").exists());
+
+    // Before reclamation the budget was permanently full and this save failed.
+    assert!(service.capture().submit(
+        model(dir.path().join("scan"), &[("one", 42, 1)]),
+        1,
+        ScanState::Complete,
+        "Normal".into()
+    ));
+    let saved = wait(&service, |s| s.scans.len() == 1 && !s.busy);
+    assert_eq!(saved.scans[0].logical, 42);
+    assert_eq!(files_with_extension(&store, "dsh").len(), 1);
+}
+
+#[test]
+fn newer_format_files_are_kept_untouched_and_never_block_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("history");
+    fs::create_dir(&store).unwrap();
+    // One by magic, one by schema, one by accounting policy. The first is so
+    // large that counting it against the write budget would leave no room.
+    let big_head = header(b"DSHIST03", 3, 1);
+    let big_len = MAX_DISK_BYTES - 1024 * 1024;
+    write_sparse(&snapshot_path(&store, 1), &big_head, big_len);
+    let by_schema = [header(MAGIC, SCHEMA + 1, POLICY), vec![7; 300]].concat();
+    fs::write(snapshot_path(&store, 2), &by_schema).unwrap();
+    let by_policy = [header(MAGIC, SCHEMA, POLICY + 1), vec![8; 300]].concat();
+    fs::write(snapshot_path(&store, 3), &by_policy).unwrap();
+
+    let service = HistoryService::new(store.clone());
+    let loaded = wait(&service, |s| !s.busy);
+    assert!(loaded.scans.is_empty());
+    assert!(
+        loaded
+            .message
+            .contains("Kept 3 history files written by a newer DiskScope"),
+        "{}",
+        loaded.message
+    );
+
+    // More saves than the retention limit: only this build's own files rotate.
+    for generation in 1..=7 {
+        assert!(service.capture().submit(
+            model(dir.path().join("scan"), &[("a", generation, 1)]),
+            generation,
+            ScanState::Complete,
+            "Normal".into()
+        ));
+        wait(&service, |s| {
+            !s.busy
+                && s.scans
+                    .first()
+                    .is_some_and(|x| x.live_generation == Some(generation))
+        });
+    }
+    drop(service);
+
+    assert_eq!(files_with_extension(&store, "dsh").len(), MAX_SNAPSHOTS + 3);
+    let big = snapshot_path(&store, 1);
+    assert_eq!(fs::metadata(&big).unwrap().len(), big_len);
+    let mut head = vec![0; big_head.len()];
+    fs::File::open(&big).unwrap().read_exact(&mut head).unwrap();
+    assert_eq!(head, big_head);
+    assert_eq!(fs::read(snapshot_path(&store, 2)).unwrap(), by_schema);
+    assert_eq!(fs::read(snapshot_path(&store, 3)).unwrap(), by_policy);
+
+    // A restart still reads its own five and still leaves the others alone.
+    let reloaded = HistoryService::new(store.clone());
+    let snapshot = wait(&reloaded, |s| !s.busy);
+    assert_eq!(snapshot.scans.len(), MAX_SNAPSHOTS);
+    assert!(snapshot.message.contains("Kept 3 history files"));
+}
+
+#[test]
+fn newer_format_files_beyond_the_hard_bound_stop_saving_until_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("history");
+    fs::create_dir(&store).unwrap();
+    let newer = header(b"DSHIST03", 3, 1);
+    for id in 1..=200 {
+        fs::write(snapshot_path(&store, id), &newer).unwrap();
+    }
+    let service = HistoryService::new(store.clone());
+    let loaded = wait(&service, |s| !s.busy);
+    assert!(loaded.message.contains("Kept 200 history files"));
+
+    assert!(service.capture().submit(
+        model(dir.path().join("scan"), &[("one", 1, 1)]),
+        1,
+        ScanState::Complete,
+        "Normal".into()
+    ));
+    let refused = wait(&service, |s| {
+        !s.busy && s.message.contains("newer DiskScope")
+    });
+    assert!(refused.scans.is_empty(), "{}", refused.message);
+    assert!(refused.message.contains("Clear saved scan history"));
+    assert_eq!(files_with_extension(&store, "dsh").len(), 200);
+    assert!(files_with_extension(&store, "tmp").is_empty());
+
+    // Clear is the user's explicit request to remove everything, newer files included.
+    assert!(service.forget_all());
+    wait(&service, |s| !s.busy && s.message.contains("cleared"));
+    assert!(files_with_extension(&store, "dsh").is_empty());
+    assert!(service.capture().submit(
+        model(dir.path().join("scan"), &[("one", 1, 1)]),
+        2,
+        ScanState::Complete,
+        "Normal".into()
+    ));
+    wait(&service, |s| s.scans.len() == 1 && !s.busy);
+}
+
+#[test]
+fn more_than_128_history_files_load_and_clear_always_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("history");
+    fs::create_dir(&store).unwrap();
+    let old_schema = header(MAGIC, SCHEMA - 1, POLICY);
+    for id in 1..=300 {
+        fs::write(snapshot_path(&store, id), &old_schema).unwrap();
+    }
+    for id in 1..=200 {
+        fs::write(staging_path(&store, id), b"interrupted").unwrap();
+    }
+    fs::write(store.join("keep.txt"), b"unrelated").unwrap();
+
+    // Before this change more than 128 files made history unavailable.
+    let service = HistoryService::new(store.clone());
+    let loaded = wait(&service, |s| !s.busy);
+    assert!(
+        loaded
+            .message
+            .contains("Removed 300 unreadable history files"),
+        "{}",
+        loaded.message
+    );
+    assert!(
+        loaded
+            .message
+            .contains("Removed 200 interrupted history writes")
+    );
+    assert!(!loaded.message.contains("unavailable"));
+    assert!(files_with_extension(&store, "dsh").is_empty());
+    assert!(files_with_extension(&store, "tmp").is_empty());
+
+    // Files that appear while the window is open (a sync client, a restored
+    // backup) must not defeat Clear either.
+    let newer = header(b"DSHIST03", 3, 1);
+    for id in 1..=300 {
+        let bytes = if id % 2 == 0 { &newer } else { &old_schema };
+        fs::write(snapshot_path(&store, id), bytes).unwrap();
+        fs::write(staging_path(&store, id), b"interrupted").unwrap();
+    }
+    assert!(service.forget_all());
+    let cleared = wait(&service, |s| !s.busy && s.message.contains("cleared"));
+    assert!(cleared.scans.is_empty());
+    assert!(files_with_extension(&store, "dsh").is_empty());
+    assert!(files_with_extension(&store, "tmp").is_empty());
+    assert_eq!(fs::read(store.join("keep.txt")).unwrap(), b"unrelated");
+}
+
+#[test]
+fn compare_reports_a_snapshot_damaged_after_startup_as_an_error_not_a_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("history");
+    let service = HistoryService::new(store.clone());
+    wait(&service, |s| !s.busy);
+    let root = dir.path().join("scan");
+    assert!(service.capture().submit(
+        model(root.clone(), &[("a", 10, 1)]),
+        1,
+        ScanState::Complete,
+        "Normal".into()
+    ));
+    let older = wait(&service, |s| s.scans.len() == 1 && !s.busy).scans[0].id;
+    assert!(service.capture().submit(
+        model(root, &[("a", 20, 1)]),
+        2,
+        ScanState::Complete,
+        "Normal".into()
+    ));
+    let newer = wait(&service, |s| s.scans.len() == 2 && !s.busy).scans[0].id;
+
+    // The catalog was verified at startup; the body is damaged afterwards.
+    let file = snapshot_path(&store, newer);
+    let mut bytes = fs::read(&file).unwrap();
+    let last_body_byte = bytes.len() - 9;
+    bytes[last_body_byte] ^= 1;
+    fs::write(&file, &bytes).unwrap();
+
+    assert!(service.compare(older, newer));
+    let failed = wait(&service, |s| !s.busy && s.message.contains("integrity"));
+    assert!(failed.comparison.is_none(), "{}", failed.message);
+
+    // The same damage found at the next start removes the file from the catalog.
+    drop(service);
+    let reloaded = HistoryService::new(store);
+    let catalog = wait(&reloaded, |s| !s.busy);
+    assert_eq!(catalog.scans.len(), 1);
+    assert_eq!(catalog.scans[0].id, older);
+    assert!(
+        catalog
+            .message
+            .contains("Removed 1 unreadable history file")
     );
 }
