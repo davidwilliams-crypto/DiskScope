@@ -180,11 +180,12 @@ pub fn recycle(
             return Err(ActionError::RecycleUnavailable(block));
         }
         let path = plan.path.clone();
+        let approved = plan.snapshot.clone();
         // The verified file and its ancestor guards stay alive until Windows
         // has finished; they drop when shell::recycle returns, so the leaf is
         // not held open by this process while its presence is checked below.
         let report = shell::recycle(plan, file, owner)?;
-        settle(report, native::presence(&path))?;
+        settle(report, native::presence(&path, &approved))?;
         Ok(ActionOutcome::Recycled {
             original_path: path,
         })
@@ -196,9 +197,17 @@ pub fn recycle(
     }
 }
 
-/// `TSF_DELETE_RECYCLE_IF_POSSIBLE`. Windows clears it when it already knows it
-/// will not recycle (for example a volume set to remove files immediately). It
-/// is set for an oversized file, so it can only veto, never prove a recycle.
+/// The text for an unclassified Shell failure. It must not suggest the file is
+/// safe: the sink can fail after Windows has already acted.
+#[cfg(any(windows, test))]
+fn failed_text(code: u32) -> String {
+    format!("Windows could not complete the Recycle Bin operation ({code:#010X}).")
+}
+
+/// `TSF_DELETE_RECYCLE_IF_POSSIBLE`. Reported (not yet verified on Windows) to
+/// be cleared when the Shell already knows it will not recycle, for example a
+/// volume set to remove files immediately, and to stay set for an oversized
+/// file. So it can only veto, never prove a recycle.
 #[cfg(any(windows, test))]
 const TSF_DELETE_RECYCLE_IF_POSSIBLE_BIT: u32 = 0x80;
 
@@ -229,21 +238,29 @@ struct ShellReport {
     aborted: bool,
 }
 
-/// Whether the original path still exists after the Shell returned.
+/// Whether the approved file is still at its original path after the Shell
+/// returned. This is about the file, not the name: a different file at the
+/// same path is `Absent`, and a name Windows will not let us open (a
+/// delete-pending name, an access error) is `Unknown`.
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Presence {
+    /// Opened, and its identity, size and time match the approved snapshot.
     Present,
     Absent,
-    /// Any error other than "not found", for example a delete-pending name.
     Unknown,
 }
 
+/// `observed` is the result of opening the path and comparing it with the
+/// approved snapshot: `Ok(true)` for the same file, `Ok(false)` for another.
 #[cfg(any(windows, test))]
-fn presence_of(metadata: &std::io::Result<std::fs::Metadata>) -> Presence {
-    match metadata {
-        Ok(_) => Presence::Present,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+fn presence_of(observed: &Result<bool, ActionError>) -> Presence {
+    match observed {
+        Ok(true) => Presence::Present,
+        // Another file now lives at the path.
+        Ok(false) => Presence::Absent,
+        // `native::io_error` maps file or path not found to `Changed`.
+        Err(ActionError::Changed) => Presence::Absent,
         Err(_) => Presence::Unknown,
     }
 }
@@ -358,7 +375,7 @@ mod native {
     const BITBUCKET_VOLUMES: &str =
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume";
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct Snapshot {
         pub identity: FileIdentity,
         pub size: u64,
@@ -584,8 +601,14 @@ mod native {
         recycle_policy::recycle_verdict(&facts, logical_size)
     }
 
-    pub(super) fn presence(path: &Path) -> Presence {
-        presence_of(&std::fs::symlink_metadata(path))
+    /// Opens the path without the standard library's metadata fallback (which
+    /// can list a delete-pending name as present) and compares what it finds
+    /// with the approved snapshot.
+    pub(super) fn presence(path: &Path, expected: &Snapshot) -> Presence {
+        let observed = open_file(path, false)
+            .and_then(|file| snapshot(&file))
+            .map(|found| found == *expected);
+        presence_of(&observed)
     }
 
     /// Rebuilds the owner window from its address and accepts it only if it is a
@@ -805,10 +828,7 @@ mod shell {
             E_ABORTED | E_CANCELLED | COPYENGINE_E_USER_CANCELLED | COPYENGINE_E_CANCELLED => {
                 ActionError::Cancelled
             }
-            _ => ActionError::Failed(format!(
-                "Windows could not complete the Recycle Bin operation ({:#010X}).",
-                code.0 as u32
-            )),
+            _ => ActionError::Failed(failed_text(code.0 as u32)),
         }
     }
 
@@ -1369,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization"]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization, with --test-threads=1"]
     fn recycle_sends_only_the_confirmed_fixture_to_the_bin() {
         let (directory, path, identity) = fixture();
         let sibling = directory.path().join("unselected-sibling.txt");
@@ -1400,6 +1420,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Reads this host's Recycle Bin settings; run on a standard fixed workspace volume"]
     fn prepared_plan_carries_a_recycle_verdict_that_does_not_block_the_fixture() {
         let (_directory, path, identity) = fixture();
         let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
@@ -1414,11 +1435,17 @@ mod tests {
     }
 
     #[test]
-    fn presence_reports_present_then_absent() {
+    fn presence_follows_the_approved_file_not_the_name() {
         let (_directory, path, _identity) = fixture();
-        assert_eq!(native::presence(&path), Presence::Present);
+        let file = native::open_file(&path, false).unwrap();
+        let approved = native::snapshot(&file).unwrap();
+        drop(file);
+        assert_eq!(native::presence(&path, &approved), Presence::Present);
         fs::remove_file(&path).unwrap();
-        assert_eq!(native::presence(&path), Presence::Absent);
+        assert_eq!(native::presence(&path, &approved), Presence::Absent);
+        // Something else re-created the path: the approved file is still gone.
+        fs::write(&path, b"a different, longer replacement file").unwrap();
+        assert_eq!(native::presence(&path, &approved), Presence::Absent);
     }
 
     #[test]
@@ -1427,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization"]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization, with --test-threads=1"]
     fn sink_veto_leaves_the_file_intact() {
         // Proves the central assumption that a failure HRESULT from
         // PreDeleteItem stops the Shell. If it fails the fixture is destroyed
@@ -1448,6 +1475,10 @@ mod tests {
         fs::write(&sibling, b"must remain").unwrap();
         let before = fs::read(&path).unwrap();
         let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
+        if matches!(plan.recycle_verdict(), RecycleVerdict::Blocked(_)) {
+            eprintln!("workspace volume is refused before the Shell; nothing to prove");
+            return;
+        }
         let _reset = Reset;
         shell::FORCE_SHELL_DECLINED.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
@@ -1459,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization"]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization, with --test-threads=1"]
     fn recycle_with_an_owner_window_completes() {
         use windows_sys::Win32::{
             System::Threading::GetCurrentThreadId,
@@ -1503,16 +1534,26 @@ mod tests {
             }
         });
         let (hwnd, thread) = receiver.recv().unwrap();
+        // The point of the test is an owner that is actually applied.
+        let owner = NonZeroIsize::new(hwnd).expect("the hidden window was created");
+        assert!(
+            native::own_window(owner).is_some(),
+            "a live window of this process must be accepted as the owner"
+        );
         let (_directory, path, identity) = fixture();
         let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
-        let started = std::time::Instant::now();
-        let outcome = recycle(plan, NonZeroIsize::new(hwnd));
+        // Run on a worker so a stuck prompt fails the test instead of hanging it.
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(recycle(plan, Some(owner)));
+        });
+        let outcome = outcome.recv_timeout(std::time::Duration::from_secs(10));
         // SAFETY: posts WM_QUIT to the pump thread created above.
         unsafe { PostThreadMessageW(thread, WM_QUIT, 0, 0) };
         pump.join().unwrap();
+        let outcome = outcome.expect("recycle with an owner window finished within 10 seconds");
         assert!(matches!(outcome.unwrap(), ActionOutcome::Recycled { .. }));
         assert!(!path.exists());
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
@@ -1663,7 +1704,6 @@ mod tests {
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
-    use std::io::{Error, ErrorKind};
 
     fn report(
         pre_seen: bool,
@@ -1684,7 +1724,8 @@ mod outcome_tests {
     #[test]
     fn pre_delete_check_table() {
         // 0x80 is the Shell's *request* bit: it can veto but never prove a
-        // recycle (it is still set for a file larger than the Bin maximum).
+        // recycle (reported, not yet verified, to stay set for a file larger
+        // than the Bin maximum).
         assert_eq!(pre_delete_check(true, 0x282), Ok(()));
         assert_eq!(
             pre_delete_check(true, 0x202),
@@ -1698,17 +1739,33 @@ mod outcome_tests {
 
     #[test]
     fn presence_of_table() {
-        assert_eq!(
-            presence_of(&std::fs::symlink_metadata(std::env::temp_dir())),
-            Presence::Present
-        );
-        for (kind, expected) in [
-            (ErrorKind::NotFound, Presence::Absent),
-            (ErrorKind::PermissionDenied, Presence::Unknown),
-            (ErrorKind::Other, Presence::Unknown),
+        assert_eq!(presence_of(&Ok(true)), Presence::Present);
+        // A different file at the same path is not the approved file.
+        assert_eq!(presence_of(&Ok(false)), Presence::Absent);
+        assert_eq!(presence_of(&Err(ActionError::Changed)), Presence::Absent);
+        // A name we cannot open, such as a delete-pending one, is unknown.
+        for error in [
+            ActionError::PermissionDenied,
+            ActionError::Busy,
+            ActionError::NotRegularFile,
+            ActionError::InvalidPath,
+            ActionError::Failed("x".into()),
         ] {
-            assert_eq!(presence_of(&Err(Error::from(kind))), expected, "{kind:?}");
+            assert_eq!(
+                presence_of(&Err(error.clone())),
+                Presence::Unknown,
+                "{error:?}"
+            );
         }
+    }
+
+    #[test]
+    fn unclassified_shell_failures_do_not_suggest_the_file_is_safe() {
+        let text = failed_text(0x8000_4005);
+        assert!(text.contains("0x80004005"), "{text}");
+        assert!(!text.contains("fallback"), "{text}");
+        assert!(!text.contains("No permanent"), "{text}");
+        assert!(!text.contains("Nothing was changed"), "{text}");
     }
 
     #[test]

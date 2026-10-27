@@ -141,7 +141,16 @@ enum Operation {
 }
 
 const RESCAN_LINE: &str = "\n\nDiskScope is rescanning so the list matches the drive.";
-const RECYCLE_CONFIRMATION: &str = "Windows will move this file to the Recycle Bin. DiskScope checked this drive's Recycle Bin settings and the file size first, but Windows makes the final decision. If Windows asks whether to delete the file permanently instead, choose No.";
+const RECYCLE_CONFIRMATION_CHECKED: &str = "Windows will move this file to the Recycle Bin. DiskScope checked this drive's Recycle Bin settings and the file size first, but Windows makes the final decision. If Windows asks whether to delete the file permanently instead, choose No.";
+const RECYCLE_CONFIRMATION_UNVERIFIED: &str = "Windows will move this file to the Recycle Bin. DiskScope could not fully check this drive's Recycle Bin settings, so Windows alone decides. If Windows asks whether to delete the file permanently instead, choose No.";
+
+fn recycle_confirmation(verdict: RecycleVerdict) -> &'static str {
+    if verdict == RecycleVerdict::Unverified {
+        RECYCLE_CONFIRMATION_UNVERIFIED
+    } else {
+        RECYCLE_CONFIRMATION_CHECKED
+    }
+}
 
 /// What to show and whether to rescan once a file action has finished.
 struct Completion {
@@ -239,7 +248,7 @@ fn running_lines(action: FileAction, elapsed: Duration) -> Vec<&'static str> {
         lines.push("If Windows asks whether to delete the file permanently, choose No.");
         if elapsed >= Duration::from_secs(3) {
             lines.push(
-                "Windows may be waiting for your answer in another window. Look for it in front of DiskScope or in the taskbar, or press Alt+Tab.",
+                "Windows may be waiting for your answer in another window. If DiskScope is minimised, restore it; otherwise look in front of DiskScope or press Alt+Tab.",
             );
         }
     }
@@ -690,16 +699,7 @@ impl DiskScopeApp {
                         ui.label("Type DELETE to enable permanent deletion:");
                         ui.add(egui::TextEdit::singleline(&mut confirmation.typed).char_limit(6).desired_width(240.0));
                     } else {
-                        ui.label(RECYCLE_CONFIRMATION);
-                        if confirmation.plan.recycle_verdict() == RecycleVerdict::Unverified {
-                            ui.label(
-                                RichText::new(
-                                    "DiskScope could not fully check this drive's Recycle Bin settings.",
-                                )
-                                .small()
-                                .color(p.muted),
-                            );
-                        }
+                        ui.label(recycle_confirmation(confirmation.plan.recycle_verdict()));
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -1156,9 +1156,21 @@ mod tests {
 
     #[test]
     fn recycle_confirmation_copy_does_not_overpromise() {
-        assert!(RECYCLE_CONFIRMATION.contains("Windows makes the final decision"));
-        assert!(RECYCLE_CONFIRMATION.contains("choose No"));
-        assert!(!RECYCLE_CONFIRMATION.contains("fails without falling back"));
+        let checked = recycle_confirmation(RecycleVerdict::Likely);
+        let unverified = recycle_confirmation(RecycleVerdict::Unverified);
+        assert_ne!(checked, unverified);
+        assert!(checked.contains("Windows makes the final decision"));
+        // When the check could not run, the copy must not claim it did.
+        assert!(!unverified.contains("checked"));
+        assert!(unverified.contains("could not fully check"));
+        for text in [checked, unverified] {
+            assert!(text.contains("choose No"), "{text}");
+            assert!(!text.contains("fails without falling back"), "{text}");
+        }
+        assert!(
+            super::controls::FILE_ACTION_HELP.contains("final decision"),
+            "Help must not promise that Recycle always stops"
+        );
     }
 
     #[test]

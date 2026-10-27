@@ -9,10 +9,11 @@ A separate setup installer is also available for this release.
 Run DiskScope.exe, choose a folder or drive, then select Scan.
 Opening the application does not start a scan. Stop scanning keeps partial results.
 File actions are available for selected local regular files after scanning stops.
-Recycle Bin is the default in standard mode. DiskScope stops if Windows would delete
-the file instead of recycling it; if Windows still asks about permanent deletion,
-choose No. Permanent deletion requires a separate confirmation, a checkbox and
-typing DELETE. Folders and links cannot be deleted.
+Recycle Bin is the default in standard mode. DiskScope checks first and stops when it
+can tell Windows would delete the file instead of recycling it (best effort); Windows
+makes the final decision, so if it asks about permanent deletion, choose No.
+Permanent deletion requires a separate confirmation, a checkbox and typing DELETE.
+Folders and links cannot be deleted.
 Hard links mean deleting one name may not reclaim its displayed size.
 
 Run as administrator explicitly requests Windows UAC consent and opens a new

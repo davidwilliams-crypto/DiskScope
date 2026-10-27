@@ -121,10 +121,12 @@ pub fn recycle_verdict(facts: &RecycleFacts, size: u64) -> RecycleVerdict {
     let capacity = if facts.volume_resolved {
         match facts.volume_max_capacity_mb {
             Setting::Value(mb) => Some(u64::from(mb).saturating_mul(MIB)),
+            // Windows records the default as whole MiB, so a file between the
+            // recorded limit and the unrounded estimate is already too large.
             Setting::Absent => facts
                 .volume_total_bytes
                 .filter(|total| *total > 0)
-                .map(default_capacity_bytes),
+                .map(|total| default_capacity_bytes(total) / MIB * MIB),
             Setting::Unreadable => None,
         }
     } else {
@@ -189,7 +191,7 @@ impl RecycleBlock {
             Self::DeletesImmediately => "This drive is set to remove files immediately instead of using the Recycle Bin, so Windows would delete this file permanently.".into(),
             Self::TooLarge { limit: 0, .. } => "This drive's Recycle Bin has a maximum size of 0, so Windows would delete this file permanently.".into(),
             Self::TooLarge { size, limit } => format!(
-                "This file ({}) is too large for this drive's Recycle Bin (limit about {}), so Windows would delete it permanently. If you raised the limit recently, restart DiskScope.",
+                "This file ({}) is too large for this drive's Recycle Bin (limit about {}), so Windows would delete it permanently.",
                 format_size(size),
                 format_size(limit)
             ),
@@ -235,6 +237,14 @@ mod tests {
                 "{size}"
             );
         }
+        // Windows recorded 18685 MiB for this volume: the first size it refuses.
+        assert_eq!(
+            recycle_verdict(&facts, 18685 * MIB),
+            RecycleVerdict::Blocked(RecycleBlock::TooLarge {
+                size: 18685 * MIB,
+                limit: 18685 * MIB,
+            })
+        );
     }
 
     #[test]

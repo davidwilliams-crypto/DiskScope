@@ -407,9 +407,7 @@ impl DiskScopeApp {
                 ] {
                     detail(ui, key, action, p);
                 }
-                ui.label(
-                    "Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE. Move to Recycle Bin stops if Windows would delete the file instead; if Windows still asks about permanent deletion, choose No.",
-                );
+                ui.label(FILE_ACTION_HELP);
                 ui.add_space(10.0);
                 ui.label(
                     "Map items have names and logical sizes. The table offers the same objects and paths.",
@@ -417,6 +415,9 @@ impl DiskScopeApp {
             });
     }
 }
+/// Explains what the file-action keys do and what they cannot promise.
+pub(super) const FILE_ACTION_HELP: &str = "Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE. Move to Recycle Bin is checked first and stops when Windows would clearly delete the file instead, but Windows makes the final decision; if it asks about permanent deletion, choose No.";
+
 /// `(min_bytes, max_bytes, modified_after, modified_before)` as parsed from
 /// the filter dialog.
 type FilterBounds = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
