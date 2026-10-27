@@ -2,7 +2,6 @@
 use super::*;
 use std::{
     io,
-    os::windows::ffi::OsStrExt,
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
@@ -50,18 +49,11 @@ struct Geometry {
     total_clusters: u64,
     mft_lcn: u64,
 }
-fn root_drive(root: &Path) -> Result<u16> {
-    let wide: Vec<_> = root.as_os_str().encode_wide().collect();
-    if wide.len() != 3
-        || wide[1] != 58
-        || wide[2] != 92
-        || !((65..=90).contains(&wide[0]) || (97..=122).contains(&wide[0]))
-    {
-        return Err(err(
-            "NTFS acceleration requires an exact local drive root such as C:\\",
-        ));
-    }
-    Ok(wide[0])
+/// The drive letter of an exact drive root. The engine chooses this backend with the same
+/// predicate (`drive_root_letter`), so it can never route a path here that this rejects.
+fn root_drive(root: &Path) -> Result<u8> {
+    drive_root_letter(root)
+        .ok_or_else(|| err("NTFS acceleration requires an exact local drive root such as C:\\"))
 }
 fn is_volume_device(target: &[u16]) -> bool {
     let prefix: Vec<_> = "\\Device\\HarddiskVolume".encode_utf16().collect();
@@ -383,7 +375,8 @@ pub fn scan_volume(
     if cancelled() {
         return Err(err("NTFS scan cancelled"));
     }
-    let drive = root_drive(root)?;
+    let letter = root_drive(root)?;
+    let drive = u16::from(letter);
     let root_wide = [drive, 58, 92, 0];
     // DRIVE_REMOVABLE=2, DRIVE_FIXED=3. Reject remote, substituted and unknown roots.
     if !matches!(unsafe { GetDriveTypeW(root_wide.as_ptr()) }, 2 | 3) {
@@ -409,7 +402,7 @@ pub fn scan_volume(
             "Substituted or unsupported volume device; use normal enumeration",
         ));
     }
-    let letter = char::from_u32(drive as u32).unwrap();
+    let letter = char::from(letter);
     let volume = open(&format!("\\\\.\\{letter}:"), GENERIC_READ)?;
     let g = geometry(&volume, &cancelled)?;
     let mft = open(&format!("\\\\?\\{letter}:\\$MFT"), 0)?;
@@ -422,6 +415,11 @@ pub fn scan_volume(
     let mut storage = ReadBuffer::new(READ_BUDGET)?;
     let buffer = storage.bytes();
     let mut records = Vec::new();
+    let mut parse_scratch = ParseScratch::default();
+    let layout = MftLayout {
+        record_size: g.record as usize,
+        sector_size: g.sector as usize,
+    };
     let mut offset = 0;
     while offset < g.mft_length {
         if cancelled() {
@@ -453,26 +451,15 @@ pub fn scan_volume(
                 Ok(())
             },
         )?;
-        for (n, raw) in buffer[..size].chunks_exact(g.record as usize).enumerate() {
-            if n % 256 == 0 && cancelled() {
-                return Err(err("NTFS scan cancelled"));
-            }
-            let index = offset / g.record + n as u64;
-            if index < 16 && index != 5 {
-                continue;
-            }
-            // Extension records belonging to the excluded NTFS metadata files
-            // must not appear as user files or force parsing their private data.
-            let base = u64_at(raw, 32)?;
-            if base != 0 && base & INDEX_MASK < 16 && base & INDEX_MASK != 5 {
-                continue;
-            }
-            if let Some(record) = parse_record(raw, index, g.sector as usize)
-                .map_err(|e| err(&format!("MFT record {index}: {e}")))?
-            {
-                records.push(record);
-            }
-        }
+        // Fixups are applied in place; the buffer is refilled by the next read.
+        parse_mft_records(
+            &mut buffer[..size],
+            offset / g.record,
+            layout,
+            &mut parse_scratch,
+            &cancelled,
+            &mut records,
+        )?;
         offset += size as u64;
         progress(NtfsProgress {
             records: offset / g.record,
@@ -492,6 +479,7 @@ pub fn scan_volume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     #[test]
     fn raw_volume_read_buffer_is_sector_aligned_and_bounded() {
         let mut buffer = ReadBuffer::new(READ_BUDGET).unwrap();
@@ -593,7 +581,7 @@ mod tests {
     }
     #[test]
     fn only_exact_drive_roots_are_eligible() {
-        assert_eq!(root_drive(Path::new("C:\\")).unwrap(), b'C' as u16);
+        assert_eq!(root_drive(Path::new("C:\\")).unwrap(), b'C');
         for path in [
             "C:",
             "C:\\folder",

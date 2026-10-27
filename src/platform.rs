@@ -161,7 +161,8 @@ mod windows {
             )
         } != 0)
             .then_some(id.VolumeSerialNumber);
-        // u64 storage supplies the eight-byte alignment required by directory records.
+        // u64 storage supplies the eight-byte alignment required by directory records. The
+        // allocation is zeroed, so the first call already sees a clean buffer.
         let mut storage = vec![0u64; 8192];
         let capacity = storage.len() * size_of::<u64>();
         let mut first = true;
@@ -169,7 +170,13 @@ mod windows {
             if cancelled() {
                 return Ok(true);
             }
-            storage.fill(0);
+            // Clear a buffer that an earlier call wrote to. The API reports no byte count, so the
+            // record walk below cannot tell where the new page ends; zeroing guarantees it can
+            // never reach records left over from the previous page. The first call skips this:
+            // the buffer is still the zeroed allocation (a small directory needs only one call).
+            if !first {
+                storage.fill(0);
+            }
             // SAFETY: writable aligned 64 KiB buffer; passed size is its actual capacity.
             let success = unsafe {
                 GetFileInformationByHandleEx(
