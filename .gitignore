@@ -5,14 +5,13 @@ target/
 target-scanner/
 target-gui/
 dist/
-research/artifacts/
-research/*.json
-research/diskscope-ui-fixture/
-research/benchmark-fixture/
-research/benchmark/
-research/benchmark-*/
 
 # Local research captures and development coordination are not public source.
+# research/ is ignored as a whole. That already covers what used to be listed
+# one by one: downloaded comparison tools (research/artifacts), raw scan reports
+# (research/*.json), the UI fixture and the benchmark fixtures and output
+# (research/benchmark*). Git cannot re-include a file under an excluded
+# directory, so narrower patterns below research/ would never take effect.
 research/
 docs/superpowers/
 docs/execution-decisions.md

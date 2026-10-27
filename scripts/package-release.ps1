@@ -22,6 +22,9 @@ if (-not $NsisCompiler) {
 $NsisCompiler = (Resolve-Path -LiteralPath $NsisCompiler -ErrorAction Stop).ProviderPath
 $nsisNotices = Join-Path (Split-Path -Parent $NsisCompiler) 'COPYING'
 if (-not (Test-Path -LiteralPath $nsisNotices -PathType Leaf)) { throw 'NSIS COPYING notices are required beside the compiler.' }
+# build.ps1 checks scripts\portable-readme.txt against Cargo.toml before it
+# compiles anything. With -SkipBuild the existing payload's own README.txt is
+# validated by Assert-ReleasePayload below instead.
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Offline:$Offline -PackageDirectory $PackageDirectory }
 $files = @(Assert-ReleasePayload -Directory $PackageDirectory -Version $version)
 $packageRoot = (Resolve-Path -LiteralPath $PackageDirectory).ProviderPath.TrimEnd('\', '/')
