@@ -1558,7 +1558,12 @@ impl eframe::App for DiskScopeApp {
         // eframe runs logic even when a minimized window does not paint.
         self.poll(ctx);
     }
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // The handle is only available on the event-loop thread, which is where
+        // ui() runs. Windows parents its own prompts to it during Recycle.
+        if self.management.owner.is_none() {
+            self.management.owner = management::native_window_id(frame);
+        }
         let ctx = ui.ctx().clone();
         if !self.management.busy() {
             self.file_action_keyboard(&ctx);

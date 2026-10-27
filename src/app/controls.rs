@@ -400,7 +400,7 @@ impl DiskScopeApp {
                     ("Alt ← / Alt →", "Back / Forward with your context"),
                     ("Tab / Shift Tab", "Move keyboard focus"),
                     ("Space / Enter", "Activate the focused control or map item"),
-                    ("Delete", "Open Recycle Bin confirmation for the selected file"),
+                    ("Delete", "Check Recycle Bin availability, then open the confirmation for the selected file"),
                     ("Shift Delete", "Open permanent-delete confirmation for the selected file"),
                     ("Escape", "Cancel a confirmation or close a dialog"),
                     ("F1", "Keyboard help"),
@@ -408,7 +408,7 @@ impl DiskScopeApp {
                     detail(ui, key, action, p);
                 }
                 ui.label(
-                    "Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE.",
+                    "Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE. Move to Recycle Bin stops if Windows would delete the file instead; if Windows still asks about permanent deletion, choose No.",
                 );
                 ui.add_space(10.0);
                 ui.label(

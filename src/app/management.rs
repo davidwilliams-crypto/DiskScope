@@ -1,8 +1,9 @@
 use super::*;
 use diskscope::{
     admin::ElevationOutcome,
-    file_actions::{self, ActionError, ActionOutcome, RecyclePlan},
+    file_actions::{self, ActionError, ActionOutcome, RecycleBlock, RecyclePlan, RecycleVerdict},
 };
+use std::num::NonZeroIsize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AccessMode {
@@ -112,7 +113,16 @@ struct Binding {
     generation: u64,
     node: NodeId,
     root: PathBuf,
+    /// The selected file, so every outcome message can name it.
+    path: PathBuf,
     action: FileAction,
+}
+
+/// A modal the user must acknowledge: a refusal or a surprising outcome.
+/// It offers no destructive action; it only points at the separate flows.
+struct Report {
+    heading: &'static str,
+    body: String,
 }
 
 struct Confirmation {
@@ -127,6 +137,128 @@ enum Operation {
     Preparing(Binding),
     Confirming(Confirmation),
     Running(Binding),
+    Report(Report),
+}
+
+const RESCAN_LINE: &str = "\n\nDiskScope is rescanning so the list matches the drive.";
+const RECYCLE_CONFIRMATION: &str = "Windows will move this file to the Recycle Bin. DiskScope checked this drive's Recycle Bin settings and the file size first, but Windows makes the final decision. If Windows asks whether to delete the file permanently instead, choose No.";
+
+/// What to show and whether to rescan once a file action has finished.
+struct Completion {
+    notice: String,
+    report: Option<Report>,
+    rescan: bool,
+}
+
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn blocked_report(path: &std::path::Path, block: RecycleBlock) -> Report {
+    Report {
+        heading: "Recycle Bin is not available for this file",
+        body: format!(
+            "{}\n\n{}\n\nTo remove the file anyway, close this and choose Delete permanently… (Shift+Delete). That asks for its own confirmation: a checkbox and typing DELETE.",
+            path.display(),
+            ActionError::RecycleUnavailable(block)
+        ),
+    }
+}
+
+fn report_for(path: &std::path::Path, error: &ActionError) -> Option<Report> {
+    let heading = match error {
+        ActionError::RecycleUnavailable(block) => return Some(blocked_report(path, *block)),
+        ActionError::DeletedNotRecycled => "Windows deleted this file instead of recycling it",
+        ActionError::RecycleOutcomeUnconfirmed => "The Recycle Bin result could not be confirmed",
+        _ => return None,
+    };
+    Some(Report {
+        heading,
+        body: format!("{}\n\n{error}", path.display()),
+    })
+}
+
+/// Decides the notice, the modal and the rescan for a finished action. A rescan
+/// follows every result in which the file may no longer exist, so the list
+/// never keeps a row for a deleted file.
+fn completion_effects(
+    path: &std::path::Path,
+    result: &Result<ActionOutcome, ActionError>,
+) -> Completion {
+    match result {
+        Ok(outcome) => Completion {
+            notice: match outcome {
+                ActionOutcome::Recycled { original_path } => {
+                    format!("Moved to Recycle Bin: {}", original_path.display())
+                }
+                ActionOutcome::DeletionRequested { original_path } => format!(
+                    "Permanent deletion requested: {}. Windows may finish when remaining handles close.",
+                    original_path.display()
+                ),
+            },
+            report: None,
+            rescan: true,
+        },
+        Err(error) => {
+            let name = file_label(path);
+            Completion {
+                notice: match error {
+                    ActionError::RecycleUnavailable(_) => {
+                        format!("Not moved to the Recycle Bin: {name}. Nothing was changed.")
+                    }
+                    ActionError::DeletedNotRecycled => format!(
+                        "Deleted instead of recycled: {name}. It is not in the Recycle Bin."
+                    ),
+                    ActionError::RecycleOutcomeUnconfirmed => format!(
+                        "Recycle Bin result not confirmed: {name} is no longer where it was."
+                    ),
+                    other => other.to_string(),
+                },
+                report: report_for(path, error),
+                rescan: error.file_may_be_gone(),
+            }
+        }
+    }
+}
+
+/// A Recycle request whose preflight already predicts a permanent delete is
+/// shown as a refusal instead of a confirmation. Permanent deletion never
+/// consults the verdict.
+fn prepared_block(action: FileAction, verdict: RecycleVerdict) -> Option<RecycleBlock> {
+    match (action, verdict) {
+        (FileAction::Recycle, RecycleVerdict::Blocked(block)) => Some(block),
+        _ => None,
+    }
+}
+
+fn running_lines(action: FileAction, elapsed: Duration) -> Vec<&'static str> {
+    let mut lines = vec!["Waiting for Windows…"];
+    if action == FileAction::Recycle {
+        lines.push("If Windows asks whether to delete the file permanently, choose No.");
+        if elapsed >= Duration::from_secs(3) {
+            lines.push(
+                "Windows may be waiting for your answer in another window. Look for it in front of DiskScope or in the taskbar, or press Alt+Tab.",
+            );
+        }
+    }
+    lines
+}
+
+/// The main window's handle, available only on the event-loop thread. The
+/// Shell uses it to keep its own prompts in front of DiskScope.
+#[cfg(windows)]
+pub(super) fn native_window_id(frame: &eframe::Frame) -> Option<NonZeroIsize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd),
+        _ => None,
+    }
+}
+#[cfg(not(windows))]
+pub(super) fn native_window_id(_frame: &eframe::Frame) -> Option<NonZeroIsize> {
+    None
 }
 
 enum ManagementResult {
@@ -141,6 +273,10 @@ pub(super) struct Management {
     sequence: u64,
     operation: Option<Operation>,
     elevating: bool,
+    /// The main window, captured once from the UI thread.
+    pub(super) owner: Option<NonZeroIsize>,
+    /// When the current action started running, for the waiting hint.
+    running_since: Option<Instant>,
 }
 
 impl Default for Management {
@@ -152,6 +288,8 @@ impl Default for Management {
             sequence: 0,
             operation: None,
             elevating: false,
+            owner: None,
+            running_since: None,
         }
     }
 }
@@ -328,6 +466,7 @@ impl DiskScopeApp {
             generation: self.generation,
             node: row.id,
             root: self.snapshot.progress.root.clone(),
+            path: row.path.clone(),
             action,
         };
         self.management.operation = Some(Operation::Preparing(binding.clone()));
@@ -372,13 +511,20 @@ impl DiskScopeApp {
                     }
                     match result {
                         Ok(plan) => {
-                            self.management.operation = Some(Operation::Confirming(Confirmation {
-                                binding,
-                                plan,
-                                acknowledged: false,
-                                typed: String::new(),
-                                focus_cancel: true,
-                            }))
+                            self.management.operation = Some(
+                                match prepared_block(binding.action, plan.recycle_verdict()) {
+                                    Some(block) => {
+                                        Operation::Report(blocked_report(&binding.path, block))
+                                    }
+                                    None => Operation::Confirming(Confirmation {
+                                        binding,
+                                        plan,
+                                        acknowledged: false,
+                                        typed: String::new(),
+                                        focus_cancel: true,
+                                    }),
+                                },
+                            )
                         }
                         Err(error) => self.notice = Some(error.to_string()),
                     }
@@ -389,25 +535,23 @@ impl DiskScopeApp {
                         continue;
                     }
                     self.management.operation = None;
-                    match result {
-                        Ok(outcome) => {
-                            let message = match outcome {
-                                ActionOutcome::Recycled { original_path } => {
-                                    format!("Moved to Recycle Bin: {}", original_path.display())
-                                }
-                                ActionOutcome::DeletionRequested { original_path } => format!(
-                                    "Permanent deletion requested: {}. Windows may finish when remaining handles close.",
-                                    original_path.display()
-                                ),
-                            };
-                            if self.generation == binding.generation
-                                && self.root_path == binding.root
-                            {
-                                self.begin_scan(binding.root);
-                            }
-                            self.notice = Some(message);
+                    self.management.running_since = None;
+                    let effects = completion_effects(&binding.path, &result);
+                    // begin_scan ignores requests while an operation is active,
+                    // so it runs after the operation is cleared and before the
+                    // report (an operation) and the notice (cleared by it).
+                    let rescanned = effects.rescan
+                        && self.generation == binding.generation
+                        && self.root_path == binding.root;
+                    if rescanned {
+                        self.begin_scan(binding.root.clone());
+                    }
+                    self.notice = Some(effects.notice);
+                    if let Some(mut report) = effects.report {
+                        if rescanned {
+                            report.body.push_str(RESCAN_LINE);
                         }
-                        Err(error) => self.notice = Some(error.to_string()),
+                        self.management.operation = Some(Operation::Report(report));
                     }
                 }
                 ManagementResult::Elevation(result) => {
@@ -454,13 +598,15 @@ impl DiskScopeApp {
             return;
         }
         self.management.operation = Some(Operation::Running(binding.clone()));
+        self.management.running_since = Some(Instant::now());
+        let owner = self.management.owner;
         let tx = self.management.tx.clone();
         let ctx = ctx.clone();
         let started = std::thread::Builder::new()
             .name("confirmed-file-action".into())
             .spawn(move || {
                 let result = match binding.action {
-                    FileAction::Recycle => file_actions::recycle(plan),
+                    FileAction::Recycle => file_actions::recycle(plan, owner),
                     FileAction::Permanent => file_actions::delete_permanently(plan),
                 };
                 let _ = tx.send(ManagementResult::Completed(binding, result));
@@ -468,6 +614,7 @@ impl DiskScopeApp {
             });
         if let Err(error) = started {
             self.management.operation = None;
+            self.management.running_since = None;
             self.notice = Some(format!(
                 "Could not start the confirmed file action: {error}"
             ));
@@ -494,20 +641,40 @@ impl DiskScopeApp {
         {
             return;
         }
+        let elapsed = self
+            .management
+            .running_since
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         let modal = egui::Modal::new(egui::Id::new("confirmed_file_action")).show(ctx, |ui| {
             ui.set_width(470.0);
             match &mut operation {
-                Operation::Preparing(_) => {
+                Operation::Preparing(binding) => {
                     ui.heading("Checking the selected file");
-                    ui.label("Verifying the current path, file identity and size before confirmation.");
+                    ui.label(if binding.action == FileAction::Recycle {
+                        "Verifying the current path, file identity, size and Recycle Bin availability before confirmation."
+                    } else {
+                        "Verifying the current path, file identity and size before confirmation."
+                    });
                     let button = ui.button("Cancel");
                     button.request_focus();
                     cancel = button.clicked();
                 }
-                Operation::Running(_) => {
+                Operation::Running(binding) => {
                     ui.heading("Applying the confirmed file action");
-                    ui.label("Waiting for Windows. The scan will refresh when the operation finishes.");
+                    for line in running_lines(binding.action, elapsed) {
+                        ui.label(line);
+                    }
                     ui.spinner();
+                }
+                Operation::Report(report) => {
+                    ui.heading(report.heading);
+                    ui.add_space(10.0);
+                    ui.add(egui::Label::new(report.body.as_str()).wrap());
+                    ui.add_space(12.0);
+                    let button = ui.button("OK");
+                    button.request_focus();
+                    cancel = button.clicked();
                 }
                 Operation::Confirming(confirmation) => {
                     let permanent = confirmation.binding.action == FileAction::Permanent;
@@ -523,7 +690,16 @@ impl DiskScopeApp {
                         ui.label("Type DELETE to enable permanent deletion:");
                         ui.add(egui::TextEdit::singleline(&mut confirmation.typed).char_limit(6).desired_width(240.0));
                     } else {
-                        ui.label("Windows will move this file to Recycle Bin. If recycling is unavailable, the action fails without falling back to permanent deletion.");
+                        ui.label(RECYCLE_CONFIRMATION);
+                        if confirmation.plan.recycle_verdict() == RecycleVerdict::Unverified {
+                            ui.label(
+                                RichText::new(
+                                    "DiskScope could not fully check this drive's Recycle Bin settings.",
+                                )
+                                .small()
+                                .color(p.muted),
+                            );
+                        }
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -641,8 +817,28 @@ mod tests {
             generation: 7,
             node: 42,
             root: PathBuf::from(r"C:\fixture"),
+            path: PathBuf::from(r"C:\fixture\demo.mp4"),
             action: FileAction::Recycle,
         }
+    }
+
+    /// An app whose current scan matches `binding(1)`, so completion handling
+    /// can rescan (the root and generation must agree for that).
+    fn app_for_binding(storage: &RecordingStorage, directory: &std::path::Path) -> DiskScopeApp {
+        let mut app = test_app(AccessMode::Admin, directory.join("history"), storage);
+        app.generation = 7;
+        app.root_path = binding(1).root;
+        app.request.selected = Some(42);
+        app
+    }
+
+    fn complete(app: &mut DiskScopeApp, result: Result<ActionOutcome, ActionError>) {
+        app.management.operation = Some(Operation::Running(binding(1)));
+        app.management
+            .tx
+            .send(ManagementResult::Completed(binding(1), result))
+            .unwrap();
+        app.poll_management(&egui::Context::default());
     }
 
     fn keyboard_app() -> DiskScopeApp {
@@ -805,6 +1001,7 @@ mod tests {
             &storage,
         );
         app.generation = 7;
+        app.root_path = binding(1).root;
         app.request.selected = Some(42);
         app.management.operation = Some(Operation::Running(binding(1)));
         app.management
@@ -876,6 +1073,187 @@ mod tests {
                     .any(|c| matches!(c, egui::ViewportCommand::Close))
             }));
         }
+    }
+
+    #[test]
+    fn completion_effects_matrix() {
+        let path = PathBuf::from(r"C:\fixture\demo.mp4");
+        let original_path = path.clone();
+        for outcome in [
+            ActionOutcome::Recycled {
+                original_path: original_path.clone(),
+            },
+            ActionOutcome::DeletionRequested {
+                original_path: original_path.clone(),
+            },
+        ] {
+            let fx = completion_effects(&path, &Ok(outcome));
+            assert!(fx.rescan && fx.report.is_none());
+        }
+        for error in [
+            ActionError::DeletedNotRecycled,
+            ActionError::RecycleOutcomeUnconfirmed,
+        ] {
+            let fx = completion_effects(&path, &Err(error.clone()));
+            assert!(fx.rescan, "{error:?}");
+            assert!(fx.report.is_some(), "{error:?}");
+            assert!(fx.notice.contains("demo.mp4"), "{}", fx.notice);
+        }
+        for block in [
+            RecycleBlock::NoBinOnDrive,
+            RecycleBlock::DisabledByPolicy,
+            RecycleBlock::DeletesImmediately,
+            RecycleBlock::TooLarge { size: 5, limit: 1 },
+            RecycleBlock::ShellDeclined,
+        ] {
+            let fx = completion_effects(&path, &Err(ActionError::RecycleUnavailable(block)));
+            assert!(!fx.rescan, "a refused recycle leaves the file in place");
+            let report = fx.report.expect("a refusal is shown, not just noted");
+            assert!(report.body.contains("Delete permanently…"));
+            assert!(report.body.contains("Nothing was changed"));
+            assert!(fx.notice.contains("Nothing was changed"));
+        }
+        for error in [
+            ActionError::Cancelled,
+            ActionError::PermissionDenied,
+            ActionError::Busy,
+            ActionError::Changed,
+            ActionError::Failed("x".into()),
+        ] {
+            let fx = completion_effects(&path, &Err(error.clone()));
+            assert!(!fx.rescan && fx.report.is_none(), "{error:?}");
+            assert_eq!(fx.notice, error.to_string());
+        }
+    }
+
+    #[test]
+    fn prepared_block_only_blocks_recycle() {
+        let blocked = RecycleVerdict::Blocked(RecycleBlock::NoBinOnDrive);
+        assert_eq!(
+            prepared_block(FileAction::Recycle, blocked),
+            Some(RecycleBlock::NoBinOnDrive)
+        );
+        assert_eq!(prepared_block(FileAction::Permanent, blocked), None);
+        for verdict in [RecycleVerdict::Likely, RecycleVerdict::Unverified] {
+            assert_eq!(prepared_block(FileAction::Recycle, verdict), None);
+        }
+    }
+
+    #[test]
+    fn running_lines_hint_only_for_recycle_after_three_seconds() {
+        let early = running_lines(FileAction::Recycle, Duration::from_millis(2900));
+        assert!(early.iter().any(|line| line.contains("choose No")));
+        assert!(!early.iter().any(|line| line.contains("another window")));
+        let late = running_lines(FileAction::Recycle, Duration::from_secs(3));
+        assert!(late.iter().any(|line| line.contains("choose No")));
+        assert!(late.iter().any(|line| line.contains("another window")));
+        for elapsed in [Duration::ZERO, Duration::from_secs(60)] {
+            let lines = running_lines(FileAction::Permanent, elapsed);
+            assert!(!lines.iter().any(|line| line.contains("choose No")));
+            assert!(!lines.iter().any(|line| line.contains("another window")));
+        }
+    }
+
+    #[test]
+    fn recycle_confirmation_copy_does_not_overpromise() {
+        assert!(RECYCLE_CONFIRMATION.contains("Windows makes the final decision"));
+        assert!(RECYCLE_CONFIRMATION.contains("choose No"));
+        assert!(!RECYCLE_CONFIRMATION.contains("fails without falling back"));
+    }
+
+    #[test]
+    fn destroyed_file_rescans_and_opens_a_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RecordingStorage::default();
+        let mut app = app_for_binding(&storage, directory.path());
+        complete(&mut app, Err(ActionError::DeletedNotRecycled));
+        // begin_scan ran: the generation moved on and the list will refresh.
+        assert_ne!(app.generation, 7);
+        let Some(Operation::Report(report)) = &app.management.operation else {
+            panic!("a destroyed file must be acknowledged");
+        };
+        assert!(report.body.contains("rescanning"), "{}", report.body);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Deleted instead of recycled"))
+        );
+        assert!(app.management.busy(), "the report holds the UI until OK");
+    }
+
+    #[test]
+    fn refused_or_failed_recycle_does_not_rescan() {
+        // Negative control: the file is intact, so the scan must be kept.
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RecordingStorage::default();
+        let mut app = app_for_binding(&storage, directory.path());
+        complete(
+            &mut app,
+            Err(ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined)),
+        );
+        assert_eq!(app.generation, 7);
+        assert!(matches!(
+            app.management.operation,
+            Some(Operation::Report(_))
+        ));
+        assert!(app.notice.is_some());
+        app.management.operation = None;
+        complete(&mut app, Err(ActionError::PermissionDenied));
+        assert_eq!(app.generation, 7);
+        assert!(app.management.operation.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Windows denied"))
+        );
+    }
+
+    #[test]
+    fn successful_recycle_rescans() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RecordingStorage::default();
+        let mut app = app_for_binding(&storage, directory.path());
+        complete(
+            &mut app,
+            Ok(ActionOutcome::Recycled {
+                original_path: binding(1).path,
+            }),
+        );
+        assert_ne!(app.generation, 7);
+        assert!(app.management.operation.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Moved to Recycle Bin"))
+        );
+    }
+
+    #[test]
+    fn report_dismisses_with_escape_and_never_starts_an_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RecordingStorage::default();
+        let mut app = app_for_binding(&storage, directory.path());
+        app.management.operation = Some(Operation::Report(blocked_report(
+            &binding(1).path,
+            RecycleBlock::NoBinOnDrive,
+        )));
+        assert!(app.management.busy());
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(input, |ui| {
+            app.management_dialog(ui.ctx(), app.preferences.theme.palette())
+        });
+        assert!(!app.management.busy());
+        assert_eq!(app.generation, 7);
+        assert_eq!(app.request.selected, Some(42));
+        assert!(app.management.rx.try_recv().is_err());
     }
 
     fn eligible() -> Eligibility {

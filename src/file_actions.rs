@@ -1,8 +1,10 @@
 //! Confirmed single-file actions: normal-token Shell recycling and explicit
 //! permanent deletion by a freshly verified native handle.
 use crate::model::FileIdentity;
+pub use crate::recycle_policy::{RecycleBlock, RecycleVerdict};
 use std::{
     fmt,
+    num::NonZeroIsize,
     path::{Path, PathBuf},
 };
 
@@ -17,7 +19,36 @@ pub enum ActionError {
     Busy,
     ElevatedRecycleUnavailable,
     Cancelled,
+    /// Recycling was refused before it could delete anything: Windows would
+    /// have deleted the file permanently instead of using the Recycle Bin.
+    RecycleUnavailable(RecycleBlock),
+    /// Windows reported success but kept no Recycle Bin copy and the file is gone.
+    DeletedNotRecycled,
+    /// The file is gone or unreadable and no Recycle Bin copy was confirmed.
+    RecycleOutcomeUnconfirmed,
     Failed(String),
+}
+
+impl ActionError {
+    /// Whether the file may no longer be at its original path. The caller must
+    /// rescan for these, so a list never keeps a row for a deleted file. The
+    /// match is exhaustive on purpose: a new variant must be classified.
+    pub fn file_may_be_gone(&self) -> bool {
+        match self {
+            Self::DeletedNotRecycled | Self::RecycleOutcomeUnconfirmed => true,
+            Self::Unsupported
+            | Self::InvalidPath
+            | Self::IdentityUnavailable
+            | Self::Changed
+            | Self::NotRegularFile
+            | Self::PermissionDenied
+            | Self::Busy
+            | Self::ElevatedRecycleUnavailable
+            | Self::Cancelled
+            | Self::RecycleUnavailable(_)
+            | Self::Failed(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for ActionError {
@@ -44,6 +75,15 @@ impl fmt::Display for ActionError {
                 "Recycle Bin actions require a normal DiskScope window. Administrator mode offers separately confirmed permanent deletion."
             }
             Self::Cancelled => "The file action was cancelled.",
+            Self::RecycleUnavailable(block) => {
+                return write!(f, "{} Nothing was changed.", block.reason());
+            }
+            Self::DeletedNotRecycled => {
+                "Windows deleted this file without keeping a copy in the Recycle Bin (it reported no Recycle Bin item), so it probably cannot be restored from the Recycle Bin. Check your backups if you need it back."
+            }
+            Self::RecycleOutcomeUnconfirmed => {
+                "The file is no longer at its original location, or its state could not be read, and Windows did not confirm that it reached the Recycle Bin. Check the Recycle Bin; if it is not there, assume the file was deleted."
+            }
             Self::Failed(message) => return f.write_str(message),
         };
         f.write_str(message)
@@ -55,6 +95,7 @@ impl std::error::Error for ActionError {}
 pub struct RecyclePlan {
     path: PathBuf,
     size: u64,
+    verdict: RecycleVerdict,
     #[cfg(windows)]
     snapshot: native::Snapshot,
 }
@@ -64,6 +105,11 @@ impl RecyclePlan {
     }
     pub fn size(&self) -> u64 {
         self.size
+    }
+    /// The Recycle Bin preflight computed while the file was verified. It only
+    /// matters to the Recycle action; permanent deletion ignores it.
+    pub fn recycle_verdict(&self) -> RecycleVerdict {
+        self.verdict
     }
 }
 
@@ -97,6 +143,7 @@ pub fn prepare(
         Ok(RecyclePlan {
             path: path.to_owned(),
             size: snapshot.size,
+            verdict: native::recycle_verdict(path, snapshot.size),
             snapshot,
         })
     }
@@ -108,7 +155,18 @@ pub fn prepare(
 }
 
 /// Consumes a user-confirmed plan. Run on a worker thread, never the UI thread.
-pub fn recycle(plan: RecyclePlan) -> Result<ActionOutcome, ActionError> {
+///
+/// `owner` is the main window's handle. It lets Windows parent any prompt of its
+/// own to DiskScope so it cannot hide behind the window.
+///
+/// Windows decides whether a file is recycled, and it deletes files it cannot
+/// recycle. So this refuses first when the preflight predicts that, vetoes in
+/// the sink if Windows does not offer the Recycle Bin, and finally checks the
+/// disk: `Ok` is returned only with a confirmed Recycle Bin destination.
+pub fn recycle(
+    plan: RecyclePlan,
+    owner: Option<NonZeroIsize>,
+) -> Result<ActionOutcome, ActionError> {
     #[cfg(windows)]
     {
         ensure_recycle_token(crate::admin::is_elevated().map_err(ActionError::Failed)?)?;
@@ -116,15 +174,103 @@ pub fn recycle(plan: RecyclePlan) -> Result<ActionOutcome, ActionError> {
         if native::snapshot(&file)? != plan.snapshot {
             return Err(ActionError::Changed);
         }
-        // Keep the verified file and its ancestor guards alive until Windows
-        // has finished. Releasing them before PerformOperations would reopen
-        // the checked namespace to ancestor replacement.
-        shell::recycle(plan, file)
+        // Authoritative gate: the settings may have changed since the dialog
+        // opened (a drive removed, a Recycle Bin limit lowered).
+        if let RecycleVerdict::Blocked(block) = native::recycle_verdict(&plan.path, plan.size) {
+            return Err(ActionError::RecycleUnavailable(block));
+        }
+        let path = plan.path.clone();
+        // The verified file and its ancestor guards stay alive until Windows
+        // has finished; they drop when shell::recycle returns, so the leaf is
+        // not held open by this process while its presence is checked below.
+        let report = shell::recycle(plan, file, owner)?;
+        settle(report, native::presence(&path))?;
+        Ok(ActionOutcome::Recycled {
+            original_path: path,
+        })
     }
     #[cfg(not(windows))]
     {
-        let _ = plan;
+        let _ = (plan, owner);
         Err(ActionError::Unsupported)
+    }
+}
+
+/// `TSF_DELETE_RECYCLE_IF_POSSIBLE`. Windows clears it when it already knows it
+/// will not recycle (for example a volume set to remove files immediately). It
+/// is set for an oversized file, so it can only veto, never prove a recycle.
+#[cfg(any(windows, test))]
+const TSF_DELETE_RECYCLE_IF_POSSIBLE_BIT: u32 = 0x80;
+
+/// The sink's first look at the single queued delete.
+#[cfg(any(windows, test))]
+fn pre_delete_check(first: bool, flags: u32) -> Result<(), ActionError> {
+    if !first {
+        return Err(ActionError::Failed(
+            "Windows queued more than the one approved file, so the action was stopped.".into(),
+        ));
+    }
+    if flags & TSF_DELETE_RECYCLE_IF_POSSIBLE_BIT == 0 {
+        return Err(ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined));
+    }
+    Ok(())
+}
+
+/// What the Shell sink observed, without any interpretation.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ShellReport {
+    pre_seen: bool,
+    recycled: bool,
+    /// `PostDeleteItem` succeeded with no Recycle Bin destination. Only a hint:
+    /// the same shape can follow a skipped item that is still intact.
+    no_destination: bool,
+    error: Option<ActionError>,
+    aborted: bool,
+}
+
+/// Whether the original path still exists after the Shell returned.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Present,
+    Absent,
+    /// Any error other than "not found", for example a delete-pending name.
+    Unknown,
+}
+
+#[cfg(any(windows, test))]
+fn presence_of(metadata: &std::io::Result<std::fs::Metadata>) -> Presence {
+    match metadata {
+        Ok(_) => Presence::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+        Err(_) => Presence::Unknown,
+    }
+}
+
+/// Turns the sink's observations and the disk's state into the truth. The disk
+/// arbitrates: a Recycle Bin destination is the only proof of success, and no
+/// error text is allowed to claim the file is safe unless it is present.
+///
+/// Invariants (tested exhaustively): `Ok` implies a confirmed Recycle Bin
+/// destination, and any error that does not say the file may be gone implies
+/// the file was observed present.
+#[cfg(any(windows, test))]
+fn settle(report: ShellReport, presence: Presence) -> Result<(), ActionError> {
+    if report.pre_seen && report.recycled {
+        return Ok(());
+    }
+    match presence {
+        Presence::Present => Err(report.error.unwrap_or(if report.aborted {
+            ActionError::Cancelled
+        } else {
+            ActionError::Failed(
+                "Windows did not move the file to the Recycle Bin, and it is still in its original location."
+                    .into(),
+            )
+        })),
+        Presence::Absent if report.no_destination => Err(ActionError::DeletedNotRecycled),
+        Presence::Absent | Presence::Unknown => Err(ActionError::RecycleOutcomeUnconfirmed),
     }
 }
 
@@ -183,6 +329,7 @@ pub fn delete_permanently(plan: RecyclePlan) -> Result<ActionOutcome, ActionErro
 #[cfg(windows)]
 mod native {
     use super::*;
+    use crate::recycle_policy::{self, RecycleFacts, Setting};
     use std::{
         fs::{File, OpenOptions},
         io,
@@ -195,10 +342,21 @@ mod native {
     use windows_sys::Win32::{
         Foundation::{
             ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND,
-            ERROR_SHARING_VIOLATION,
+            ERROR_SHARING_VIOLATION, ERROR_SUCCESS, HWND,
         },
         Storage::FileSystem::*,
+        System::{
+            Registry::{
+                HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW,
+            },
+            Threading::GetCurrentProcessId,
+        },
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
     };
+
+    const POLICY_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+    const BITBUCKET_VOLUMES: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume";
 
     #[derive(Debug, PartialEq, Eq)]
     pub(super) struct Snapshot {
@@ -314,6 +472,135 @@ mod native {
             || (base.len() == 4
                 && (base[..3] == [67, 79, 77] || base[..3] == [76, 80, 84])
                 && matches!(base[3], 49..=57 | 0x00b9 | 0x00b2 | 0x00b3))
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// Read-only registry DWORD. A missing key or value is a Windows default
+    /// (`Absent`); any other failure is missing evidence (`Unreadable`).
+    fn read_dword(hive: HKEY, subkey: &str, value: &str) -> Setting {
+        let subkey = wide(subkey);
+        let value = wide(value);
+        let mut data = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        // SAFETY: NUL-terminated names, a writable DWORD with its exact size,
+        // and RRF_RT_REG_DWORD restricts the type. This is a read-only query.
+        let status = unsafe {
+            RegGetValueW(
+                hive,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut data as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => Setting::Value(data),
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Setting::Absent,
+            _ => Setting::Unreadable,
+        }
+    }
+
+    /// `\\?\Volume{GUID}\` for a drive root such as `C:\`.
+    fn volume_name(root: &[u16; 4]) -> Option<String> {
+        let mut buffer = [0u16; 50];
+        // SAFETY: NUL-terminated drive root and a writable buffer of the
+        // documented minimum length, whose size is passed in characters.
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                root.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let end = buffer.iter().position(|unit| *unit == 0)?;
+        Some(String::from_utf16_lossy(&buffer[..end]))
+    }
+
+    /// Gathers the Recycle Bin facts for the file's drive. Every environmental
+    /// failure becomes `Unreadable` or `None`; none can refuse by itself.
+    fn recycle_facts(path: &Path) -> RecycleFacts {
+        let drive = path.as_os_str().encode_wide().next().unwrap_or(0);
+        if drive == 0 {
+            return RecycleFacts {
+                drive_type: 0,
+                policy_no_recycle: Setting::Absent,
+                volume_resolved: false,
+                volume_nuke_on_delete: Setting::Absent,
+                volume_max_capacity_mb: Setting::Absent,
+                volume_total_bytes: None,
+            };
+        }
+        let root = [drive, 58, 92, 0];
+        // SAFETY: drive letter, colon, backslash and NUL, as GetDriveTypeW
+        // requires. This is a read-only query.
+        let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
+        let policy_no_recycle = read_dword(HKEY_LOCAL_MACHINE, POLICY_KEY, "NoRecycleFiles")
+            .combine(read_dword(HKEY_CURRENT_USER, POLICY_KEY, "NoRecycleFiles"));
+        let name = volume_name(&root);
+        let guid = name.as_deref().and_then(recycle_policy::volume_guid_braced);
+        let (volume_nuke_on_delete, volume_max_capacity_mb) = match guid {
+            Some(guid) => {
+                let key = format!(r"{BITBUCKET_VOLUMES}\{guid}");
+                (
+                    read_dword(HKEY_CURRENT_USER, &key, "NukeOnDelete"),
+                    read_dword(HKEY_CURRENT_USER, &key, "MaxCapacity"),
+                )
+            }
+            None => (Setting::Absent, Setting::Absent),
+        };
+        let mut total = 0u64;
+        // SAFETY: NUL-terminated drive root and one writable u64; the other
+        // out-parameters are optional and passed as null.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                root.as_ptr(),
+                std::ptr::null_mut(),
+                &mut total,
+                std::ptr::null_mut(),
+            )
+        };
+        RecycleFacts {
+            drive_type,
+            policy_no_recycle,
+            volume_resolved: guid.is_some(),
+            volume_nuke_on_delete,
+            volume_max_capacity_mb,
+            volume_total_bytes: (ok != 0).then_some(total),
+        }
+    }
+
+    pub(super) fn recycle_verdict(path: &Path, logical_size: u64) -> RecycleVerdict {
+        let facts = recycle_facts(path);
+        #[cfg(test)]
+        eprintln!("DiskScope fixture recycle facts: {facts:?}");
+        recycle_policy::recycle_verdict(&facts, logical_size)
+    }
+
+    pub(super) fn presence(path: &Path) -> Presence {
+        presence_of(&std::fs::symlink_metadata(path))
+    }
+
+    /// Rebuilds the owner window from its address and accepts it only if it is a
+    /// live window of this process; a stale or foreign handle is ignored.
+    pub(super) fn own_window(owner: NonZeroIsize) -> Option<HWND> {
+        let hwnd = owner.get() as HWND;
+        let mut process = 0u32;
+        // SAFETY: both calls accept any handle value and report failure for a
+        // stale one; the process id out-parameter is writable.
+        let ours = unsafe {
+            IsWindow(hwnd) != 0
+                && GetWindowThreadProcessId(hwnd, &mut process) != 0
+                && process == GetCurrentProcessId()
+        };
+        ours.then_some(hwnd)
     }
 
     pub(super) fn io_error(error: io::Error) -> ActionError {
@@ -458,7 +745,7 @@ mod shell {
     use std::{cell::RefCell, os::windows::ffi::OsStrExt, rc::Rc};
     use windows::{
         Win32::{
-            Foundation::E_ABORT,
+            Foundation::{E_ABORT, HWND},
             System::Com::{
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
                 CoUninitialize,
@@ -468,10 +755,20 @@ mod shell {
         core::{Error, HRESULT, PCWSTR, Ref, Result as ComResult, implement},
     };
 
+    /// Test hook: pretends Windows cleared the recycle bit so the sink veto
+    /// can be exercised against a real fixture.
+    #[cfg(test)]
+    pub(super) static FORCE_SHELL_DECLINED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    const _: () =
+        assert!(TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == TSF_DELETE_RECYCLE_IF_POSSIBLE_BIT);
+
     #[derive(Default)]
     struct State {
         pre_seen: bool,
         recycled: bool,
+        no_destination: bool,
         error: Option<ActionError>,
     }
 
@@ -509,16 +806,21 @@ mod shell {
                 ActionError::Cancelled
             }
             _ => ActionError::Failed(format!(
-                "Windows could not complete the Recycle Bin operation ({:#010X}). No permanent fallback was requested.",
+                "Windows could not complete the Recycle Bin operation ({:#010X}).",
                 code.0 as u32
             )),
         }
     }
 
+    /// Runs the single approved `DeleteItem` and reports what the sink saw. It
+    /// never decides the user-visible outcome: `file_actions::recycle` checks
+    /// the disk after the pinned handles in `_guard` have dropped. Errors
+    /// before anything is queued return early with the file untouched.
     pub(super) fn recycle(
         plan: RecyclePlan,
         _guard: native::VerifiedFile,
-    ) -> Result<ActionOutcome, ActionError> {
+        owner: Option<NonZeroIsize>,
+    ) -> Result<ShellReport, ActionError> {
         // IFileOperation requires STA. A pre-existing MTA is refused, never used.
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() }.map_err(com_error)?;
         let _apartment = Apartment;
@@ -540,7 +842,12 @@ mod shell {
         }
         .into();
         // FOFX_RECYCLEONDELETE is the documented recycle request; ALLOWUNDO
-        // alone is insufficient. Do not auto-answer any Shell confirmation.
+        // alone is insufficient. No documented flag makes the Shell fail
+        // instead of delete when it cannot recycle: FOF_WANTNUKEWARNING is the
+        // only Shell-level brake, and FOF_NOCONFIRMATION / FOF_NO_UI would
+        // answer that prompt Yes for the user. The preflight, the sink veto
+        // and the settlement in file_actions::recycle carry the rest. These
+        // are the flags the validated happy-path fixture used.
         let flags = FOFX_RECYCLEONDELETE
             | FOFX_ADDUNDORECORD
             | FOF_WANTNUKEWARNING
@@ -552,6 +859,14 @@ mod shell {
             | FOF_NORECURSEREPARSE
             | FOFX_NOCOPYHOOKS;
         unsafe { operation.SetOperationFlags(flags) }.map_err(com_error)?;
+        // Best effort: parent any prompt of Windows' own to DiskScope so it is
+        // modal and in front rather than hidden behind the main window. It is
+        // defence in depth, so a failure must not disable every recycle. The
+        // UI thread must never block on or join this worker while an owner is
+        // set (the two threads' input queues become attached); it only polls.
+        if let Some(hwnd) = owner.and_then(native::own_window) {
+            let _ = unsafe { operation.SetOwnerWindow(HWND(hwnd)) };
+        }
         #[cfg(test)]
         eprintln!("DiskScope fixture SetOperationFlags: {:#010x}", flags.0);
         let cookie = unsafe { operation.Advise(&sink) }.map_err(com_error)?;
@@ -566,17 +881,17 @@ mod shell {
         })();
         let _ = unsafe { operation.Unadvise(cookie) };
         let mut finished = state.borrow_mut();
-        if let Some(error) = finished.error.take() {
-            return Err(error);
-        }
-        if result? {
-            return Err(ActionError::Cancelled);
-        }
-        if !finished.pre_seen || !finished.recycled {
-            return Err(ActionError::Failed("Windows did not confirm a Recycle Bin destination. The action was not reported as recycled.".into()));
-        }
-        Ok(ActionOutcome::Recycled {
-            original_path: plan.path.clone(),
+        let (call_error, aborted) = match result {
+            Ok(aborted) => (None, aborted),
+            Err(error) => (Some(error), false),
+        };
+        Ok(ShellReport {
+            pre_seen: finished.pre_seen,
+            recycled: finished.recycled,
+            no_destination: finished.no_destination,
+            // The sink's reason comes first: it saw the Shell's own report.
+            error: finished.error.take().or(call_error),
+            aborted,
         })
     }
 
@@ -622,8 +937,16 @@ mod shell {
                 .unwrap_or(false);
             #[cfg(test)]
             eprintln!("DiskScope fixture PreDeleteItem: flags={flags:#010x}, first={first}");
-            if !first || flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
-                return self.refuse(ActionError::Failed("Windows did not offer the approved single-file Recycle Bin operation. Permanent deletion was not approved.".into()));
+            #[cfg(test)]
+            let flags = if FORCE_SHELL_DECLINED.load(std::sync::atomic::Ordering::SeqCst) {
+                flags & !TSF_DELETE_RECYCLE_IF_POSSIBLE_BIT
+            } else {
+                flags
+            };
+            // Veto by failure HRESULT (never an S_ code) when Windows does not
+            // offer the Recycle Bin or queues more than the one approved item.
+            if let Err(error) = pre_delete_check(first, flags) {
+                return self.refuse(error);
             }
             let Some(item) = item.as_ref() else {
                 return self.refuse(ActionError::Changed);
@@ -655,21 +978,25 @@ mod shell {
         ) -> ComResult<()> {
             #[cfg(test)]
             eprintln!(
-                "DiskScope fixture PostDeleteItem: result={:#010x}, recycled_destination={}",
+                "DiskScope fixture PostDeleteItem: flags={_flags:#010x}, result={:#010x}, recycled_destination={}",
                 result.0 as u32,
                 !destination.is_null()
             );
             if result.is_err() {
                 return self.refuse(hresult_error(result));
             }
-            if destination.is_null() {
-                return self.refuse(ActionError::Failed("Windows returned no recycled destination; the result could not be verified as a Recycle Bin operation.".into()));
-            }
             let mut state = self
                 .state
                 .try_borrow_mut()
                 .map_err(|_| Error::from_hresult(E_ABORT))?;
-            state.recycled = true;
+            if destination.is_null() {
+                // Success without a Recycle Bin item. Only a hint: the item may
+                // already be gone or still intact (a skipped item reports the
+                // same), so the disk decides what the user is told.
+                state.no_destination = true;
+            } else {
+                state.recycled = true;
+            }
             Ok(())
         }
         fn PreRenameItem(
@@ -1050,20 +1377,142 @@ mod tests {
         let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
         let elevated = crate::admin::is_elevated().unwrap();
         eprintln!("DiskScope fixture Windows token elevated={elevated}");
+        eprintln!("DiskScope fixture verdict={:?}", plan.recycle_verdict());
         if elevated {
             assert!(matches!(
-                recycle(plan),
+                recycle(plan, None),
                 Err(ActionError::ElevatedRecycleUnavailable)
             ));
             assert!(path.is_file());
         } else {
+            // Happy-path guard: an ordinary file on a fixed volume is not refused.
+            assert!(!matches!(
+                plan.recycle_verdict(),
+                RecycleVerdict::Blocked(_)
+            ));
             assert!(matches!(
-                recycle(plan).unwrap(),
+                recycle(plan, None).unwrap(),
                 ActionOutcome::Recycled { .. }
             ));
             assert!(!path.exists());
         }
         assert_eq!(fs::read(sibling).unwrap(), b"must remain");
+    }
+
+    #[test]
+    fn prepared_plan_carries_a_recycle_verdict_that_does_not_block_the_fixture() {
+        let (_directory, path, identity) = fixture();
+        let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
+        let verdict = plan.recycle_verdict();
+        eprintln!("DiskScope fixture verdict={verdict:?}");
+        match verdict {
+            RecycleVerdict::Blocked(RecycleBlock::NoBinOnDrive) => {
+                eprintln!("workspace drive is not a fixed disk; nothing to assert")
+            }
+            other => assert!(!matches!(other, RecycleVerdict::Blocked(_)), "{other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_reports_present_then_absent() {
+        let (_directory, path, _identity) = fixture();
+        assert_eq!(native::presence(&path), Presence::Present);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(native::presence(&path), Presence::Absent);
+    }
+
+    #[test]
+    fn owner_window_rejects_a_stale_handle() {
+        assert!(native::own_window(NonZeroIsize::new(1).unwrap()).is_none());
+    }
+
+    #[test]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization"]
+    fn sink_veto_leaves_the_file_intact() {
+        // Proves the central assumption that a failure HRESULT from
+        // PreDeleteItem stops the Shell. If it fails the fixture is destroyed
+        // and the result must be DeletedNotRecycled, never a plain failure.
+        // Run with --test-threads=1: the hook is process-wide.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                shell::FORCE_SHELL_DECLINED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        if crate::admin::is_elevated().unwrap() {
+            eprintln!("elevated token: Recycle is refused earlier; nothing to prove");
+            return;
+        }
+        let (directory, path, identity) = fixture();
+        let sibling = directory.path().join("unselected-sibling.txt");
+        fs::write(&sibling, b"must remain").unwrap();
+        let before = fs::read(&path).unwrap();
+        let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
+        let _reset = Reset;
+        shell::FORCE_SHELL_DECLINED.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            recycle(plan, None).unwrap_err(),
+            ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(sibling).unwrap(), b"must remain");
+    }
+
+    #[test]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization"]
+    fn recycle_with_an_owner_window_completes() {
+        use windows_sys::Win32::{
+            System::Threading::GetCurrentThreadId,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
+                PostThreadMessageW, TranslateMessage, WM_QUIT,
+            },
+        };
+        if crate::admin::is_elevated().unwrap() {
+            return;
+        }
+        // A hidden top-level window on a helper thread that pumps messages,
+        // like the application's main window on its own thread.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let pump = std::thread::spawn(move || {
+            let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            // SAFETY: predefined class, null title, no parent or menu; the
+            // window is created, pumped and destroyed on this one thread.
+            unsafe {
+                let hwnd = CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                sender.send((hwnd as isize, GetCurrentThreadId())).unwrap();
+                let mut message = std::mem::zeroed::<MSG>();
+                while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                DestroyWindow(hwnd);
+            }
+        });
+        let (hwnd, thread) = receiver.recv().unwrap();
+        let (_directory, path, identity) = fixture();
+        let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = recycle(plan, NonZeroIsize::new(hwnd));
+        // SAFETY: posts WM_QUIT to the pump thread created above.
+        unsafe { PostThreadMessageW(thread, WM_QUIT, 0, 0) };
+        pump.join().unwrap();
+        assert!(matches!(outcome.unwrap(), ActionOutcome::Recycled { .. }));
+        assert!(!path.exists());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
@@ -1206,5 +1655,248 @@ mod tests {
             fs::read(moved.join("disposable-fixture.txt")).unwrap(),
             b"DiskScope disposable recycle policy fixture"
         );
+    }
+}
+
+/// Platform-independent tests for the Recycle outcome rules. They run on every
+/// host because the rules are pure functions over plain data.
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn report(
+        pre_seen: bool,
+        recycled: bool,
+        no_destination: bool,
+        error: Option<ActionError>,
+        aborted: bool,
+    ) -> ShellReport {
+        ShellReport {
+            pre_seen,
+            recycled,
+            no_destination,
+            error,
+            aborted,
+        }
+    }
+
+    #[test]
+    fn pre_delete_check_table() {
+        // 0x80 is the Shell's *request* bit: it can veto but never prove a
+        // recycle (it is still set for a file larger than the Bin maximum).
+        assert_eq!(pre_delete_check(true, 0x282), Ok(()));
+        assert_eq!(
+            pre_delete_check(true, 0x202),
+            Err(ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined))
+        );
+        assert!(matches!(
+            pre_delete_check(false, 0x282),
+            Err(ActionError::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn presence_of_table() {
+        assert_eq!(
+            presence_of(&std::fs::symlink_metadata(std::env::temp_dir())),
+            Presence::Present
+        );
+        for (kind, expected) in [
+            (ErrorKind::NotFound, Presence::Absent),
+            (ErrorKind::PermissionDenied, Presence::Unknown),
+            (ErrorKind::Other, Presence::Unknown),
+        ] {
+            assert_eq!(presence_of(&Err(Error::from(kind))), expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn settle_truth_table() {
+        let veto = ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined);
+        // A confirmed Recycle Bin destination wins over everything else.
+        for presence in [Presence::Present, Presence::Absent, Presence::Unknown] {
+            assert_eq!(
+                settle(
+                    report(true, true, false, Some(ActionError::Cancelled), false),
+                    presence
+                ),
+                Ok(())
+            );
+        }
+        // File present: the recorded reason, else the abort, else a plain failure.
+        let present = |r| settle(r, Presence::Present).unwrap_err();
+        assert!(
+            matches!(present(report(true, false, false, None, false)), ActionError::Failed(text) if text.contains("still in its original location"))
+        );
+        assert_eq!(
+            present(report(true, false, false, Some(veto.clone()), false)),
+            veto
+        );
+        assert_eq!(
+            present(report(true, false, false, None, true)),
+            ActionError::Cancelled
+        );
+        assert_eq!(
+            present(report(
+                true,
+                false,
+                false,
+                Some(ActionError::PermissionDenied),
+                false
+            )),
+            ActionError::PermissionDenied
+        );
+        // File gone with a null destination: deleted, even if a veto was ignored.
+        for error in [None, Some(veto.clone())] {
+            for aborted in [false, true] {
+                assert_eq!(
+                    settle(
+                        report(true, false, true, error.clone(), aborted),
+                        Presence::Absent
+                    ),
+                    Err(ActionError::DeletedNotRecycled)
+                );
+            }
+        }
+        // Gone or unreadable without a destination hint: never "cancelled".
+        for (presence, hint) in [
+            (Presence::Absent, false),
+            (Presence::Unknown, true),
+            (Presence::Unknown, false),
+        ] {
+            assert_eq!(
+                settle(
+                    report(true, false, hint, Some(ActionError::Cancelled), false),
+                    presence
+                ),
+                Err(ActionError::RecycleOutcomeUnconfirmed)
+            );
+        }
+        // A destination without the pre-delete callback is not proof.
+        assert_eq!(
+            settle(report(false, true, false, None, false), Presence::Absent),
+            Err(ActionError::RecycleOutcomeUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn settle_never_lies_about_a_missing_file() {
+        let errors = [
+            None,
+            Some(ActionError::Cancelled),
+            Some(ActionError::PermissionDenied),
+            Some(ActionError::Busy),
+            Some(ActionError::Changed),
+            Some(ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined)),
+            Some(ActionError::Failed("x".into())),
+        ];
+        for pre_seen in [false, true] {
+            for recycled in [false, true] {
+                for no_destination in [false, true] {
+                    for aborted in [false, true] {
+                        for error in &errors {
+                            for presence in [Presence::Present, Presence::Absent, Presence::Unknown]
+                            {
+                                let input = report(
+                                    pre_seen,
+                                    recycled,
+                                    no_destination,
+                                    error.clone(),
+                                    aborted,
+                                );
+                                let label = format!("{input:?} {presence:?}");
+                                match settle(input, presence) {
+                                    // I1: success needs a confirmed Bin destination.
+                                    Ok(()) => assert!(pre_seen && recycled, "{label}"),
+                                    // I2: an error that does not say the file may be
+                                    // gone is only allowed for a file seen present.
+                                    Err(e) if !e.file_may_be_gone() => {
+                                        assert_eq!(presence, Presence::Present, "{label}")
+                                    }
+                                    // And "deleted" needs the file seen absent.
+                                    Err(ActionError::DeletedNotRecycled) => {
+                                        assert_eq!(presence, Presence::Absent, "{label}")
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_may_be_gone_truth_table() {
+        // Written without a wildcard so a new variant cannot be forgotten.
+        for (error, gone) in [
+            (ActionError::Unsupported, false),
+            (ActionError::InvalidPath, false),
+            (ActionError::IdentityUnavailable, false),
+            (ActionError::Changed, false),
+            (ActionError::NotRegularFile, false),
+            (ActionError::PermissionDenied, false),
+            (ActionError::Busy, false),
+            (ActionError::ElevatedRecycleUnavailable, false),
+            (ActionError::Cancelled, false),
+            (
+                ActionError::RecycleUnavailable(RecycleBlock::NoBinOnDrive),
+                false,
+            ),
+            (ActionError::DeletedNotRecycled, true),
+            (ActionError::RecycleOutcomeUnconfirmed, true),
+            (ActionError::Failed("x".into()), false),
+        ] {
+            assert_eq!(error.file_may_be_gone(), gone, "{error:?}");
+            match error {
+                ActionError::Unsupported
+                | ActionError::InvalidPath
+                | ActionError::IdentityUnavailable
+                | ActionError::Changed
+                | ActionError::NotRegularFile
+                | ActionError::PermissionDenied
+                | ActionError::Busy
+                | ActionError::ElevatedRecycleUnavailable
+                | ActionError::Cancelled
+                | ActionError::RecycleUnavailable(_)
+                | ActionError::DeletedNotRecycled
+                | ActionError::RecycleOutcomeUnconfirmed
+                | ActionError::Failed(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn error_messages_tell_the_truth() {
+        let blocked = ActionError::RecycleUnavailable(RecycleBlock::DeletesImmediately).to_string();
+        assert!(blocked.contains("remove files immediately"), "{blocked}");
+        assert!(blocked.ends_with("Nothing was changed."), "{blocked}");
+        let deleted = ActionError::DeletedNotRecycled.to_string();
+        assert!(deleted.contains("without keeping a copy in the Recycle Bin"));
+        assert!(deleted.contains("probably cannot be restored"));
+        let unconfirmed = ActionError::RecycleOutcomeUnconfirmed.to_string();
+        assert!(unconfirmed.contains("did not confirm"));
+        assert!(unconfirmed.contains("Check the Recycle Bin"));
+        for error in [
+            ActionError::Cancelled,
+            ActionError::Busy,
+            ActionError::PermissionDenied,
+            blocked_error(),
+            ActionError::DeletedNotRecycled,
+            ActionError::RecycleOutcomeUnconfirmed,
+        ] {
+            let text = error.to_string();
+            assert!(!text.contains("No permanent fallback"), "{text}");
+            assert!(!text.contains("without falling back"), "{text}");
+        }
+    }
+
+    fn blocked_error() -> ActionError {
+        ActionError::RecycleUnavailable(RecycleBlock::TooLarge {
+            size: 5 << 20,
+            limit: 1 << 20,
+        })
     }
 }
