@@ -131,6 +131,50 @@ fn dropping_a_controller_does_not_join_workers() {
 }
 
 #[test]
+fn an_idle_controller_runs_the_next_scan_without_waiting_for_a_timer() {
+    // The coordinator and the workers block while idle instead of polling. Starting a scan after
+    // they have been idle must still reach them at once: the coordinator's safety-net timeout is
+    // a full second, far above this limit.
+    const PROMPT: Duration = Duration::from_millis(700);
+    let first = tempfile::tempdir().unwrap();
+    fs::write(first.path().join("one"), [1; 5]).unwrap();
+    let second = tempfile::tempdir().unwrap();
+    fs::write(second.path().join("two"), [1; 11]).unwrap();
+    let mut controller = Controller::new();
+    let generation = controller.start(first.path().into(), BackendChoice::Normal);
+    assert_eq!(terminal(&controller, generation).progress.logical, 5);
+    thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let generation = controller.start(second.path().into(), BackendChoice::Normal);
+    let result = terminal(&controller, generation);
+    assert_eq!(result.progress.logical, 11);
+    assert!(
+        started.elapsed() < PROMPT,
+        "idle controller took {:?} to run a scan",
+        started.elapsed()
+    );
+    // And so does a view request against the finished scan.
+    thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    controller.request_view(ViewRequest {
+        revision: 42,
+        ..Default::default()
+    });
+    loop {
+        if let Some(snapshot) = controller.poll()
+            && snapshot.view.revision == 42
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < PROMPT,
+            "idle controller ignored a view request"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
 fn latest_view_request_is_applied_after_scan_completion() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("small"), [1; 3]).unwrap();
