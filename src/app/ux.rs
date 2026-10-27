@@ -163,9 +163,13 @@ impl DiskScopeApp {
                 }
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     ui.label(
-                        RichText::new("Metadata-only history")
-                            .small()
-                            .color(p.faint),
+                        RichText::new(if self.access_mode.persistence_allowed() {
+                            "Metadata-only history"
+                        } else {
+                            "History not saved"
+                        })
+                        .small()
+                        .color(p.faint),
                     );
                     ui.label(
                         RichText::new(format!("{}  PREVIEW", env!("CARGO_PKG_VERSION")))
@@ -184,13 +188,23 @@ impl DiskScopeApp {
     pub(super) fn overview(&mut self, ui: &mut egui::Ui, p: Palette) {
         if self.generation == 0 {
             ui.add_space(38.0);
-            card(p).show(ui,|ui| {
+            card(p).show(ui, |ui| {
                 ui.label(RichText::new("Make room for what matters.").size(30.0).strong());
                 ui.add_space(12.0);
-                ui.label("Choose a folder above to discover its largest folders and file types. History stores metadata only; Changes shows its storage location.");
+                ui.label(
+                    "Choose a folder above to discover its largest folders and file types. History stores metadata only; Changes shows its storage location.",
+                );
                 ui.add_space(12.0);
-                if ui.button("Choose a folder…").clicked(){self.choose_folder(ui.ctx());}
-                ui.add_space(10.0);ui.label(RichText::new("Scans read metadata. Single-file actions require a separate confirmation.").color(p.muted));
+                if ui.button("Choose a folder…").clicked() {
+                    self.choose_folder(ui.ctx());
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "Scans read metadata. Single-file actions require a separate confirmation.",
+                    )
+                    .color(p.muted),
+                );
             });
             return;
         }
@@ -365,14 +379,7 @@ impl DiskScopeApp {
                 ui.horizontal(|ui| {
                     ui.colored_label(tile_color(&item.extension), "■");
                     if ui
-                        .add(
-                            egui::Button::new(if item.extension.is_empty() {
-                                "No extension"
-                            } else {
-                                &item.extension
-                            })
-                            .frame(false),
-                        )
+                        .add(egui::Button::new(&item.extension).frame(false))
                         .clicked()
                     {
                         self.set_extension_lens(&item.extension);
@@ -464,16 +471,47 @@ impl DiskScopeApp {
         self.mark_query_changed();
     }
     fn update_controls(&mut self, ui: &mut egui::Ui, p: Palette) {
-        ui.horizontal_wrapped(|ui|{
-            if ui.checkbox(&mut self.preferences.stable_updates,"Stable display").on_hover_text("Keep the visible results still while background scanning and progress continue. Navigation and selection still update.").changed() && !self.preferences.stable_updates {self.apply_pending();}
-            if self.pending.is_some(){
-                ui.colored_label(p.accent,"New results waiting");
-                if ui.button("Apply update").clicked(){self.apply_pending();}
+        ui.horizontal_wrapped(|ui| {
+            let stable = ui
+                .checkbox(&mut self.preferences.stable_updates, "Stable display")
+                .on_hover_text(
+                    "Keep the visible results still while background scanning and progress continue. Navigation and selection still update.",
+                );
+            if stable.changed() && !self.preferences.stable_updates {
+                self.apply_pending();
             }
-            if ui.button(if self.request.filters.is_active(){"Edit filters •"}else{"Filters"}).clicked(){self.sync_filter_fields();self.filter_open=true;}
-            if !self.request.pinned.is_empty() && ui.button(format!("Compare pinned ({})",self.request.pinned.len())).clicked(){self.comparison_open=true;}
+            if self.pending.is_some() {
+                ui.colored_label(p.accent, "New results waiting");
+                if ui.button("Apply update").clicked() {
+                    self.apply_pending();
+                }
+            }
+            let filters_label = if self.request.filters.is_active() {
+                "Edit filters •"
+            } else {
+                "Filters"
+            };
+            if ui.button(filters_label).clicked() {
+                self.sync_filter_fields();
+                self.filter_open = true;
+            }
+            if !self.request.pinned.is_empty()
+                && ui
+                    .button(format!("Compare pinned ({})", self.request.pinned.len()))
+                    .clicked()
+            {
+                self.comparison_open = true;
+            }
             if !self.changes && self.visible.view.filters_active {
-                ui.label(RichText::new(format!("{} matching files · {} logical",format_count(self.visible.view.matching_files),format_bytes(self.visible.view.matching_logical))).small().color(p.accent));
+                ui.label(
+                    RichText::new(format!(
+                        "{} matching files · {} logical",
+                        format_count(self.visible.view.matching_files),
+                        format_bytes(self.visible.view.matching_logical)
+                    ))
+                    .small()
+                    .color(p.accent),
+                );
             }
         });
         if let Some(notice) = self.visible.view.notice.as_ref() {
@@ -505,36 +543,8 @@ impl DiskScopeApp {
                 .small()
                 .color(p.muted),
             );
-            let f = &self.request.filters;
-            for (key, label) in [
-                (
-                    0,
-                    if f.extensions.is_empty() {
-                        None
-                    } else {
-                        Some(f.extensions.join(", "))
-                    },
-                ),
-                (
-                    1,
-                    f.min_bytes.map(|n| format!("At least {}", format_bytes(n))),
-                ),
-                (
-                    2,
-                    f.max_bytes.map(|n| format!("At most {}", format_bytes(n))),
-                ),
-                (
-                    3,
-                    f.modified_after
-                        .map(|n| format!("Modified since {}", date_label(n))),
-                ),
-                (
-                    4,
-                    f.modified_before
-                        .map(|n| format!("Modified through {}", date_label(n))),
-                ),
-            ] {
-                if let Some(label) = label
+            for field in FilterField::ALL {
+                if let Some(label) = field.chip_label(&self.request.filters)
                     && ui
                         .add(
                             egui::Button::new(format!("{label}  ×"))
@@ -543,7 +553,7 @@ impl DiskScopeApp {
                         )
                         .clicked()
                 {
-                    clear.push(key);
+                    clear.push(field);
                 }
             }
             if !self.request.search.is_empty()
@@ -555,18 +565,12 @@ impl DiskScopeApp {
                 self.mark_query_changed();
             }
             if self.request.filters.is_active() && ui.small_button("Clear filters").clicked() {
-                clear.extend(0..5);
+                clear.extend(FilterField::ALL);
             }
         });
         if !clear.is_empty() {
-            for key in clear {
-                match key {
-                    0 => self.request.filters.extensions.clear(),
-                    1 => self.request.filters.min_bytes = None,
-                    2 => self.request.filters.max_bytes = None,
-                    3 => self.request.filters.modified_after = None,
-                    _ => self.request.filters.modified_before = None,
-                }
+            for field in clear {
+                field.clear(&mut self.request.filters);
             }
             self.mark_query_changed();
         }
@@ -584,6 +588,47 @@ impl DiskScopeApp {
             .unwrap_or_default();
         self.filter_after = f.modified_after.map(date_label).unwrap_or_default();
         self.filter_before = f.modified_before.map(date_label).unwrap_or_default();
+    }
+}
+
+/// One removable chip per filter condition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterField {
+    Extensions,
+    MinBytes,
+    MaxBytes,
+    ModifiedAfter,
+    ModifiedBefore,
+}
+impl FilterField {
+    const ALL: [FilterField; 5] = [
+        Self::Extensions,
+        Self::MinBytes,
+        Self::MaxBytes,
+        Self::ModifiedAfter,
+        Self::ModifiedBefore,
+    ];
+    fn chip_label(self, f: &QueryFilter) -> Option<String> {
+        match self {
+            Self::Extensions => (!f.extensions.is_empty()).then(|| f.extensions.join(", ")),
+            Self::MinBytes => f.min_bytes.map(|n| format!("At least {}", format_bytes(n))),
+            Self::MaxBytes => f.max_bytes.map(|n| format!("At most {}", format_bytes(n))),
+            Self::ModifiedAfter => f
+                .modified_after
+                .map(|n| format!("Modified since {}", date_label(n))),
+            Self::ModifiedBefore => f
+                .modified_before
+                .map(|n| format!("Modified through {}", date_label(n))),
+        }
+    }
+    fn clear(self, f: &mut QueryFilter) {
+        match self {
+            Self::Extensions => f.extensions.clear(),
+            Self::MinBytes => f.min_bytes = None,
+            Self::MaxBytes => f.max_bytes = None,
+            Self::ModifiedAfter => f.modified_after = None,
+            Self::ModifiedBefore => f.modified_before = None,
+        }
     }
 }
 

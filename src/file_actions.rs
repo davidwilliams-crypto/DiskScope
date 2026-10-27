@@ -485,11 +485,29 @@ mod shell {
     fn com_error(error: Error) -> ActionError {
         hresult_error(error.code())
     }
+    /// HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED).
+    const E_ACCESS_DENIED: u32 = 0x8007_0005;
+    /// HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION).
+    const E_SHARING_VIOLATION: u32 = 0x8007_0020;
+    /// HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION).
+    const E_LOCK_VIOLATION: u32 = 0x8007_0021;
+    /// E_ABORT, also what [`RecycleSink::refuse`] returns; the stored sink
+    /// error is checked before this mapping so the real reason wins.
+    const E_ABORTED: u32 = 0x8000_4004;
+    /// HRESULT_FROM_WIN32(ERROR_CANCELLED).
+    const E_CANCELLED: u32 = 0x8007_04c7;
+    /// COPYENGINE_E_USER_CANCELLED.
+    const COPYENGINE_E_USER_CANCELLED: u32 = 0x8027_0000;
+    /// COPYENGINE_E_CANCELLED.
+    const COPYENGINE_E_CANCELLED: u32 = 0x8027_0001;
+
     fn hresult_error(code: HRESULT) -> ActionError {
         match code.0 as u32 {
-            0x80070005 => ActionError::PermissionDenied,
-            0x80070020 | 0x80070021 => ActionError::Busy,
-            0x80004004 | 0x800704c7 | 0x80270000 | 0x80270001 => ActionError::Cancelled,
+            E_ACCESS_DENIED => ActionError::PermissionDenied,
+            E_SHARING_VIOLATION | E_LOCK_VIOLATION => ActionError::Busy,
+            E_ABORTED | E_CANCELLED | COPYENGINE_E_USER_CANCELLED | COPYENGINE_E_CANCELLED => {
+                ActionError::Cancelled
+            }
             _ => ActionError::Failed(format!(
                 "Windows could not complete the Recycle Bin operation ({:#010X}). No permanent fallback was requested.",
                 code.0 as u32

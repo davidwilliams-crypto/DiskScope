@@ -57,7 +57,7 @@ impl AccessMode {
 
     pub(crate) fn configure_native_options(&self, options: &mut eframe::NativeOptions) {
         if !self.persistence_allowed() {
-            // eframe 0.33 creates its default storage directory before App::new.
+            // eframe creates its default storage directory before App::new.
             // A custom path bypasses that branch; the Windows null device is a
             // sink even if eframe adds another persistence key in the future.
             options.persistence_path = Some(PathBuf::from(r"\\.\NUL"));
@@ -677,6 +677,9 @@ mod tests {
         app
     }
 
+    // The Cut-event translation is compiled only for Windows (`cfg!(windows)`
+    // in `file_action_keyboard`), so these two regressions are Windows-only.
+    #[cfg(windows)]
     #[test]
     fn windows_shift_delete_cut_event_opens_only_permanent_preparation() {
         let mut app = keyboard_app();
@@ -696,6 +699,7 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_shift_delete_cut_and_key_release_preserve_the_shortcut_after_modifier_release() {
         let mut app = keyboard_app();

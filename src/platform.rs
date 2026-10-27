@@ -22,8 +22,13 @@ pub fn enumerate(
     }
     let metadata = std::fs::symlink_metadata(path)?;
     if is_reparse(&metadata) {
-        emit(EnumerationEvent::Skipped);
-        return Ok(());
+        // Only a scan root reaches this point: nested reparse directories are
+        // listed but never scheduled. A silent empty "complete" scan would hide
+        // that nothing was read, so report it as an explicit root error.
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "The scan root is a directory junction or link. DiskScope does not follow links; choose the target folder instead.",
+        ));
     }
     #[cfg(windows)]
     if windows::enumerate(path, &cancelled, &mut emit)? {

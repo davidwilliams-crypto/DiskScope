@@ -83,7 +83,9 @@ enum TaskKind {
 enum Event {
     Started(u64, PathBuf),
     Entries(u64, NodeId, Vec<Entry>),
-    Error(u64, PathBuf, String),
+    /// A failure while enumerating the directory whose node id is given; the
+    /// path names the entry that failed (the directory itself or a child).
+    Error(u64, NodeId, PathBuf, String),
     Skipped(u64),
     Done(u64, NodeId),
     NtfsProgress(u64, crate::ntfs::NtfsProgress),
@@ -242,7 +244,7 @@ fn worker(tasks: Receiver<Task>, events: Sender<Event>, signals: Arc<Signals>) {
                         Event::Entries(task.generation, task.parent, entries)
                     }
                     EnumerationEvent::Error(path, error) => {
-                        Event::Error(task.generation, path, error.to_string())
+                        Event::Error(task.generation, task.parent, path, error.to_string())
                     }
                     EnumerationEvent::Skipped => Event::Skipped(task.generation),
                 };
@@ -253,7 +255,7 @@ fn worker(tasks: Receiver<Task>, events: Sender<Event>, signals: Arc<Signals>) {
         if let Err(error) = result {
             deliver(
                 &events,
-                Event::Error(task.generation, task.path, error.to_string()),
+                Event::Error(task.generation, task.parent, task.path, error.to_string()),
                 &signals,
                 task.generation,
             );
@@ -280,6 +282,9 @@ struct Scan {
     current_path: PathBuf,
     backend: String,
     root_failed: bool,
+    /// Directories whose enumeration reported any error; their allocation
+    /// stays unknown even after their worker finishes.
+    failed_dirs: std::collections::HashSet<NodeId>,
     kind: TaskKind,
     fallback_reason: Option<String>,
     raw_progress: Option<crate::ntfs::NtfsProgress>,
@@ -319,6 +324,7 @@ impl Scan {
             }
             .into(),
             root_failed: false,
+            failed_dirs: std::collections::HashSet::new(),
             kind,
             fallback_reason,
             raw_progress: None,
@@ -336,6 +342,7 @@ impl Scan {
         self.state = ScanState::Preparing;
         self.elapsed = None;
         self.root_failed = false;
+        self.failed_dirs.clear();
         self.kind = TaskKind::Directory;
         self.backend = "Normal fallback (NTFS reader unavailable)".into();
         self.fallback_reason = Some(format!(
@@ -352,25 +359,66 @@ impl Scan {
         for id in ids {
             let node = &mut model.nodes[id as usize];
             if node.is_dir {
-                node.allocation_complete = false;
+                // Reparse directories are never enumerated, so nothing inside
+                // them is pending; ordinary directories wait for their Done.
+                node.allocation_complete = node.reparse;
                 if node.reparse {
                     model.skipped = model.skipped.saturating_add(1);
                 }
             }
         }
     }
+    fn directory_failed(&mut self, parent: NodeId) {
+        self.failed_dirs.insert(parent);
+        if let Some(node) = Arc::get_mut(&mut self.model)
+            .expect("active scan owns model")
+            .nodes
+            .get_mut(parent as usize)
+        {
+            node.allocation_complete = false;
+        }
+    }
+    fn directory_done(&mut self, parent: NodeId) {
+        if self.failed_dirs.contains(&parent) {
+            return;
+        }
+        if let Some(node) = Arc::get_mut(&mut self.model)
+            .expect("active scan owns model")
+            .nodes
+            .get_mut(parent as usize)
+        {
+            node.allocation_complete = true;
+        }
+    }
+    /// Settles `allocation_complete` for every directory. A directory is
+    /// complete only when its own enumeration finished without error and every
+    /// child directory is complete, so a single denied folder leaves exactly
+    /// its ancestors unknown while unrelated siblings keep their totals.
     fn finish(&mut self, state: ScanState) {
         self.state = state;
         self.elapsed = Some(self.started.elapsed());
         let _sweep = Span::new(Metric::FinishSweep);
         let model = Arc::get_mut(&mut self.model).expect("only active scans mutate metadata");
-        for node in &mut model.nodes {
-            if node.is_dir {
-                node.allocation_complete = state == ScanState::Complete;
+        if state == ScanState::Complete {
+            for node in &mut model.nodes {
+                if node.is_dir {
+                    node.allocation_complete = true;
+                }
             }
+            return;
         }
-        if state != ScanState::Complete {
-            model.unique_allocated = None;
+        model.unique_allocated = None;
+        // Children are appended after their parent, so a reverse pass sees
+        // every child's settled flag before its parent.
+        for index in (0..model.nodes.len()).rev() {
+            if !model.nodes[index].is_dir || !model.nodes[index].allocation_complete {
+                continue;
+            }
+            let complete = model.nodes[index].children.iter().all(|&child| {
+                let child = &model.nodes[child as usize];
+                !child.is_dir || child.allocation_complete
+            });
+            model.nodes[index].allocation_complete = complete;
         }
     }
     fn snapshot(&self, request: &ViewRequest) -> UiSnapshot {
@@ -523,10 +571,13 @@ fn coordinate(
                         active.insert_entries(parent, entries);
                         dirty = true;
                     }
-                    Event::Error(generation, path, error) if generation == active.generation => {
-                        if path == active.model.root_path {
+                    Event::Error(generation, parent, path, error)
+                        if generation == active.generation =>
+                    {
+                        if parent == 0 {
                             active.root_failed = true;
                         }
+                        active.directory_failed(parent);
                         let model =
                             Arc::get_mut(&mut active.model).expect("active scan owns model");
                         model.record_error(path, error);
@@ -541,6 +592,7 @@ fn coordinate(
                     }
                     Event::Done(generation, parent) if generation == active.generation => {
                         active.outstanding = active.outstanding.saturating_sub(1);
+                        active.directory_done(parent);
                         active.current_path = active.model.path(parent);
                     }
                     _ => {}
@@ -597,7 +649,11 @@ fn coordinate(
                         active.next_node += 1;
                     }
                     if active.next_node == active.model.nodes.len() && active.outstanding == 0 {
-                        let state = if active.root_failed {
+                        // A root error with retained entries is a partial result,
+                        // not a failure; only an unreadable root fails the scan.
+                        let root_unreadable =
+                            active.root_failed && active.model.nodes[0].children.is_empty();
+                        let state = if root_unreadable {
                             ScanState::Failed
                         } else if active.model.errors_total > 0 || active.model.overflowed {
                             ScanState::Partial
@@ -700,7 +756,7 @@ mod tests {
 
     #[test]
     fn history_captures_once_only_complete_current_terminal_generation() {
-        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let history = crate::history::HistoryService::new(temp.path().join("history"));
         let (mut controller, tasks, events) = controlled_io_with_history(Some(history.capture()));
         let stale = controller.start(temp.path().join("old"), BackendChoice::Normal);
@@ -917,6 +973,113 @@ mod tests {
         }
     }
     #[test]
+    fn one_failed_directory_leaves_siblings_allocation_known_and_ancestors_unknown() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                root.parent,
+                vec![
+                    fixture_entry("denied", true, 0),
+                    fixture_entry("readable", true, 0),
+                ],
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        let first = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (denied, readable) = if first.parent == 1 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        events
+            .send(Event::Entries(
+                generation,
+                readable.parent,
+                vec![fixture_entry("kept", false, 23)],
+            ))
+            .unwrap();
+        events
+            .send(Event::Done(generation, readable.parent))
+            .unwrap();
+        events
+            .send(Event::Error(
+                generation,
+                denied.parent,
+                denied.path.clone(),
+                "injected access denied".into(),
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, denied.parent)).unwrap();
+        let snapshot = wait_snapshot(&controller, |s| !s.progress.state.is_active());
+        assert_eq!(snapshot.progress.state, ScanState::Partial);
+        assert_eq!(snapshot.progress.unique_allocated, None);
+        controller.request_view(ViewRequest {
+            revision: 1,
+            sort: SortKey::Name,
+            descending: false,
+            ..Default::default()
+        });
+        let view = wait_snapshot(&controller, |s| s.view.revision == 1);
+        let allocated: Vec<_> = view
+            .view
+            .rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.allocated))
+            .collect();
+        assert_eq!(allocated, [("denied", None), ("readable", Some(23))]);
+        controller.request_view(ViewRequest {
+            revision: 2,
+            root: 2,
+            ..Default::default()
+        });
+        let readable_view = wait_snapshot(&controller, |s| s.view.revision == 2);
+        assert_eq!(readable_view.view.unique_allocated, Some(23));
+    }
+    #[test]
+    fn root_error_after_retained_entries_is_partial_not_failed() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                root.parent,
+                vec![fixture_entry("first", false, 5)],
+            ))
+            .unwrap();
+        events
+            .send(Event::Error(
+                generation,
+                root.parent,
+                root.path.clone(),
+                "injected mid-listing failure".into(),
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        let snapshot = wait_snapshot(&controller, |s| !s.progress.state.is_active());
+        assert_eq!(snapshot.progress.state, ScanState::Partial);
+        assert_eq!(snapshot.progress.logical, 5);
+        assert_eq!(snapshot.progress.errors_total, 1);
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Error(
+                generation,
+                root.parent,
+                root.path.clone(),
+                "injected unreadable root".into(),
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        let snapshot = wait_snapshot(&controller, |s| !s.progress.state.is_active());
+        assert_eq!(snapshot.progress.state, ScanState::Failed);
+    }
+    #[test]
     fn child_enumeration_failure_retains_results_but_is_partial_and_allocation_unknown() {
         for partial_child in [false, true] {
             let (mut controller, tasks, events) = controlled_io();
@@ -946,6 +1109,7 @@ mod tests {
             events
                 .send(Event::Error(
                     generation,
+                    child.parent,
                     child.path.clone(),
                     "injected child access denied".into(),
                 ))
@@ -1352,7 +1516,7 @@ mod tests {
                 }
                 producer_events
                     .send_timeout(
-                        Event::Error(stale, "burst-new".into(), "stale failure".into()),
+                        Event::Error(stale, 0, "burst-new".into(), "stale failure".into()),
                         Duration::from_secs(2),
                     )
                     .unwrap();

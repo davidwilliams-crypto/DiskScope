@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::Path;
 
+/// Low 48 bits of an MFT reference: the record index without its sequence.
+#[cfg_attr(not(windows), allow(dead_code))]
 const INDEX_MASK: u64 = 0x0000_ffff_ffff_ffff;
 #[derive(Debug, Clone, Copy)]
 pub struct NtfsProgress {
@@ -24,6 +26,17 @@ pub fn scan_volume(
     Err(err("The NTFS volume backend requires Windows"))
 }
 
+/// System metadata records 0-15 other than the root directory (index 5)
+/// anchor subtrees that are excluded from user totals.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_metadata_parent(parent_index: u64) -> bool {
+    parent_index < 16 && parent_index != 5
+}
+
+/// Builds a [`Model`] from decoded MFT records. The decoder and this
+/// reconstruction are portable and unit-tested everywhere; only the Windows
+/// volume reader produces records outside tests.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn reconstruct(
     root: &Path,
     volume: u64,
@@ -165,12 +178,22 @@ fn reconstruct(
         if record.names.is_empty() || (record.is_dir && record.names.len() != 1) {
             return Err(err("Missing or ambiguous FILE_NAME links"));
         }
-        if !record.is_dir && (record.logical.is_none() || record.allocated.is_none()) {
+        // Files living only under metadata directories ($Extend\$Quota,
+        // $ObjId, $Reparse, $UsnJrnl) legitimately have no unnamed DATA
+        // stream. They are excluded from user totals, so their accounting is
+        // not required; demanding it would reject every standard volume.
+        let metadata_only = record
+            .names
+            .iter()
+            .all(|name| is_metadata_parent(name.parent & INDEX_MASK));
+        if !record.is_dir
+            && !metadata_only
+            && (record.logical.is_none() || record.allocated.is_none())
+        {
             return Err(err("Missing unnamed DATA accounting"));
         }
         for name in &record.names {
-            let parent_index = name.parent & INDEX_MASK;
-            if parent_index < 16 && parent_index != 5 {
+            if is_metadata_parent(name.parent & INDEX_MASK) {
                 excluded_roots.insert(name.parent);
             } else if bases.get(&name.parent).is_none_or(|p| !p.is_dir) {
                 return Err(err("Missing, stale or non-directory parent reference"));
@@ -284,6 +307,7 @@ pub struct AttributeKey {
     name: Vec<u16>,
 }
 #[derive(Debug, Clone)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct AttributeReference {
     reference: u64,
     key: AttributeKey,
@@ -1062,5 +1086,22 @@ mod tests {
         let model = reconstruct(Path::new("C:\\"), 42, 4096, records, || false).unwrap();
         assert_eq!(model.nodes.len(), 3);
         assert_eq!(model.nodes[0].logical, 10);
+    }
+    #[test]
+    fn metadata_files_without_unnamed_data_do_not_reject_the_volume() {
+        // $Extend ($MFT index 11) holds view-index files such as $Quota,
+        // $ObjId and $Reparse that carry no unnamed DATA stream.
+        let mut records = tree();
+        let mut quota = record(24, 11, "$Quota", false);
+        quota.logical = None;
+        quota.allocated = None;
+        records.push(quota);
+        let model = reconstruct(Path::new("C:\\"), 42, 4096, records, || false).unwrap();
+        assert_eq!(model.nodes.len(), 3);
+        assert_eq!(model.nodes[0].logical, 10);
+        // The same omission on a user file is still an error.
+        let mut records = tree();
+        records[2].logical = None;
+        assert!(reconstruct(Path::new("C:\\"), 42, 4096, records, || false).is_err());
     }
 }

@@ -345,7 +345,7 @@ fn history_worker(
         if let Err(error) = result {
             snapshot.message = error;
         }
-        if skipped {
+        if std::mem::take(&mut skipped) {
             snapshot.message.push_str(" Some history requests were skipped because the scan was incomplete/oversized or the background queue was busy.");
         }
         snapshot.busy = false;
@@ -368,7 +368,10 @@ fn save_capture(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let mut id = now.as_micros().min(u64::MAX as u128) as u64;
+    let mut id = next_snapshot_id(
+        now.as_micros().min(u64::MAX as u128) as u64,
+        snapshot.scans.iter().map(|s| s.id),
+    )?;
     while directory.file(id).exists() || snapshot.scans.iter().any(|s| s.id == id) {
         id = id.checked_add(1).ok_or("History ID exhausted")?;
     }
@@ -404,11 +407,22 @@ fn save_capture(
     validate(&saved)?;
     let bytes = encode(&saved)?;
     directory.write(id, &bytes)?;
-    snapshot.scans.insert(0, saved.summary);
+    snapshot.scans.push(saved.summary);
     snapshot.scans.sort_by_key(|s| std::cmp::Reverse(s.id));
     retain_snapshots(directory, snapshot)?;
     snapshot.message="Saved complete metadata locally; five snapshots maximum, 128 MiB each, 768 MiB including staging. No file contents stored.".into();
     Ok(())
+}
+
+/// Snapshot ids order the catalog and decide retention, so they must grow even
+/// when the wall clock moves backwards (VM restore, manual change, a shared
+/// history directory). The new id is the current time or one past the newest
+/// retained id, whichever is larger.
+fn next_snapshot_id(now_micros: u64, existing: impl Iterator<Item = u64>) -> Result<u64, String> {
+    match existing.max() {
+        Some(newest) => Ok(now_micros.max(newest.checked_add(1).ok_or("History ID exhausted")?)),
+        None => Ok(now_micros),
+    }
 }
 
 fn retain_snapshots(directory: &Directory, snapshot: &mut HistorySnapshot) -> Result<(), String> {
@@ -486,6 +500,7 @@ impl Directory {
         Ok(entries)
     }
     fn load(&self) -> Result<(Vec<ScanSummary>, String), String> {
+        let pruned = self.prune_staging()?;
         let mut files = self.owned()?;
         let total = self.disk_usage()?;
         if total > MAX_DISK_BYTES {
@@ -502,14 +517,33 @@ impl Directory {
                 Err(_) => rejected += 1,
             }
         }
-        let message = if rejected > 0 {
+        let mut message = if rejected > 0 {
             format!(
                 "Ignored {rejected} corrupt, oversized or incompatible history file(s). Clear history to remove them."
             )
         } else {
             "Local metadata history ready. Five snapshots maximum; no file contents stored.".into()
         };
+        if pruned > 0 {
+            message.push_str(&format!(" Removed {pruned} interrupted history write(s)."));
+        }
         Ok((scans, message))
+    }
+    /// Removes staging files left by an interrupted write. This directory is
+    /// exclusively owned, so no other window can be mid-write; without this,
+    /// an orphaned 128 MiB `.tmp` would count against the disk budget until
+    /// the user clears all history.
+    fn prune_staging(&self) -> Result<usize, String> {
+        let mut pruned = 0;
+        for path in self.staging()? {
+            self.check()?;
+            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                fs::remove_file(path).map_err(|e| e.to_string())?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
     fn read(&self, id: u64) -> Result<Saved, String> {
         self.check()?;
@@ -577,14 +611,7 @@ impl Directory {
         for (id, _, _) in self.owned()? {
             self.remove(id)?;
         }
-        for path in self.staging()? {
-            self.check()?;
-            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-            if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-                fs::remove_file(path).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
+        self.prune_staging().map(|_| ())
     }
     fn staging(&self) -> Result<Vec<PathBuf>, String> {
         self.check()?;

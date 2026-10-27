@@ -1,31 +1,28 @@
-use crate::theme::TextScale;
-use crate::theme::{Palette, Theme, load_system_font};
+mod changes;
+mod controls;
+mod management;
+mod native;
+mod state;
+mod ux;
+
+use crate::theme::{Palette, TextScale, Theme, load_system_font};
+use controls::{date_label, date_time_label};
 use diskscope::{
     engine::Controller,
     history::{self as scan_history, HistoryService, HistorySnapshot},
     model::*,
 };
-use state::{
-    BrowseContext, apply_type_lens, overview_type_share, previous_pair, restore_browse_context,
-    transitioned,
-};
-use state::{BrowseHistory, Command, apply_extensions, command_matches, hold_view, toggle_pin};
-#[path = "app/changes.rs"]
-mod changes;
-#[path = "app/controls.rs"]
-mod controls;
-#[path = "app/management.rs"]
-mod management;
-#[path = "app/native.rs"]
-mod native;
-pub(crate) use management::AccessMode;
-#[path = "app/ux.rs"]
-mod ux;
-use controls::{date_label, date_time_label};
 use eframe::egui::{self, Align, Color32, FontId, Layout, Rect, RichText, Sense, Stroke};
 use egui_extras::{Column, TableBuilder};
+pub(crate) use management::AccessMode;
+#[cfg(windows)]
+pub(crate) use native::windows_directory;
 use serde::{Deserialize, Serialize};
-use state::{comparison_matches, focus_change_request};
+use state::{
+    BrowseContext, BrowseHistory, Command, MAX_PINS, apply_extensions, apply_type_lens,
+    command_matches, comparison_matches, focus_change_request, hold_view, overview_type_share,
+    previous_pair, restore_browse_context, toggle_pin, transitioned,
+};
 use std::{
     path::PathBuf,
     sync::{
@@ -37,6 +34,11 @@ use std::{
 
 const PAGE_SIZE: usize = 256;
 const PREFERENCES_KEY: &str = "diskscope.preferences.v1";
+/// Breadcrumb trail length; deeper trails keep the current folder and hide the
+/// oldest ancestors behind an ellipsis.
+const MAX_BREADCRUMBS: usize = 12;
+/// Search text is re-queried this long after the last keystroke.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 #[derive(Default)]
 struct CancellationAcknowledgement {
     generation: Option<u64>,
@@ -83,6 +85,14 @@ fn progress_explanation(progress: &Progress) -> &str {
 }
 fn row_share(bytes: u64, view: &ViewSnapshot) -> f32 {
     share(bytes, view.row_scope_logical)
+}
+/// Stop wording shared by the compact and the metric header layouts.
+fn stop_status(state: ScanState) -> Option<&'static str> {
+    match state {
+        ScanState::Cancelling => Some("Stop requested · keeping partial results"),
+        ScanState::Cancelled => Some("Stopped · partial results"),
+        _ => None,
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -136,6 +146,8 @@ pub struct DiskScopeApp {
     newer_scan: Option<u64>,
     changes: bool,
     filter_open: bool,
+    /// Validation message shown inside the filter dialog until it closes.
+    filter_error: Option<&'static str>,
     filter_extensions: String,
     filter_min: String,
     filter_max: String,
@@ -225,6 +237,7 @@ impl DiskScopeApp {
             newer_scan: None,
             changes: false,
             filter_open: false,
+            filter_error: None,
             filter_extensions: String::new(),
             filter_min: String::new(),
             filter_max: String::new(),
@@ -459,7 +472,9 @@ impl DiskScopeApp {
             if !root.as_os_str().is_empty() {
                 dialog = dialog.set_directory(root);
             }
-            let _ = tx.try_send(NativeResult::Folder(dialog.pick_folder()));
+            // A dropped result would leave the Browse button disabled forever;
+            // blocking this helper thread until the UI drains is harmless.
+            let _ = tx.send(NativeResult::Folder(dialog.pick_folder()));
             ctx.request_repaint();
         });
     }
@@ -473,7 +488,7 @@ impl DiskScopeApp {
                     .map(|_| ())
                     .map_err(|e| format!("Could not open Explorer: {e}"))
             });
-            let _ = tx.try_send(NativeResult::Reveal(result));
+            let _ = tx.send(NativeResult::Reveal(result));
             ctx.request_repaint();
         });
     }
@@ -577,14 +592,7 @@ impl DiskScopeApp {
         if self.changes || self.request.mode == ViewMode::Overview || !state.is_active() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(if state == ScanState::Cancelling {
-                        "Stop requested · keeping partial results"
-                    } else if state == ScanState::Cancelled {
-                        "Stopped · partial results"
-                    } else {
-                        state.label()
-                    })
-                    .color(p.accent),
+                    RichText::new(stop_status(state).unwrap_or(state.label())).color(p.accent),
                 );
                 ui.separator();
                 ui.label(RichText::new(format_bytes(progress.logical)).strong());
@@ -684,19 +692,15 @@ impl DiskScopeApp {
             );
         });
         ui.horizontal(|ui| {
-            let status = if state == ScanState::Cancelling {
-                "Stop requested · keeping partial results"
-            } else if state.is_active() {
+            let status = stop_status(state).unwrap_or(if state.is_active() {
                 "Discovering · total unknown"
-            } else if progress.state == ScanState::Cancelled {
-                "Stopped · partial results"
             } else if progress.state == ScanState::Partial {
                 "Finished · partial results"
             } else if progress.state == ScanState::Complete {
                 "Complete · logical sizes"
             } else {
                 "Folder scan · read-only"
-            };
+            });
             ui.label(RichText::new(status).small().color(p.muted));
             ui.label(
                 RichText::new(format!(
@@ -756,10 +760,16 @@ impl DiskScopeApp {
             {
                 action = Some(Action::Up);
             }
-            if self.visible.view.breadcrumbs.is_empty() {
+            let crumbs = &self.visible.view.breadcrumbs;
+            if crumbs.is_empty() {
                 ui.label(RichText::new("Your folders").color(p.muted));
             } else {
-                for (id, name) in self.visible.view.breadcrumbs.iter().take(12) {
+                let hidden = crumbs.len().saturating_sub(MAX_BREADCRUMBS);
+                if hidden > 0 {
+                    ui.colored_label(p.faint, "…")
+                        .on_hover_text(format!("{hidden} parent folders not shown"));
+                }
+                for (id, name) in crumbs.iter().skip(hidden) {
                     ui.colored_label(p.faint, "/");
                     if ui
                         .add(
@@ -833,10 +843,24 @@ impl DiskScopeApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let width=(ui.available_width()-130.0).clamp(110.0,260.0);
-            let response=ui.add_sized([width,26.0],egui::TextEdit::singleline(&mut self.request.search).char_limit(1024).hint_text("Search names…"));
-            if response.changed(){self.search_changed=Some(Instant::now());}
-            if ui.checkbox(&mut self.request.search_all,"Whole scan").on_hover_text("Search and filters use the whole scan; the map keeps your current folder context.").changed(){self.mark_query_changed();}
+            let width = (ui.available_width() - 130.0).clamp(110.0, 260.0);
+            let response = ui.add_sized(
+                [width, 26.0],
+                egui::TextEdit::singleline(&mut self.request.search)
+                    .char_limit(1024)
+                    .hint_text("Search names…"),
+            );
+            if response.changed() {
+                self.search_changed = Some(Instant::now());
+            }
+            let scope = ui
+                .checkbox(&mut self.request.search_all, "Whole scan")
+                .on_hover_text(
+                    "Search and filters use the whole scan; the map keeps your current folder context.",
+                );
+            if scope.changed() {
+                self.mark_query_changed();
+            }
         });
     }
     fn explorer(&mut self, ui: &mut egui::Ui, height: f32, p: Palette) {
@@ -1095,14 +1119,7 @@ impl DiskScopeApp {
                             egui::Label::new(RichText::new("■").color(tile_color(&item.extension)))
                                 .selectable(false),
                         );
-                        ui.add(
-                            egui::Label::new(if item.extension.is_empty() {
-                                "No extension"
-                            } else {
-                                &item.extension
-                            })
-                            .selectable(false),
-                        );
+                        ui.add(egui::Label::new(&item.extension).selectable(false));
                     });
                     row.col(|ui| {
                         ui.add(egui::Label::new(format_bytes(item.logical)).selectable(false));
@@ -1163,8 +1180,17 @@ impl DiskScopeApp {
             if previous != self.request.map_layout {
                 self.mark_query_changed();
             }
-            ui.label(RichText::new("Area = logical size").small().color(p.faint)).on_hover_text("Folder colors distinguish items. Click to inspect; double-click a folder to open it.");
-            if ui.available_width()>260.0 {ui.label(RichText::new("Click to inspect · double-click to open").small().color(p.faint));}
+            ui.label(RichText::new("Area = logical size").small().color(p.faint))
+                .on_hover_text(
+                    "Folder colors distinguish items. Click to inspect; double-click a folder to open it.",
+                );
+            if ui.available_width() > 260.0 {
+                ui.label(
+                    RichText::new("Click to inspect · double-click to open")
+                        .small()
+                        .color(p.faint),
+                );
+            }
         });
         let width = ui.available_width();
         let (rect, _) =
@@ -1296,16 +1322,13 @@ impl DiskScopeApp {
         }
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Files:").small().color(p.faint));
-            for name in [
-                "Video",
-                "Archives",
-                "Developer",
-                "Images",
-                "Documents",
-                "Other",
-            ] {
-                ui.colored_label(tile_color(legend_sample(name)), "■");
-                ui.label(RichText::new(name).small().color(p.muted));
+            for (label, color) in FILE_CATEGORIES
+                .iter()
+                .map(|category| (category.label, category.color))
+                .chain([("Other", OTHER_TILE_COLOR)])
+            {
+                ui.colored_label(color, "■");
+                ui.label(RichText::new(label).small().color(p.muted));
             }
         });
         if let Some(action) = action {
@@ -1403,6 +1426,9 @@ impl DiskScopeApp {
         if row.hard_link {
             detail(ui, "Hard link", "Yes", p);
         }
+        if let Some(modified) = row.modified {
+            detail(ui, "Modified", &date_time_label(modified), p);
+        }
         ui.add_space(15.0);
         if row.is_dir
             && ui
@@ -1493,16 +1519,38 @@ impl DiskScopeApp {
         );
     }
     fn error_window(&mut self, ctx: &egui::Context, p: Palette) {
-        egui::Window::new("Scan errors & skipped locations").open(&mut self.show_errors).default_size([650.0,350.0]).show(ctx,|ui| {
-            let progress=&self.snapshot.progress;
-            ui.label(format!("{} errors · {} skipped entries",format_count(progress.errors_total),format_count(progress.skipped)));
-            ui.label(RichText::new("Skipped directory reparse points are not followed. Error samples are bounded.").small().color(p.muted)); ui.separator();
-            egui::ScrollArea::vertical().show_rows(ui,50.0,progress.errors.len(),|ui,range| {for error in &progress.errors[range] {
-                ui.add(egui::Label::new(RichText::new(error.path.to_string_lossy()).strong()).truncate()).on_hover_text(error.path.to_string_lossy());
-                ui.label(RichText::new(&error.message).small().color(p.muted));
-            }});
-            if progress.errors.is_empty() {ui.label("No error samples.");}
-        });
+        egui::Window::new("Scan errors & skipped locations")
+            .open(&mut self.show_errors)
+            .default_size([650.0, 350.0])
+            .show(ctx, |ui| {
+                let progress = &self.snapshot.progress;
+                ui.label(format!(
+                    "{} errors · {} skipped entries",
+                    format_count(progress.errors_total),
+                    format_count(progress.skipped)
+                ));
+                ui.label(
+                    RichText::new(
+                        "Skipped directory reparse points are not followed. Error samples are bounded.",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical().show_rows(ui, 50.0, progress.errors.len(), |ui, range| {
+                    for error in &progress.errors[range] {
+                        ui.add(
+                            egui::Label::new(RichText::new(error.path.to_string_lossy()).strong())
+                                .truncate(),
+                        )
+                        .on_hover_text(error.path.to_string_lossy());
+                        ui.label(RichText::new(&error.message).small().color(p.muted));
+                    }
+                });
+                if progress.errors.is_empty() {
+                    ui.label("No error samples.");
+                }
+            });
     }
 }
 impl eframe::App for DiskScopeApp {
@@ -1520,7 +1568,7 @@ impl eframe::App for DiskScopeApp {
         }
         if self
             .search_changed
-            .is_some_and(|time| time.elapsed() >= Duration::from_millis(180))
+            .is_some_and(|time| time.elapsed() >= SEARCH_DEBOUNCE)
         {
             self.mark_query_changed();
         }
@@ -1687,16 +1735,54 @@ fn format_count(count: u64) -> String {
     }
     text
 }
-fn legend_sample(label: &str) -> &'static str {
-    match label {
-        "Video" => ".mp4",
-        "Archives" => ".zip",
-        "Developer" => ".rs",
-        "Images" => ".png",
-        "Documents" => ".pdf",
-        _ => "",
+/// A named family of extensions with its map colour. One table feeds the map
+/// tiles, the legend and the filter presets so they can never disagree.
+pub(crate) struct FileCategory {
+    pub label: &'static str,
+    /// Lowercase extensions without the leading dot.
+    pub extensions: &'static [&'static str],
+    pub color: Color32,
+}
+impl FileCategory {
+    /// The category as a filter string, e.g. `.mp4, .mkv`.
+    pub fn filter_text(&self) -> String {
+        self.extensions
+            .iter()
+            .map(|extension| format!(".{extension}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
+pub(crate) const FILE_CATEGORIES: [FileCategory; 5] = [
+    FileCategory {
+        label: "Video",
+        extensions: &["mp4", "mkv", "mov", "avi", "webm", "wmv"],
+        color: Color32::from_rgb(80, 127, 152),
+    },
+    FileCategory {
+        label: "Archives",
+        extensions: &["zip", "7z", "rar", "tar", "gz", "iso"],
+        color: Color32::from_rgb(154, 134, 94),
+    },
+    FileCategory {
+        label: "Code",
+        extensions: &[
+            "rs", "js", "ts", "py", "cs", "cpp", "c", "h", "json", "toml",
+        ],
+        color: Color32::from_rgb(105, 140, 120),
+    },
+    FileCategory {
+        label: "Images",
+        extensions: &["png", "jpg", "jpeg", "gif", "webp", "svg", "heic", "psd"],
+        color: Color32::from_rgb(131, 117, 150),
+    },
+    FileCategory {
+        label: "Documents",
+        extensions: &["pdf", "doc", "docx", "txt", "md", "xlsx", "pptx"],
+        color: Color32::from_rgb(123, 142, 158),
+    },
+];
+const OTHER_TILE_COLOR: Color32 = Color32::from_rgb(80, 104, 115);
 fn folder_color(name: &str) -> Color32 {
     // This distinguishes sibling items only; it says nothing about their contents.
     let hash = name.bytes().fold(2_166_136_261u32, |h, b| {
@@ -1704,20 +1790,13 @@ fn folder_color(name: &str) -> Color32 {
     });
     egui::ecolor::Hsva::new((hash % 360) as f32 / 360.0, 0.40, 0.38, 1.0).into()
 }
+/// Colour for a file name or a type bucket such as `.mp4`.
 fn tile_color(name: &str) -> Color32 {
     let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match extension.as_str() {
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "wmv" => Color32::from_rgb(80, 127, 152),
-        "zip" | "7z" | "rar" | "tar" | "gz" | "iso" => Color32::from_rgb(154, 134, 94),
-        "rs" | "js" | "ts" | "py" | "cs" | "cpp" | "c" | "h" | "json" | "toml" => {
-            Color32::from_rgb(105, 140, 120)
-        }
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "heic" | "psd" => {
-            Color32::from_rgb(131, 117, 150)
-        }
-        "pdf" | "doc" | "docx" | "txt" | "md" | "xlsx" | "pptx" => Color32::from_rgb(123, 142, 158),
-        _ => Color32::from_rgb(80, 104, 115),
-    }
+    FILE_CATEGORIES
+        .iter()
+        .find(|category| category.extensions.contains(&extension.as_str()))
+        .map_or(OTHER_TILE_COLOR, |category| category.color)
 }
 fn opaque_tint(color: Color32, factor: f32) -> Color32 {
     Color32::from_rgb(
@@ -2357,6 +2436,3 @@ mod tests {
         assert!(admits_snapshot(4, 7, 4, 7));
     }
 }
-
-#[path = "app/state.rs"]
-mod state;
