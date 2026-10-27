@@ -2,7 +2,7 @@
 //! palette. Nothing here touches egui, so every rule is unit-testable.
 use super::*;
 use diskscope::view::NO_EXTENSION;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, path::Path};
 
 /// Back/Forward entries beyond this count drop the oldest context.
 const BROWSE_HISTORY_LIMIT: usize = 128;
@@ -84,6 +84,236 @@ pub(super) fn restore_browse_context(
     previous.request.revision = current.revision;
     previous.request.pinned = current.pinned.clone();
     previous
+}
+
+/// Where to put the user once a rescan has discovered it again.
+///
+/// Node ids are handed out in discovery order, so every scan numbers the same
+/// folder differently. The place is therefore kept as native paths and looked
+/// up again. It stays pending while the scan is still running (the model does
+/// not contain a folder until the scan reaches it) and ends only when the path
+/// resolves or the scan has stopped.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PendingRestore {
+    /// The scan root; the walk towards an ancestor never goes above it.
+    scan_root: PathBuf,
+    /// The folder to reopen. Replaced by its parent when it cannot be found.
+    folder: PathBuf,
+    /// A direct child of `folder` to select, when one is worth selecting.
+    select: Option<PathBuf>,
+    /// Set once `folder` was not found and an ancestor is being tried.
+    fallen_back: Option<FallBack>,
+}
+
+/// The folder the user was in, remembered for the notice about losing it.
+#[derive(Clone, Debug, PartialEq)]
+struct FallBack {
+    from: PathBuf,
+    /// The scan stopped early, so the folder may exist without having been read.
+    incomplete: bool,
+}
+
+/// What a snapshot means for a pending restore.
+#[derive(Debug, PartialEq)]
+pub(super) enum RestoreStep {
+    /// The scan has not reached the target yet; ask again with the next snapshot.
+    Wait,
+    /// The target changed (the neighbour never appeared, or an ancestor is
+    /// tried instead); ask again with [`PendingRestore::focus_path`].
+    Retarget,
+    /// Done: adopt this place.
+    Land(Landing),
+}
+
+/// The place a restore ended at.
+#[derive(Debug, PartialEq)]
+pub(super) struct Landing {
+    pub root: NodeId,
+    pub selected: Option<NodeId>,
+    /// The snapshot that resolved the path was built around a different
+    /// folder (its parent), so the view must be requested again.
+    pub rebuild: bool,
+    /// Set when the folder was lost and a nearby place was opened instead.
+    pub notice: Option<String>,
+}
+
+fn folder_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn lost_folder_notice(lost: &FallBack, landed_in: Option<&Path>) -> String {
+    let name = folder_name(&lost.from);
+    let why = if lost.incomplete {
+        "was not found in these incomplete results"
+    } else {
+        "is no longer in the scan"
+    };
+    match landed_in {
+        Some(parent) => format!(
+            "{name} {why}, so DiskScope opened its closest remaining parent folder, {}.",
+            folder_name(parent)
+        ),
+        None => format!("{name} {why}, so DiskScope opened the scan root."),
+    }
+}
+
+impl PendingRestore {
+    /// `None` when there is nothing to restore: the user was at the scan root
+    /// with no neighbour worth selecting.
+    pub fn new(scan_root: &Path, folder: &Path, select: Option<PathBuf>) -> Option<Self> {
+        (folder != scan_root || select.is_some()).then(|| Self {
+            scan_root: scan_root.to_path_buf(),
+            folder: folder.to_path_buf(),
+            select,
+            fallen_back: None,
+        })
+    }
+
+    /// The path the next view requests should focus on.
+    pub fn focus_path(&self) -> &Path {
+        self.select.as_deref().unwrap_or(&self.folder)
+    }
+
+    /// Gives up the neighbour selection (the user selected something else).
+    /// True when the focus target changed and must be requested again.
+    pub fn drop_selection(&mut self) -> bool {
+        self.select.take().is_some()
+    }
+
+    /// Short text for the header while the restore is pending.
+    pub fn status(&self) -> String {
+        format!(
+            "Restoring your place in {} once the scan reaches it.",
+            folder_name(&self.folder)
+        )
+    }
+
+    /// Decides what the newest admitted snapshot means. `view` must have been
+    /// built from a request focused on [`Self::focus_path`]; a resolved focus
+    /// shows up as the selected row carrying exactly that path.
+    pub fn observe(&mut self, view: &ViewSnapshot, state: ScanState) -> RestoreStep {
+        let target = self.focus_path();
+        let found = view.selected.as_ref().filter(|row| row.path == target);
+        if let Some(row) = found {
+            if self.select.is_some() {
+                return RestoreStep::Land(Landing {
+                    root: row.parent.unwrap_or(0),
+                    selected: Some(row.id),
+                    rebuild: false,
+                    notice: None,
+                });
+            }
+            if row.is_dir {
+                return RestoreStep::Land(Landing {
+                    root: row.id,
+                    selected: None,
+                    rebuild: true,
+                    notice: self
+                        .fallen_back
+                        .as_ref()
+                        .map(|lost| lost_folder_notice(lost, Some(&self.folder))),
+                });
+            }
+            // The path now names a file, which cannot turn back into a folder
+            // during this scan: treat the folder as lost.
+            return self.fall_back(state);
+        }
+        if state.is_active() {
+            return RestoreStep::Wait;
+        }
+        // The scan has stopped and the target is still absent.
+        if self.select.take().is_some() {
+            // The neighbour is gone too; the folder itself is still wanted.
+            return RestoreStep::Retarget;
+        }
+        self.fall_back(state)
+    }
+
+    /// Moves to the parent folder, or lands on the scan root when the walk is
+    /// used up.
+    fn fall_back(&mut self, state: ScanState) -> RestoreStep {
+        let lost = self.fallen_back.get_or_insert_with(|| FallBack {
+            from: self.folder.clone(),
+            incomplete: state != ScanState::Complete,
+        });
+        match self.folder.parent() {
+            Some(parent) if parent != self.scan_root && parent.starts_with(&self.scan_root) => {
+                self.folder = parent.to_path_buf();
+                RestoreStep::Retarget
+            }
+            _ => RestoreStep::Land(Landing {
+                root: 0,
+                selected: None,
+                rebuild: true,
+                notice: Some(lost_folder_notice(lost, None)),
+            }),
+        }
+    }
+}
+
+/// A browse position reduced to what survives a rescan.
+#[derive(Debug)]
+pub(super) struct SavedBrowse {
+    /// Query settings with every node id removed.
+    pub request: ViewRequest,
+    /// Present when the user was somewhere other than the top of the scan.
+    pub restore: Option<PendingRestore>,
+}
+
+/// The sibling to select after `removed` disappears: the next row under the
+/// same parent, otherwise the previous one.
+fn neighbour_of(rows: &[Row], removed: NodeId) -> Option<&Row> {
+    let index = rows.iter().position(|row| row.id == removed)?;
+    let parent = rows[index].parent;
+    let sibling = |row: &&Row| row.parent == parent;
+    rows[index + 1..]
+        .iter()
+        .find(sibling)
+        .or_else(|| rows[..index].iter().rev().find(sibling))
+}
+
+/// Reduces the current browse position to what can be carried into a rescan of
+/// `scan_root` after the file `removed` was acted on.
+///
+/// Query settings are kept as they are. Everything that holds a node id (root,
+/// selection, expanded folders, pins) starts fresh because ids are reassigned,
+/// and the page offset restarts at the first page because the listing changed.
+/// The folder and a neighbouring row are kept as paths from `view`, which must
+/// be the view currently displayed for `request` (`None` when it is not).
+pub(super) fn save_browse(
+    request: &ViewRequest,
+    view: Option<&ViewSnapshot>,
+    scan_root: &Path,
+    removed: NodeId,
+) -> SavedBrowse {
+    let kept = ViewRequest {
+        limit: request.limit,
+        mode: request.mode,
+        search: request.search.clone(),
+        search_all: request.search_all,
+        sort: request.sort,
+        descending: request.descending,
+        map_aspect: request.map_aspect,
+        filters: request.filters.clone(),
+        map_layout: request.map_layout,
+        ..ViewRequest::default()
+    };
+    let restore = view
+        .filter(|view| view.root == request.root)
+        .and_then(|view| {
+            // Only a direct child can be focused without leaving the folder.
+            let select = neighbour_of(&view.rows, removed)
+                .filter(|row| row.parent == Some(view.root))
+                .map(|row| row.path.clone());
+            PendingRestore::new(scan_root, &view.root_path, select)
+        });
+    SavedBrowse {
+        request: kept,
+        restore,
+    }
 }
 
 /// `None` switches to the Changes page; `Some(mode)` switches to a workspace.
@@ -238,6 +468,61 @@ impl Command {
             Self::Pin => "Pin / unpin selection",
             Self::Filters => "Edit filters",
             Self::Theme => "Switch theme",
+        }
+    }
+}
+/// What the command palette needs to know to tell which commands can run.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PaletteFacts {
+    pub scan_loaded: bool,
+    /// The displayed scan state, with a pending stop request folded in.
+    pub scan_state: ScanState,
+    pub can_back: bool,
+    pub can_forward: bool,
+    pub has_selection: bool,
+    pub selection_pinned: bool,
+    pub pins_full: bool,
+    pub history_saved: bool,
+    pub on_changes_page: bool,
+}
+
+impl Command {
+    /// Why this command cannot run right now, or `None` when it can. The
+    /// palette shows the reason and runs nothing for an unavailable command.
+    pub fn unavailable(self, facts: &PaletteFacts) -> Option<&'static str> {
+        match self {
+            Self::Stop => match facts.scan_state {
+                ScanState::Cancelling => Some("Stopping has already been requested."),
+                state if !state.is_active() => Some("No scan is running."),
+                _ => None,
+            },
+            Self::Back => (!facts.can_back).then_some("Nothing earlier to go back to."),
+            Self::Forward => (!facts.can_forward).then_some("Nothing later to go forward to."),
+            Self::Root => (!facts.scan_loaded).then_some("Scan a folder first."),
+            Self::Pin => {
+                if !facts.has_selection {
+                    Some("Select a folder or file first.")
+                } else if facts.pins_full && !facts.selection_pinned {
+                    Some("The comparison is full. Unpin an item first.")
+                } else {
+                    None
+                }
+            }
+            Self::Changes => {
+                if !facts.history_saved {
+                    Some("Scan history is not saved in this window.")
+                } else if facts.on_changes_page {
+                    Some("Already showing changes between scans.")
+                } else {
+                    None
+                }
+            }
+            Self::Overview
+            | Self::Explorer
+            | Self::Largest
+            | Self::Types
+            | Self::Filters
+            | Self::Theme => None,
         }
     }
 }
@@ -485,6 +770,481 @@ mod tests {
         assert_eq!(restored.offset, 256);
         assert_eq!(restored.revision, 17);
         assert_eq!(restored.pinned, [3]);
+    }
+
+    /// `/scan/a/{x.bin, y.bin, z.bin}` plus `/scan/top.bin`. Returns the model
+    /// and the id of `a`.
+    fn restore_model() -> (Model, NodeId) {
+        let mut model = Model::new("/scan".into());
+        let ids = model.insert_batch(0, vec![directory("a"), file("top.bin", 5)]);
+        let a = ids[0];
+        model.insert_batch(
+            a,
+            vec![file("x.bin", 30), file("y.bin", 20), file("z.bin", 10)],
+        );
+        (model, a)
+    }
+
+    /// The view the worker would build for a request focused on `path`.
+    fn focused_view(model: &Model, path: &str) -> ViewSnapshot {
+        let request = ViewRequest {
+            focus_path: Some(PathBuf::from(path)),
+            ..Default::default()
+        };
+        diskscope::view::build_view(model, &request, 1)
+    }
+
+    fn pending(folder: &str, select: Option<&str>) -> PendingRestore {
+        PendingRestore::new(
+            Path::new("/scan"),
+            Path::new(folder),
+            select.map(PathBuf::from),
+        )
+        .expect("a folder below the root needs restoring")
+    }
+
+    #[test]
+    fn restore_stays_pending_until_the_scan_reaches_the_folder() {
+        let mut model = Model::new("/scan".into());
+        let a = model.insert_batch(0, vec![directory("a")])[0];
+        let mut restore = pending("/scan/a/b", None);
+        // The scan is still running and has not listed `a` yet: not found is
+        // not an answer, however many snapshots arrive.
+        for _ in 0..3 {
+            let view = focused_view(&model, "/scan/a/b");
+            assert!(view.selected.is_none(), "the folder is not in the model");
+            assert_eq!(
+                restore.observe(&view, ScanState::Scanning),
+                RestoreStep::Wait
+            );
+        }
+        let b = model.insert_batch(a, vec![directory("b")])[0];
+        let view = focused_view(&model, "/scan/a/b");
+        assert_eq!(
+            restore.observe(&view, ScanState::Scanning),
+            RestoreStep::Land(Landing {
+                root: b,
+                selected: None,
+                // The resolving view is built around the parent `a`.
+                rebuild: true,
+                notice: None,
+            })
+        );
+    }
+
+    #[test]
+    fn restore_selects_a_neighbour_inside_the_folder_without_rebuilding() {
+        let (model, a) = restore_model();
+        let mut restore = pending("/scan/a", Some("/scan/a/y.bin"));
+        assert_eq!(restore.focus_path(), Path::new("/scan/a/y.bin"));
+        let view = focused_view(&model, "/scan/a/y.bin");
+        let y = view.selected.as_ref().map(|row| row.id);
+        assert_eq!(
+            restore.observe(&view, ScanState::Scanning),
+            RestoreStep::Land(Landing {
+                root: a,
+                selected: y,
+                rebuild: false,
+                notice: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_neighbour_that_never_appears_falls_back_to_just_the_folder() {
+        let (model, a) = restore_model();
+        let mut restore = pending("/scan/a", Some("/scan/a/gone.bin"));
+        let missing = focused_view(&model, "/scan/a/gone.bin");
+        // While scanning, the neighbour may simply not be listed yet.
+        assert_eq!(
+            restore.observe(&missing, ScanState::Scanning),
+            RestoreStep::Wait
+        );
+        assert_eq!(restore.focus_path(), Path::new("/scan/a/gone.bin"));
+        // Once the scan has stopped it cannot appear any more.
+        assert_eq!(
+            restore.observe(&missing, ScanState::Complete),
+            RestoreStep::Retarget
+        );
+        assert_eq!(restore.focus_path(), Path::new("/scan/a"));
+        let folder = focused_view(&model, "/scan/a");
+        assert_eq!(
+            restore.observe(&folder, ScanState::Complete),
+            RestoreStep::Land(Landing {
+                root: a,
+                selected: None,
+                rebuild: true,
+                notice: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_lost_folder_opens_the_closest_surviving_parent_and_says_so() {
+        let (model, a) = restore_model();
+        let mut restore = pending("/scan/a/b/c", None);
+        let view = focused_view(&model, "/scan/a/b/c");
+        assert_eq!(
+            restore.observe(&view, ScanState::Complete),
+            RestoreStep::Retarget
+        );
+        assert_eq!(restore.focus_path(), Path::new("/scan/a/b"));
+        let view = focused_view(&model, "/scan/a/b");
+        assert_eq!(
+            restore.observe(&view, ScanState::Complete),
+            RestoreStep::Retarget
+        );
+        assert_eq!(restore.focus_path(), Path::new("/scan/a"));
+        let view = focused_view(&model, "/scan/a");
+        let RestoreStep::Land(landing) = restore.observe(&view, ScanState::Complete) else {
+            panic!("the parent exists, so the walk must end there");
+        };
+        assert_eq!(
+            (landing.root, landing.selected, landing.rebuild),
+            (a, None, true)
+        );
+        assert_eq!(
+            landing.notice.as_deref(),
+            Some(
+                "c is no longer in the scan, so DiskScope opened its closest remaining parent folder, a."
+            )
+        );
+    }
+
+    #[test]
+    fn a_lost_top_level_folder_opens_the_scan_root_and_says_so() {
+        let (model, _) = restore_model();
+        let mut restore = pending("/scan/vanished", None);
+        let view = focused_view(&model, "/scan/vanished");
+        let RestoreStep::Land(landing) = restore.observe(&view, ScanState::Complete) else {
+            panic!("nothing is left to try below the scan root");
+        };
+        assert_eq!(
+            (landing.root, landing.selected, landing.rebuild),
+            (0, None, true)
+        );
+        assert_eq!(
+            landing.notice.as_deref(),
+            Some("vanished is no longer in the scan, so DiskScope opened the scan root.")
+        );
+    }
+
+    #[test]
+    fn an_incomplete_scan_never_claims_the_folder_was_removed() {
+        let (model, _) = restore_model();
+        for state in [ScanState::Cancelled, ScanState::Partial, ScanState::Failed] {
+            let mut restore = pending("/scan/vanished", None);
+            let view = focused_view(&model, "/scan/vanished");
+            let RestoreStep::Land(landing) = restore.observe(&view, state) else {
+                panic!("{state:?} is terminal");
+            };
+            let notice = landing.notice.expect("a lost folder is announced");
+            assert!(notice.contains("incomplete results"), "{state:?}: {notice}");
+            assert!(!notice.contains("no longer"), "{state:?}: {notice}");
+        }
+    }
+
+    #[test]
+    fn a_folder_replaced_by_a_file_is_lost_even_while_scanning() {
+        let (model, _) = restore_model();
+        // `/scan/top.bin` exists as a file; it cannot become a folder later.
+        let mut restore = pending("/scan/top.bin", None);
+        let view = focused_view(&model, "/scan/top.bin");
+        assert!(view.selected.is_some());
+        let RestoreStep::Land(landing) = restore.observe(&view, ScanState::Scanning) else {
+            panic!("a file is a definite answer");
+        };
+        assert_eq!(landing.root, 0);
+        assert!(landing.notice.is_some());
+    }
+
+    #[test]
+    fn nothing_is_restored_at_the_scan_root_unless_a_neighbour_is_wanted() {
+        let root = Path::new("/scan");
+        assert!(PendingRestore::new(root, root, None).is_none());
+        let with_neighbour = PendingRestore::new(root, root, Some("/scan/top.bin".into()));
+        assert!(with_neighbour.is_some());
+    }
+
+    #[test]
+    fn user_selection_drops_only_the_neighbour_not_the_folder() {
+        let mut restore = pending("/scan/a", Some("/scan/a/y.bin"));
+        assert!(restore.drop_selection());
+        assert_eq!(restore.focus_path(), Path::new("/scan/a"));
+        assert!(!restore.drop_selection(), "already dropped");
+    }
+
+    fn row_at(id: NodeId, parent: NodeId, name: &str) -> Row {
+        Row {
+            id,
+            parent: Some(parent),
+            depth: 0,
+            name: name.into(),
+            path: PathBuf::from("/scan/a").join(name),
+            is_dir: false,
+            reparse: false,
+            identity: None,
+            hard_link: false,
+            logical: 0,
+            allocated: None,
+            files: 0,
+            folders: 0,
+            modified: None,
+            has_children: false,
+        }
+    }
+
+    fn view_of(root: NodeId, rows: Vec<Row>) -> ViewSnapshot {
+        ViewSnapshot {
+            root,
+            root_path: PathBuf::from("/scan/a"),
+            rows,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn saved_browse_keeps_the_query_and_forgets_every_node_id() {
+        let mut request = ViewRequest {
+            root: 7,
+            selected: Some(9),
+            expanded: [3, 4].into_iter().collect(),
+            mode: ViewMode::Largest,
+            search: "log".into(),
+            search_all: true,
+            sort: SortKey::Name,
+            descending: false,
+            offset: 256,
+            limit: 256,
+            map_aspect: 1.5,
+            filters: QueryFilter {
+                extensions: vec![".log".into()],
+                min_bytes: Some(10),
+                ..Default::default()
+            },
+            map_layout: MapLayout::Icicle,
+            pinned: vec![2],
+            focus_path: Some("/scan/elsewhere".into()),
+            ..Default::default()
+        };
+        request.revision = 41;
+        let view = view_of(7, vec![row_at(9, 7, "gone.log")]);
+        let saved = save_browse(&request, Some(&view), Path::new("/scan"), 9);
+        let kept = saved.request;
+        assert_eq!(kept.mode, ViewMode::Largest);
+        assert_eq!(kept.search, "log");
+        assert!(kept.search_all);
+        assert_eq!(kept.sort, SortKey::Name);
+        assert!(!kept.descending);
+        assert_eq!(kept.limit, 256);
+        assert_eq!(kept.map_aspect, 1.5);
+        assert_eq!(kept.map_layout, MapLayout::Icicle);
+        assert_eq!(kept.filters.extensions, [".log"]);
+        assert_eq!(kept.filters.min_bytes, Some(10));
+        // Ids and one-shot state start fresh.
+        assert_eq!((kept.root, kept.selected, kept.offset), (0, None, 0));
+        assert!(kept.expanded.is_empty() && kept.pinned.is_empty());
+        assert_eq!((kept.revision, kept.focus_path), (0, None));
+        // The folder survives as a path.
+        let restore = saved.restore.expect("the user was inside a folder");
+        assert_eq!(restore.focus_path(), Path::new("/scan/a"));
+    }
+
+    #[test]
+    fn the_next_sibling_is_selected_else_the_previous_one() {
+        let rows = vec![
+            row_at(1, 7, "first"),
+            row_at(2, 7, "removed"),
+            row_at(3, 7, "next"),
+        ];
+        let request = ViewRequest {
+            root: 7,
+            ..Default::default()
+        };
+        let view = view_of(7, rows.clone());
+        let saved = save_browse(&request, Some(&view), Path::new("/scan"), 2);
+        let restore = saved.restore.unwrap();
+        assert_eq!(restore.focus_path(), Path::new("/scan/a/next"));
+
+        let last = view_of(7, rows[..2].to_vec());
+        let saved = save_browse(&request, Some(&last), Path::new("/scan"), 2);
+        assert_eq!(
+            saved.restore.unwrap().focus_path(),
+            Path::new("/scan/a/first")
+        );
+    }
+
+    #[test]
+    fn a_neighbour_must_be_a_sibling_and_a_direct_child_of_the_folder() {
+        // The removed file sits inside an expanded subfolder (parent 8), so
+        // its neighbour is not a direct child of the folder (7): focusing it
+        // would leave the folder, so only the folder is restored.
+        let rows = vec![
+            row_at(8, 7, "sub"),
+            row_at(9, 8, "removed"),
+            row_at(10, 8, "other"),
+        ];
+        let request = ViewRequest {
+            root: 7,
+            ..Default::default()
+        };
+        let view = view_of(7, rows);
+        let saved = save_browse(&request, Some(&view), Path::new("/scan"), 9);
+        assert_eq!(saved.restore.unwrap().focus_path(), Path::new("/scan/a"));
+
+        // The only row removed: nothing to select, but the folder is kept.
+        let view = view_of(7, vec![row_at(9, 7, "removed")]);
+        let saved = save_browse(&request, Some(&view), Path::new("/scan"), 9);
+        assert_eq!(saved.restore.unwrap().focus_path(), Path::new("/scan/a"));
+    }
+
+    #[test]
+    fn a_stale_or_missing_view_restores_the_query_but_not_the_folder() {
+        let request = ViewRequest {
+            root: 7,
+            sort: SortKey::Files,
+            ..Default::default()
+        };
+        // The displayed view belongs to another folder than the request.
+        let view = view_of(3, vec![row_at(9, 3, "removed")]);
+        let saved = save_browse(&request, Some(&view), Path::new("/scan"), 9);
+        assert!(saved.restore.is_none());
+        assert_eq!(saved.request.sort, SortKey::Files);
+        let saved = save_browse(&request, None, Path::new("/scan"), 9);
+        assert!(saved.restore.is_none());
+        assert_eq!(saved.request.sort, SortKey::Files);
+    }
+
+    #[test]
+    fn a_user_at_the_scan_root_needs_no_folder_but_keeps_a_neighbour() {
+        let request = ViewRequest::default();
+        let mut view = view_of(0, vec![row_at(1, 0, "removed"), row_at(2, 0, "next")]);
+        view.root_path = PathBuf::from("/scan");
+        let saved = save_browse(&request, Some(&view), Path::new("/scan"), 1);
+        assert_eq!(
+            saved.restore.unwrap().focus_path(),
+            Path::new("/scan/a/next")
+        );
+        view.rows.truncate(1);
+        assert!(
+            save_browse(&request, Some(&view), Path::new("/scan"), 1)
+                .restore
+                .is_none()
+        );
+    }
+
+    fn facts() -> PaletteFacts {
+        PaletteFacts {
+            scan_loaded: true,
+            scan_state: ScanState::Scanning,
+            can_back: true,
+            can_forward: true,
+            has_selection: true,
+            selection_pinned: false,
+            pins_full: false,
+            history_saved: true,
+            on_changes_page: false,
+        }
+    }
+
+    #[test]
+    fn every_command_runs_when_its_preconditions_hold() {
+        for command in Command::ALL {
+            assert_eq!(command.unavailable(&facts()), None, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn commands_that_cannot_run_say_why() {
+        let blocked = [
+            (
+                Command::Stop,
+                PaletteFacts {
+                    scan_state: ScanState::Complete,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Stop,
+                PaletteFacts {
+                    scan_state: ScanState::Idle,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Stop,
+                PaletteFacts {
+                    scan_state: ScanState::Cancelling,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Back,
+                PaletteFacts {
+                    can_back: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Forward,
+                PaletteFacts {
+                    can_forward: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Root,
+                PaletteFacts {
+                    scan_loaded: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Pin,
+                PaletteFacts {
+                    has_selection: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Pin,
+                PaletteFacts {
+                    pins_full: true,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Changes,
+                PaletteFacts {
+                    history_saved: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Changes,
+                PaletteFacts {
+                    on_changes_page: true,
+                    ..facts()
+                },
+            ),
+        ];
+        for (command, facts) in blocked {
+            let reason = command.unavailable(&facts);
+            assert!(
+                reason.is_some_and(|text| text.ends_with('.')),
+                "{command:?} with {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_comparison_still_lets_the_user_unpin_the_selection() {
+        let full_but_pinned = PaletteFacts {
+            pins_full: true,
+            selection_pinned: true,
+            ..facts()
+        };
+        assert_eq!(Command::Pin.unavailable(&full_but_pinned), None);
     }
 
     #[test]

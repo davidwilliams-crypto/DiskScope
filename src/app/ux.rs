@@ -2,8 +2,12 @@ use super::*;
 
 impl DiskScopeApp {
     pub(super) fn browse_context(&self) -> BrowseContext {
+        let mut request = self.request.clone();
+        // A focus is a pending lookup, not a place: restoring it later would
+        // jump to a path the user has long since left.
+        request.focus_path = None;
         BrowseContext {
-            request: self.request.clone(),
+            request,
             changes: self.changes,
             older_scan: self.older_scan,
             newer_scan: self.newer_scan,
@@ -14,6 +18,7 @@ impl DiskScopeApp {
         self.history.remember(&current);
     }
     pub(super) fn restore_context(&mut self, context: BrowseContext) {
+        self.cancel_restore();
         let context = restore_browse_context(&self.request, context);
         self.request = context.request;
         self.changes = context.changes;
@@ -514,7 +519,11 @@ impl DiskScopeApp {
                 );
             }
         });
-        if let Some(notice) = self.visible.view.notice.as_ref() {
+        // While a restore is pending its focus is expected to miss for a
+        // while, so the worker's "path is not present" note would mislead.
+        if self.restore.is_none()
+            && let Some(notice) = self.visible.view.notice.as_ref()
+        {
             ui.colored_label(p.muted, notice);
         }
     }
