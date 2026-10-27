@@ -3,6 +3,8 @@ mod controls;
 mod management;
 mod native;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod ux;
 
 use crate::theme::{Palette, TextScale, Theme, load_system_font};
@@ -19,9 +21,10 @@ pub(crate) use management::AccessMode;
 pub(crate) use native::windows_directory;
 use serde::{Deserialize, Serialize};
 use state::{
-    BrowseContext, BrowseHistory, Command, MAX_PINS, apply_extensions, apply_type_lens,
-    command_matches, comparison_matches, focus_change_request, hold_view, overview_type_share,
-    previous_pair, restore_browse_context, toggle_pin, transitioned,
+    BrowseContext, BrowseHistory, Command, MAX_PINS, PaletteFacts, PendingRestore, RestoreStep,
+    SavedBrowse, apply_extensions, apply_type_lens, command_matches, comparison_matches,
+    focus_change_request, hold_view, overview_type_share, previous_pair, restore_browse_context,
+    save_browse, toggle_pin, transitioned,
 };
 use std::{
     path::PathBuf,
@@ -86,13 +89,52 @@ fn progress_explanation(progress: &Progress) -> &str {
 fn row_share(bytes: u64, view: &ViewSnapshot) -> f32 {
     share(bytes, view.row_scope_logical)
 }
-/// Stop wording shared by the compact and the metric header layouts.
+/// What the header's stop status says while a stop is pending or done.
 fn stop_status(state: ScanState) -> Option<&'static str> {
     match state {
         ScanState::Cancelling => Some("Stop requested · keeping partial results"),
         ScanState::Cancelled => Some("Stopped · partial results"),
         _ => None,
     }
+}
+/// The header's detail line: what the scan is doing, where it is reading, and
+/// whether the user's place is still being looked up. Empty when there is
+/// nothing to add.
+fn status_detail(
+    progress: &Progress,
+    state: ScanState,
+    restore: Option<&PendingRestore>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(restore) = restore {
+        parts.push(restore.status());
+    }
+    if state.is_active() {
+        parts.push(progress_explanation(progress).to_owned());
+        let reading = progress.current_path.to_string_lossy();
+        if !reading.is_empty() {
+            parts.push(reading.into_owned());
+        }
+    } else if matches!(state, ScanState::Partial | ScanState::Failed) {
+        parts.push(progress_explanation(progress).to_owned());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join(" · ")
+}
+const NO_ERRORS_HINT: &str =
+    "No errors were reported. Skipped links and reparse points are not errors.";
+/// The error-count button. With nothing to list it is disabled and says why
+/// instead of opening an empty window. True when it was clicked.
+fn errors_button(ui: &mut egui::Ui, errors_total: u64) -> bool {
+    let label = format!(
+        "{} {}",
+        format_count(errors_total),
+        if errors_total == 1 { "error" } else { "errors" }
+    );
+    let response = ui.add_enabled(errors_total > 0, egui::Button::new(label).small());
+    let clicked = response.clicked();
+    response.on_disabled_hover_text(NO_ERRORS_HINT);
+    clicked
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -139,6 +181,10 @@ pub struct DiskScopeApp {
     volume_tx: SyncSender<(u64, PathBuf)>,
     history: BrowseHistory,
     pending: Option<Arc<UiSnapshot>>,
+    /// A browse position being looked up again in a rescan; see
+    /// [`PendingRestore`]. While it is set, `request.focus_path` carries its
+    /// current target so every view request keeps asking until it resolves.
+    restore: Option<PendingRestore>,
     history_service: HistoryService,
     history_snapshot: Arc<HistorySnapshot>,
     history_directory: PathBuf,
@@ -230,6 +276,7 @@ impl DiskScopeApp {
             volume_tx,
             history: BrowseHistory::default(),
             pending: None,
+            restore: None,
             history_service,
             history_snapshot: Arc::new(HistorySnapshot::default()),
             history_directory,
@@ -267,18 +314,48 @@ impl DiskScopeApp {
         }
         app
     }
+    /// Starts a new scan from the top: Overview at the scan root, no history.
     fn begin_scan(&mut self, path: PathBuf) {
+        self.start_scan(path, None);
+    }
+    /// Rescans `root` after the file `removed` was acted on and keeps the
+    /// user's place: the folder, workspace, sort, filters and search. Back and
+    /// Forward still reset, because their entries hold node ids that the new
+    /// scan reassigns.
+    fn rescan_keeping_place(&mut self, root: PathBuf, removed: NodeId) {
+        // The displayed view names its folder by path, but is only trusted
+        // when it belongs to the scan the request is about.
+        let view = (self.visible.view.generation == self.generation).then_some(&self.visible.view);
+        let saved = save_browse(&self.request, view, &root, removed);
+        self.start_scan(root, Some(saved));
+    }
+    fn start_scan(&mut self, path: PathBuf, keep: Option<SavedBrowse>) {
         if self.management.busy() {
             return;
         }
         self.root_path = path;
         self.path_text = self.root_path.to_string_lossy().into_owned();
         self.path_edited = false;
-        self.request = ViewRequest {
-            limit: PAGE_SIZE,
-            mode: ViewMode::Overview,
-            ..ViewRequest::default()
+        let (mut request, restore) = match keep {
+            Some(saved) => (saved.request, saved.restore),
+            None => (
+                ViewRequest {
+                    mode: ViewMode::Overview,
+                    ..ViewRequest::default()
+                },
+                None,
+            ),
         };
+        request.limit = PAGE_SIZE;
+        // The worker keeps answering with its last request until the new one
+        // arrives. Revisions that never go backwards keep those leftover
+        // answers from matching the new scan's first request.
+        request.revision = self.request.revision;
+        request.focus_path = restore
+            .as_ref()
+            .map(|restore| restore.focus_path().to_path_buf());
+        self.request = request;
+        self.restore = restore;
         self.history.clear();
         self.pending = None;
         self.changes = false;
@@ -323,11 +400,8 @@ impl DiskScopeApp {
                 self.request.revision,
                 next.view.generation,
                 next.view.revision,
-            ) {
-                if self.request.focus_path.take().is_some() {
-                    self.request.root = next.view.root;
-                    self.request.selected = next.view.selected.as_ref().map(|row| row.id);
-                }
+            ) && !self.settle_focus(&next)
+            {
                 if hold_view(
                     self.preferences.stable_updates,
                     self.visible.view.revision,
@@ -403,12 +477,69 @@ impl DiskScopeApp {
         self.search_changed = None;
         self.dirty = true;
     }
+    /// Applies a one-shot path focus carried by the newest admitted snapshot.
+    /// Returns true when the snapshot must not be displayed because the view
+    /// has to be requested again around the place that was just found.
+    fn settle_focus(&mut self, next: &UiSnapshot) -> bool {
+        let Some(restore) = self.restore.as_mut() else {
+            // A jump to one changed item resolves against a finished scan, so
+            // the first admitted snapshot answers it either way.
+            if self.request.focus_path.take().is_some() {
+                self.request.root = next.view.root;
+                self.request.selected = next.view.selected.as_ref().map(|row| row.id);
+            }
+            return false;
+        };
+        match restore.observe(&next.view, next.progress.state) {
+            RestoreStep::Wait => false,
+            RestoreStep::Retarget => {
+                self.request.focus_path = Some(restore.focus_path().to_path_buf());
+                self.dirty = true;
+                false
+            }
+            RestoreStep::Land(landing) => {
+                self.restore = None;
+                self.request.focus_path = None;
+                self.request.root = landing.root;
+                self.request.selected = landing.selected;
+                self.request.expanded.clear();
+                self.request.offset = 0;
+                if let Some(lost) = landing.notice {
+                    // Keep the file action's own notice; the lost folder is
+                    // extra information, not a replacement for it.
+                    self.notice = Some(match self.notice.take() {
+                        Some(existing) => format!("{existing} {lost}"),
+                        None => lost,
+                    });
+                }
+                // Always ask again: the worker keeps answering with the last
+                // request it was given, focus path included, until a new one
+                // replaces it. When `rebuild` is false this snapshot is already
+                // consistent with the new request and is still displayed.
+                self.dirty = true;
+                landing.rebuild
+            }
+        }
+    }
+    /// Ends a pending restore because the user chose somewhere else.
+    fn cancel_restore(&mut self) {
+        if self.restore.take().is_some() {
+            self.request.focus_path = None;
+        }
+    }
     fn action(&mut self, action: Action) {
         if self.management.busy() {
             return;
         }
         match action {
             Action::Select(id) => {
+                // An explicit choice beats the remembered neighbour; the
+                // folder is still restored.
+                if let Some(restore) = self.restore.as_mut()
+                    && restore.drop_selection()
+                {
+                    self.request.focus_path = Some(restore.focus_path().to_path_buf());
+                }
                 self.request.selected = Some(id);
                 self.dirty = true;
             }
@@ -425,6 +556,7 @@ impl DiskScopeApp {
                 self.dirty = true;
             }
             Action::Navigate(id) => {
+                self.cancel_restore();
                 if id != self.request.root {
                     self.remember_context();
                 }
@@ -587,151 +719,67 @@ impl DiskScopeApp {
             }
         });
         ui.add_space(12.0);
-        let progress = &self.snapshot.progress;
+        self.scan_summary(ui, p);
+        self.notice_line(ui, p);
+        ui.add_space(6.0);
+        ui.separator();
+    }
+    /// The totals and status of the current scan. Every page and every scan
+    /// state uses this one layout, so the header keeps its shape when a scan
+    /// finishes or the workspace changes. The detail line is always laid out
+    /// (blank when there is nothing to say) to keep the height constant.
+    fn scan_summary(&mut self, ui: &mut egui::Ui, p: Palette) {
         let state = self.scan_state();
-        if self.changes || self.request.mode == ViewMode::Overview || !state.is_active() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(stop_status(state).unwrap_or(state.label())).color(p.accent),
-                );
-                ui.separator();
-                ui.label(RichText::new(format_bytes(progress.logical)).strong());
-                ui.label(
-                    RichText::new(format!(
-                        "logical · {} files · {} folders · {} elapsed",
-                        format_count(progress.files),
-                        format_count(progress.folders),
-                        format_duration(progress.elapsed)
-                    ))
-                    .color(p.muted),
-                );
-                if ui
-                    .small_button(format!("{} errors", format_count(progress.errors_total)))
-                    .clicked()
-                {
-                    self.show_errors = true;
-                }
-                if let Some(scan) = self
-                    .history_snapshot
-                    .scans
-                    .iter()
-                    .find(|scan| scan.live_generation == Some(self.generation))
-                {
-                    ui.label(
-                        RichText::new(format!("Scanned {}", date_time_label(scan.finished_unix)))
-                            .small()
-                            .color(p.faint),
-                    );
-                }
-            });
-            if state.is_active() || matches!(state, ScanState::Partial | ScanState::Failed) {
-                ui.label(
-                    RichText::new(progress_explanation(progress))
-                        .small()
-                        .color(p.muted),
-                );
-            }
-            if let Some(notice) = self.notice.clone() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(p.accent, notice);
-                    if ui.small_button("Dismiss").clicked() {
-                        self.notice = None;
-                    }
-                });
-            }
-            ui.add_space(6.0);
+        let progress = &self.snapshot.progress;
+        let errors_total = progress.errors_total;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(stop_status(state).unwrap_or(state.label())).color(p.accent));
             ui.separator();
-            return;
-        }
-        let available = ui.available_width();
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(available * 0.34, 54.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_min_width(available * 0.34);
-                    ui.horizontal(|ui| {
-                        if state.is_active() && !self.preferences.reduced_motion {
-                            ui.add(egui::Spinner::new().size(12.0).color(p.accent));
-                        } else {
-                            ui.colored_label(p.accent, "●");
-                        }
-                        ui.label(RichText::new(state.label()).strong());
-                    });
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(progress_explanation(progress))
-                                .small()
-                                .color(p.muted),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(progress_explanation(progress));
-                },
-            );
-            metric(
-                ui,
-                &format_bytes(progress.logical),
-                "LOGICAL SIZE",
-                p,
-                available * 0.21,
-            );
-            metric(
-                ui,
-                &format_count(progress.files),
-                "FILES DISCOVERED",
-                p,
-                available * 0.21,
-            );
-            metric(
-                ui,
-                &format_duration(progress.elapsed),
-                "ELAPSED",
-                p,
-                available * 0.18,
-            );
-        });
-        ui.horizontal(|ui| {
-            let status = stop_status(state).unwrap_or(if state.is_active() {
-                "Discovering · total unknown"
-            } else if progress.state == ScanState::Partial {
-                "Finished · partial results"
-            } else if progress.state == ScanState::Complete {
-                "Complete · logical sizes"
+            ui.label(RichText::new(format_bytes(progress.logical)).strong());
+            let skipped = if progress.skipped > 0 {
+                format!(" · {} skipped", format_count(progress.skipped))
             } else {
-                "Folder scan · read-only"
-            });
-            ui.label(RichText::new(status).small().color(p.muted));
+                String::new()
+            };
             ui.label(
                 RichText::new(format!(
-                    "{} folders · {} skipped",
+                    "logical · {} files · {} folders · {} elapsed{skipped}",
+                    format_count(progress.files),
                     format_count(progress.folders),
-                    format_count(progress.skipped)
+                    format_duration(progress.elapsed)
                 ))
-                .small()
-                .color(p.faint),
+                .color(p.muted),
             );
-            if ui
-                .small_button(format!("{} errors", format_count(progress.errors_total)))
-                .clicked()
-            {
+            if errors_button(ui, errors_total) {
                 self.show_errors = true;
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(progress.current_path.to_string_lossy())
-                            .small()
-                            .color(p.faint),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(progress.current_path.to_string_lossy());
-            });
+            if let Some(scan) = self
+                .history_snapshot
+                .scans
+                .iter()
+                .find(|scan| scan.live_generation == Some(self.generation))
+            {
+                ui.label(
+                    RichText::new(format!("Scanned {}", date_time_label(scan.finished_unix)))
+                        .small()
+                        .color(p.faint),
+                );
+            }
         });
-        ui.separator();
+        let detail = status_detail(progress, state, self.restore.as_ref());
+        ui.horizontal(|ui| {
+            // A blank line still takes the height of a text line.
+            let shown = if detail.is_empty() { " " } else { &detail };
+            let line =
+                ui.add(egui::Label::new(RichText::new(shown).small().color(p.muted)).truncate());
+            if !detail.is_empty() {
+                line.on_hover_text(&detail);
+            }
+        });
+    }
+    fn notice_line(&mut self, ui: &mut egui::Ui, p: Palette) {
         if let Some(notice) = self.notice.clone() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.colored_label(p.accent, notice);
                 if ui.small_button("Dismiss").clicked() {
                     self.notice = None;
@@ -1601,13 +1649,6 @@ impl eframe::App for DiskScopeApp {
                         .small()
                         .color(p.faint),
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Preview · performance validation in progress")
-                                .small()
-                                .color(p.faint),
-                        );
-                    });
                 });
             });
         egui::CentralPanel::default()
@@ -1685,6 +1726,7 @@ fn entry_icon(ui: &mut egui::Ui, is_dir: bool, size: f32, color: Color32) {
         Stroke::new((size / 14.0).clamp(1.0, 2.0), color),
     ));
 }
+/// A figure with a caption, used by the Changes page.
 fn metric(ui: &mut egui::Ui, value: &str, label: &str, p: Palette, width: f32) {
     ui.allocate_ui(egui::vec2(width, 54.0), |ui| {
         ui.set_min_width(width);
@@ -1855,6 +1897,7 @@ fn admits_snapshot(
 }
 #[cfg(test)]
 mod tests {
+    use super::test_support::{rendered_texts, settle_frames};
     use super::*;
 
     fn table_fixture() -> (DiskScopeApp, egui::Context) {
@@ -2249,6 +2292,325 @@ mod tests {
         assert!(search.y > sort.y + 14.0);
         assert!((search.y - scope.y).abs() < 6.0);
         assert!(header.y > search.y + 14.0);
+    }
+
+    /// Lays the header out until egui's layout has settled and returns the
+    /// vertical position just below it.
+    fn settled_header_bottom(app: &mut DiskScopeApp, ctx: &egui::Context) -> f32 {
+        let mut bottom = 0.0;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        app.header(ui, app.preferences.theme.palette());
+                        bottom = ui.cursor().top();
+                    });
+                },
+            );
+        }
+        bottom
+    }
+
+    fn set_progress(app: &mut DiskScopeApp, state: ScanState, message: &str) {
+        let snapshot = Arc::make_mut(&mut app.snapshot);
+        snapshot.progress.state = state;
+        snapshot.progress.message = message.into();
+        snapshot.progress.current_path = PathBuf::from(r"C:\fixture\deeply\nested\folder");
+        snapshot.progress.files = 12_345;
+        snapshot.progress.folders = 678;
+        snapshot.progress.logical = 9_876_543_210;
+    }
+
+    #[test]
+    fn header_keeps_one_height_for_every_page_and_scan_state() {
+        let (mut app, ctx) = table_fixture();
+        set_progress(&mut app, ScanState::Complete, "");
+        app.request.mode = ViewMode::Overview;
+        let reference = settled_header_bottom(&mut app, &ctx);
+        assert!(reference > 0.0);
+        for changes in [false, true] {
+            for mode in [
+                ViewMode::Overview,
+                ViewMode::Explorer,
+                ViewMode::Largest,
+                ViewMode::Types,
+            ] {
+                for (state, message) in [
+                    (
+                        ScanState::Idle,
+                        "Choose a folder to see what uses its space",
+                    ),
+                    (ScanState::Preparing, "Waiting for an available worker."),
+                    (ScanState::Scanning, "Reading folders in the background"),
+                    (ScanState::Finalizing, ""),
+                    (ScanState::Cancelling, ""),
+                    (
+                        ScanState::Cancelled,
+                        "Scan cancelled; results are incomplete.",
+                    ),
+                    (ScanState::Complete, ""),
+                    (ScanState::Partial, "Scan finished with partial results."),
+                    (
+                        ScanState::Failed,
+                        "Root could not be read; results are incomplete.",
+                    ),
+                ] {
+                    app.changes = changes;
+                    app.request.mode = mode;
+                    set_progress(&mut app, state, message);
+                    let bottom = settled_header_bottom(&mut app, &ctx);
+                    assert_eq!(
+                        bottom, reference,
+                        "header height moved for {mode:?} {state:?} changes={changes}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn header_frame(
+        app: &mut DiskScopeApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    app.header(ui, app.preferences.theme.palette());
+                });
+            },
+        )
+    }
+
+    fn header_click(app: &mut DiskScopeApp, ctx: &egui::Context, label: &str) {
+        header_frame(app, ctx, vec![]);
+        let position = text_center(&header_frame(app, ctx, vec![]).shapes, label);
+        header_frame(app, ctx, vec![egui::Event::PointerMoved(position)]);
+        for pressed in [true, false] {
+            header_frame(
+                app,
+                ctx,
+                vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+    }
+
+    #[test]
+    fn errors_button_does_nothing_without_errors_and_opens_the_list_with_them() {
+        let (mut app, ctx) = table_fixture();
+        assert_eq!(app.snapshot.progress.errors_total, 0);
+        header_click(&mut app, &ctx, "0 errors");
+        assert!(!app.show_errors, "an empty list must not open");
+        // Negative control: the same click opens the list once there is
+        // something in it, so the check above is about the count.
+        Arc::make_mut(&mut app.snapshot).progress.errors_total = 1;
+        header_click(&mut app, &ctx, "1 error");
+        assert!(app.show_errors);
+    }
+
+    #[test]
+    fn status_bar_carries_facts_not_a_permanent_preview_banner() {
+        use eframe::App as _;
+
+        let (mut app, ctx) = table_fixture();
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = settle_frames(&ctx, |ui| app.ui(ui, &mut frame));
+        let texts = rendered_texts(&output.shapes);
+        assert!(texts.iter().any(|text| text == "Normal folder scan"));
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("performance validation")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn detail_line_names_the_restore_the_work_and_the_failure() {
+        let progress = Progress {
+            message: "Reading folders in the background".into(),
+            current_path: PathBuf::from("/scan/a"),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_detail(&progress, ScanState::Scanning, None),
+            "Reading folders in the background · /scan/a"
+        );
+        // Terminal and healthy: nothing to add.
+        assert_eq!(status_detail(&progress, ScanState::Complete, None), "");
+        assert_eq!(status_detail(&progress, ScanState::Idle, None), "");
+        for state in [ScanState::Partial, ScanState::Failed] {
+            assert_eq!(
+                status_detail(&progress, state, None),
+                "Reading folders in the background"
+            );
+        }
+        let restore = PendingRestore::new(
+            std::path::Path::new("/scan"),
+            std::path::Path::new("/scan/a"),
+            None,
+        )
+        .unwrap();
+        let detail = status_detail(&progress, ScanState::Scanning, Some(&restore));
+        assert!(
+            detail.starts_with("Restoring your place in a once the scan reaches it. · Reading"),
+            "{detail}"
+        );
+    }
+
+    /// A model mid-scan: `/scan/a` has been listed but `/scan/a/b` has not.
+    fn scan_model(with_b: bool) -> Model {
+        let directory = |name: &str| Entry {
+            name: name.into(),
+            is_dir: true,
+            reparse: false,
+            logical: 0,
+            allocated: Some(0),
+            modified: None,
+            identity: None,
+        };
+        let mut model = Model::new(PathBuf::from("/scan"));
+        let a = model.insert_batch(0, vec![directory("a")])[0];
+        if with_b {
+            model.insert_batch(a, vec![directory("b")]);
+        }
+        model
+    }
+
+    /// What the worker publishes for the app's current request.
+    fn snapshot_for(app: &DiskScopeApp, model: &Model, state: ScanState) -> UiSnapshot {
+        let mut snapshot = UiSnapshot::default();
+        snapshot.progress.generation = app.generation;
+        snapshot.progress.state = state;
+        snapshot.view = diskscope::view::build_view(model, &app.request, app.generation);
+        snapshot
+    }
+
+    fn restoring_app(folder: &str, select: Option<&str>) -> DiskScopeApp {
+        let (mut app, _ctx) = table_fixture();
+        let restore = PendingRestore::new(
+            std::path::Path::new("/scan"),
+            std::path::Path::new(folder),
+            select.map(PathBuf::from),
+        )
+        .unwrap();
+        app.request.mode = ViewMode::Largest;
+        app.request.focus_path = Some(restore.focus_path().to_path_buf());
+        app.restore = Some(restore);
+        app.dirty = false;
+        app
+    }
+
+    #[test]
+    fn restore_keeps_asking_across_snapshots_until_the_folder_exists() {
+        let mut app = restoring_app("/scan/a/b", None);
+        // The scan has not reached `b`: snapshot after snapshot, nothing moves.
+        for _ in 0..3 {
+            let snapshot = snapshot_for(&app, &scan_model(false), ScanState::Scanning);
+            assert!(!app.settle_focus(&snapshot), "the snapshot is displayed");
+            assert!(app.restore.is_some());
+            assert_eq!(app.request.focus_path, Some(PathBuf::from("/scan/a/b")));
+            assert_eq!(app.request.root, 0);
+            assert!(!app.dirty);
+        }
+        // The scan reaches it: land on the folder and ask for it to be built.
+        let snapshot = snapshot_for(&app, &scan_model(true), ScanState::Scanning);
+        assert!(
+            app.settle_focus(&snapshot),
+            "the parent's view is not shown"
+        );
+        assert!(app.restore.is_none());
+        assert_eq!(app.request.focus_path, None);
+        assert_eq!(app.request.root, 2, "b is the third node: root, a, b");
+        assert_eq!(app.request.selected, None);
+        assert_eq!(app.request.mode, ViewMode::Largest);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_folder_lost_when_the_scan_stops_is_announced_beside_the_action_notice() {
+        let mut app = restoring_app("/scan/gone", None);
+        app.notice = Some("Moved to Recycle Bin: /scan/gone/x.bin.".into());
+        let snapshot = snapshot_for(&app, &scan_model(false), ScanState::Complete);
+        assert!(app.settle_focus(&snapshot));
+        assert!(app.restore.is_none());
+        assert_eq!(app.request.root, 0);
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.starts_with("Moved to Recycle Bin: /scan/gone/x.bin. gone is no longer"));
+        assert!(notice.ends_with("opened the scan root."), "{notice}");
+    }
+
+    #[test]
+    fn a_missing_neighbour_retargets_the_request_to_the_folder() {
+        let mut app = restoring_app("/scan/a", Some("/scan/a/x.bin"));
+        let snapshot = snapshot_for(&app, &scan_model(false), ScanState::Complete);
+        assert!(!app.settle_focus(&snapshot));
+        assert!(app.restore.is_some(), "the folder is still wanted");
+        assert_eq!(app.request.focus_path, Some(PathBuf::from("/scan/a")));
+        assert!(app.dirty, "the new target has to be requested");
+    }
+
+    #[test]
+    fn choosing_somewhere_else_cancels_the_restore_instead_of_yanking_the_user_back() {
+        // Navigating away ends it, and no focus is left in the request.
+        let mut app = restoring_app("/scan/a/b", None);
+        app.action(Action::Navigate(1));
+        assert!(app.restore.is_none());
+        assert_eq!(app.request.focus_path, None);
+        assert_eq!(app.request.root, 1);
+        // Selecting something keeps the folder but drops the neighbour.
+        let mut app = restoring_app("/scan/a", Some("/scan/a/x.bin"));
+        app.action(Action::Select(1));
+        assert!(app.restore.is_some());
+        assert_eq!(app.request.focus_path, Some(PathBuf::from("/scan/a")));
+        assert_eq!(app.request.selected, Some(1));
+        // Jumping to a changed item uses the same focus and so replaces it.
+        let mut app = restoring_app("/scan/a/b", None);
+        app.focus_changed_item(PathBuf::from("/scan/elsewhere"));
+        assert!(app.restore.is_none());
+        assert_eq!(
+            app.request.focus_path,
+            Some(PathBuf::from("/scan/elsewhere"))
+        );
+    }
+
+    #[test]
+    fn a_new_scan_continues_the_request_revision_instead_of_restarting_it() {
+        let (mut app, _ctx) = table_fixture();
+        app.request.revision = 41;
+        app.begin_scan(PathBuf::from("/scan-that-does-not-exist"));
+        assert_eq!(app.request.revision, 41);
+        app.submit_view();
+        // The worker may still hold the old scan's request (revision 41 or
+        // lower); the first request of the new scan must outrank it.
+        assert_eq!(app.request.revision, 42);
+    }
+
+    #[test]
+    fn a_pending_focus_is_never_saved_into_back_and_forward() {
+        let app = restoring_app("/scan/a/b", None);
+        assert!(app.request.focus_path.is_some());
+        assert_eq!(app.browse_context().request.focus_path, None);
     }
 
     #[test]

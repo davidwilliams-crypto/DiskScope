@@ -31,6 +31,10 @@ metrics! {
     CursorVisited => "scheduler_cursor_visited",
     TasksAccepted => "scheduler_tasks_accepted",
     TasksFull => "scheduler_queue_rejected",
+    // `EventWait` covers every blocking wait of the coordinator: for a worker event, a UI
+    // command, or a timeout. An idle coordinator sleeps up to a second per wait, so a few long
+    // samples mean idle, not busy. `IdleSleep` is only the shutdown wait after every event
+    // sender has gone.
     IdleSleep => "coordinator_sleep_ns",
     EventWait => "coordinator_event_wait_ns",
     WorkerEnumeration => "worker_enumeration_including_delivery_ns",

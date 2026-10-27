@@ -4,7 +4,7 @@ use crate::{
     model::*,
     platform::{self, EnumerationEvent},
 };
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
 use std::{
     path::PathBuf,
     sync::{
@@ -17,6 +17,14 @@ use std::{
 
 const QUEUE: usize = 16;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
+/// Longest the coordinator sleeps when nothing is pending. Every input that can matter (a
+/// command from the UI, an event from a worker) wakes it on its own, so this only bounds the
+/// harm of a wake-up that was somehow missed; it is deliberately long.
+const IDLE_WAIT: Duration = Duration::from_millis(1000);
+/// How often the coordinator retries while the bounded task queue is full: room appears when a
+/// worker takes a task, with no message to wake on. It is also the floor of every timed wait, so
+/// a publication that cannot proceed never turns the loop into a spin.
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 struct Latest<T> {
     tx: Sender<T>,
@@ -56,6 +64,10 @@ struct Signals {
     generation: AtomicU64,
     cancel: AtomicBool,
     stop: AtomicBool,
+    /// Test instrumentation: how many times the coordinator blocked waiting for work, so a test
+    /// can prove an idle coordinator is not polling.
+    #[cfg(test)]
+    coordinator_waits: AtomicU64,
 }
 impl Signals {
     fn obsolete(&self, generation: u64) -> bool {
@@ -92,11 +104,31 @@ enum Event {
     NtfsResult(u64, Result<Model, String>),
 }
 
-pub struct Controller {
-    signals: Arc<Signals>,
+/// Controller-to-coordinator channels, shared by cloning.
+#[derive(Clone)]
+struct Mailboxes {
     starts: Latest<Start>,
     views: Latest<ViewRequest>,
     snapshots: Latest<Arc<UiSnapshot>>,
+    /// Rung after every command (start, cancel, view request, shutdown) so an idle coordinator
+    /// wakes at once instead of polling. Rings coalesce: the coordinator re-reads every mailbox
+    /// when it wakes, so one pending ring covers any number of commands.
+    doorbell: Latest<()>,
+}
+impl Mailboxes {
+    fn new() -> Self {
+        Self {
+            starts: Latest::new(),
+            views: Latest::new(),
+            snapshots: Latest::new(),
+            doorbell: Latest::new(),
+        }
+    }
+}
+
+pub struct Controller {
+    signals: Arc<Signals>,
+    mailboxes: Mailboxes,
 }
 impl Default for Controller {
     fn default() -> Self {
@@ -112,9 +144,7 @@ impl Controller {
     }
     fn create(history: Option<crate::history::HistoryCapture>) -> Self {
         let signals = Arc::new(Signals::default());
-        let starts = Latest::new();
-        let views = Latest::new();
-        let snapshots = Latest::new();
+        let mailboxes = Mailboxes::new();
         let (tasks_tx, tasks_rx) = bounded::<Task>(QUEUE);
         let (events_tx, events_rx) = bounded::<Event>(QUEUE);
         let workers = thread::available_parallelism()
@@ -127,41 +157,34 @@ impl Controller {
                 .spawn(move || worker(tasks, events, signals))
                 .expect("directory worker");
         }
-        let (s, v, p, control) = (
-            starts.clone(),
-            views.clone(),
-            snapshots.clone(),
-            signals.clone(),
-        );
+        let (inbox, control) = (mailboxes.clone(), signals.clone());
         thread::Builder::new()
             .name("scan-coordinator".into())
-            .spawn(move || coordinate(s, v, p, control, tasks_tx, events_rx, history))
+            .spawn(move || coordinate(inbox, control, tasks_tx, events_rx, history))
             .expect("scan coordinator");
-        Self {
-            signals,
-            starts,
-            views,
-            snapshots,
-        }
+        Self { signals, mailboxes }
     }
     pub fn start(&mut self, root: PathBuf, backend: BackendChoice) -> u64 {
         let generation = self.signals.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.signals.cancel.store(false, Ordering::Release);
-        self.starts.set(Start {
+        self.mailboxes.starts.set(Start {
             generation,
             root,
             backend,
         });
+        self.mailboxes.doorbell.set(());
         generation
     }
     pub fn cancel(&self) {
         self.signals.cancel.store(true, Ordering::Release);
+        self.mailboxes.doorbell.set(());
     }
     pub fn request_view(&self, request: ViewRequest) {
-        self.views.set(request);
+        self.mailboxes.views.set(request);
+        self.mailboxes.doorbell.set(());
     }
     pub fn poll(&self) -> Option<Arc<UiSnapshot>> {
-        let snapshot = self.snapshots.take()?;
+        let snapshot = self.mailboxes.snapshots.take()?;
         (snapshot.progress.generation == self.signals.generation.load(Ordering::Acquire))
             .then_some(snapshot)
     }
@@ -169,6 +192,7 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         self.signals.stop.store(true, Ordering::Release);
+        self.mailboxes.doorbell.set(());
     }
 }
 
@@ -191,12 +215,10 @@ fn deliver(events: &Sender<Event>, mut event: Event, signals: &Signals, generati
     }
 }
 fn worker(tasks: Receiver<Task>, events: Sender<Event>, signals: Arc<Signals>) {
-    while !signals.stop.load(Ordering::Acquire) {
-        let task = match tasks.recv_timeout(Duration::from_millis(20)) {
-            Ok(t) => t,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(_) => break,
-        };
+    // Blocks until a task arrives. The coordinator owns the only task sender and drops it when it
+    // exits on `stop`, which closes the channel and ends this loop, so an idle worker never
+    // wakes just to check a flag. A task still queued at shutdown is skipped as obsolete.
+    while let Ok(task) = tasks.recv() {
         if signals.obsolete(task.generation) {
             continue;
         }
@@ -289,21 +311,40 @@ struct Scan {
     fallback_reason: Option<String>,
     raw_progress: Option<crate::ntfs::NtfsProgress>,
 }
-fn whole_drive_root(path: &std::path::Path) -> bool {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1..] == *b":\\"
+/// The only place a `&mut Model` is taken from a scan's `Arc`.
+///
+/// Invariant: while a scan is active the coordinator holds the sole `Arc` to its model. The one
+/// other holder is history, which receives a clone in `history.submit` strictly after the scan
+/// is terminal; from then on the coordinator never mutates that model. Event handlers ignore
+/// every event once `state.is_active()` is false, and `Scan::finish` and the cancel path run
+/// only for active scans. A new handler that mutates the model must keep to the same rule. If
+/// it does not, `get_mut` fails and the coordinator panics: that is deliberate, because `Model`
+/// is not `Clone` and silently copying a multi-million-node arena would hide the bug behind
+/// stalls instead of reporting it.
+///
+/// It takes the `Arc` rather than the `Scan` so a caller can keep borrowing the scan's other
+/// fields while it holds the model.
+fn model_mut(model: &mut Arc<Model>) -> &mut Model {
+    Arc::get_mut(model).expect("model is shared although the scan is active; see engine::model_mut")
 }
+
+const NTFS_NEEDS_DRIVE_ROOT: &str = "NTFS reading requires a whole local drive root such as \
+     C:\\; using normal enumeration for this path.";
+
 impl Scan {
     fn new(start: Start) -> Self {
         let mut model = Model::new(start.root.clone());
         model.nodes[0].allocation_complete = false;
-        let kind = if start.backend == BackendChoice::Ntfs && whole_drive_root(&start.root) {
+        // The NTFS module owns this predicate and its volume reader applies the same one, so the
+        // backend chosen here and the reason shown on fallback cannot disagree with it.
+        let whole_drive = crate::ntfs::drive_root_letter(&start.root).is_some();
+        let kind = if start.backend == BackendChoice::Ntfs && whole_drive {
             TaskKind::Ntfs
         } else {
             TaskKind::Directory
         };
         let fallback_reason = (start.backend == BackendChoice::Ntfs && kind == TaskKind::Directory)
-            .then(||"NTFS reading requires a whole local drive root such as C:\\; using normal enumeration for this path.".into());
+            .then(|| NTFS_NEEDS_DRIVE_ROOT.to_owned());
         Self {
             generation: start.generation,
             current_path: start.root.clone(),
@@ -351,7 +392,7 @@ impl Scan {
         self.raw_progress = None;
     }
     fn insert_entries(&mut self, parent: NodeId, entries: Vec<Entry>) {
-        let model = Arc::get_mut(&mut self.model).expect("active scan owns model");
+        let model = model_mut(&mut self.model);
         let ids = model.insert_batch(parent, entries);
         if let Some(summary) = self.root_summary.as_mut() {
             summary.append(model, &ids);
@@ -370,23 +411,29 @@ impl Scan {
     }
     fn directory_failed(&mut self, parent: NodeId) {
         self.failed_dirs.insert(parent);
-        if let Some(node) = Arc::get_mut(&mut self.model)
-            .expect("active scan owns model")
-            .nodes
-            .get_mut(parent as usize)
-        {
+        if let Some(node) = model_mut(&mut self.model).nodes.get_mut(parent as usize) {
             node.allocation_complete = false;
         }
+    }
+    /// Records a failure while enumerating `parent`; `path` names the entry that failed.
+    fn record_error(&mut self, parent: NodeId, path: PathBuf, error: String) {
+        if parent == 0 {
+            self.root_failed = true;
+        }
+        self.directory_failed(parent);
+        let model = model_mut(&mut self.model);
+        model.record_error(path, error);
+        model.unique_allocated = None;
+    }
+    fn count_skipped(&mut self) {
+        let model = model_mut(&mut self.model);
+        model.skipped = model.skipped.saturating_add(1);
     }
     fn directory_done(&mut self, parent: NodeId) {
         if self.failed_dirs.contains(&parent) {
             return;
         }
-        if let Some(node) = Arc::get_mut(&mut self.model)
-            .expect("active scan owns model")
-            .nodes
-            .get_mut(parent as usize)
-        {
+        if let Some(node) = model_mut(&mut self.model).nodes.get_mut(parent as usize) {
             node.allocation_complete = true;
         }
     }
@@ -398,7 +445,7 @@ impl Scan {
         self.state = state;
         self.elapsed = Some(self.started.elapsed());
         let _sweep = Span::new(Metric::FinishSweep);
-        let model = Arc::get_mut(&mut self.model).expect("only active scans mutate metadata");
+        let model = model_mut(&mut self.model);
         if state == ScanState::Complete {
             for node in &mut model.nodes {
                 if node.is_dir {
@@ -481,15 +528,66 @@ impl Scan {
         UiSnapshot { progress, view }
     }
 }
+/// What ended one idle wait of the coordinator.
+enum Wake {
+    Event(Event),
+    /// The doorbell rang: a start, cancel, view request or shutdown is waiting.
+    Command,
+    Timeout,
+}
+
+/// How long the coordinator may sleep when it has nothing to do this turn.
+///
+/// Commands and worker events wake it on their own, so with nothing pending it sleeps for
+/// `IDLE_WAIT`. The two situations that end without any message arriving are polled instead:
+/// `scheduler_blocked` (the bounded task queue was full, and room appears when a worker takes a
+/// task) and `publication_in` (a snapshot is ready but its publication budget has time left).
+fn idle_wait(scheduler_blocked: bool, publication_in: Option<Duration>) -> Duration {
+    let mut wait = IDLE_WAIT;
+    if scheduler_blocked {
+        wait = wait.min(POLL_INTERVAL);
+    }
+    if let Some(left) = publication_in {
+        // Never spin: a publication that is blocked for another reason reports no time left.
+        wait = wait.min(left.max(POLL_INTERVAL));
+    }
+    wait
+}
+
+/// Blocks until a worker event arrives, the doorbell rings, or `timeout` passes.
+fn wait_for_work(events: &Receiver<Event>, doorbell: &Latest<()>, timeout: Duration) -> Wake {
+    let _wait = Span::new(Metric::EventWait);
+    select! {
+        recv(events) -> event => match event {
+            Ok(event) => Wake::Event(event),
+            Err(_) => {
+                // Every sender is gone, which only happens during shutdown. A closed channel is
+                // always ready, so waiting on it would spin; wait on the doorbell alone.
+                let _sleep = Span::new(Metric::IdleSleep);
+                match doorbell.rx.recv_timeout(timeout) {
+                    Ok(()) => Wake::Command,
+                    Err(_) => Wake::Timeout,
+                }
+            }
+        },
+        recv(doorbell.rx) -> _ => Wake::Command,
+        default(timeout) => Wake::Timeout,
+    }
+}
+
 fn coordinate(
-    starts: Latest<Start>,
-    views: Latest<ViewRequest>,
-    snapshots: Latest<Arc<UiSnapshot>>,
+    mailboxes: Mailboxes,
     signals: Arc<Signals>,
     tasks: Sender<Task>,
     events: Receiver<Event>,
     history: Option<crate::history::HistoryCapture>,
 ) {
+    let Mailboxes {
+        starts,
+        views,
+        snapshots,
+        doorbell,
+    } = mailboxes;
     let mut scan: Option<Scan> = None;
     let mut request = ViewRequest::default();
     let mut published = Instant::now();
@@ -498,6 +596,7 @@ fn coordinate(
     let mut pending_event = None;
     while !signals.stop.load(Ordering::Acquire) {
         let mut made_progress = false;
+        let mut scheduler_blocked = false;
         if let Some(start) = starts.take() {
             let _replacement = Span::new(Metric::Replacement);
             scan = Some(Scan::new(start));
@@ -574,20 +673,11 @@ fn coordinate(
                     Event::Error(generation, parent, path, error)
                         if generation == active.generation =>
                     {
-                        if parent == 0 {
-                            active.root_failed = true;
-                        }
-                        active.directory_failed(parent);
-                        let model =
-                            Arc::get_mut(&mut active.model).expect("active scan owns model");
-                        model.record_error(path, error);
-                        model.unique_allocated = None;
+                        active.record_error(parent, path, error);
                         dirty = true;
                     }
                     Event::Skipped(generation) if generation == active.generation => {
-                        Arc::get_mut(&mut active.model)
-                            .expect("active scan owns model")
-                            .skipped += 1;
+                        active.count_skipped();
                         dirty = true;
                     }
                     Event::Done(generation, parent) if generation == active.generation => {
@@ -618,6 +708,7 @@ fn coordinate(
                             tasks_accepted.bump();
                         } else {
                             tasks_rejected.bump();
+                            scheduler_blocked = true;
                         }
                     }
                 } else {
@@ -642,6 +733,7 @@ fn coordinate(
                                 }
                                 Err(_) => {
                                     tasks_rejected.bump();
+                                    scheduler_blocked = true;
                                     break;
                                 }
                             }
@@ -701,19 +793,21 @@ fn coordinate(
                 published = Instant::now();
             }
         }
-        // Preserve per-turn event/cursor bounds for command fairness. When no
-        // progress is possible, wait for a result rather than delaying workers
-        // with polling sleeps. Stash just one event: the next turn checks new
-        // starts/views/cancellation before handling it, including its generation.
+        // Preserve per-turn event/cursor bounds for command fairness. When no progress is
+        // possible, sleep until something can change that: a worker event, a command (the
+        // doorbell), or one of the two timed situations in `idle_wait`. Stash just one event:
+        // the next turn checks new starts/views/cancellation before handling it, including its
+        // generation.
         if !made_progress {
-            let _wait = Span::new(Metric::EventWait);
-            match events.recv_timeout(Duration::from_millis(2)) {
-                Ok(event) => pending_event = Some(event),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    let _sleep = Span::new(Metric::IdleSleep);
-                    thread::sleep(Duration::from_millis(2));
-                }
+            // A publication is only waiting on its budget when a scan exists to publish it.
+            let publication_in = (dirty && scan.is_some())
+                .then(|| PUBLISH_INTERVAL.saturating_sub(published.elapsed()));
+            #[cfg(test)]
+            signals.coordinator_waits.fetch_add(1, Ordering::Relaxed);
+            let wait = idle_wait(scheduler_blocked, publication_in);
+            match wait_for_work(&events, &doorbell, wait) {
+                Wake::Event(event) => pending_event = Some(event),
+                Wake::Command | Wake::Timeout => {}
             }
         }
     }
@@ -730,28 +824,12 @@ mod tests {
         history: Option<crate::history::HistoryCapture>,
     ) -> (Controller, Receiver<Task>, Sender<Event>) {
         let signals = Arc::new(Signals::default());
-        let starts = Latest::new();
-        let views = Latest::new();
-        let snapshots = Latest::new();
+        let mailboxes = Mailboxes::new();
         let (tasks_tx, tasks_rx) = bounded(QUEUE);
         let (events_tx, events_rx) = bounded(QUEUE);
-        let (s, v, p, control) = (
-            starts.clone(),
-            views.clone(),
-            snapshots.clone(),
-            signals.clone(),
-        );
-        thread::spawn(move || coordinate(s, v, p, control, tasks_tx, events_rx, history));
-        (
-            Controller {
-                signals,
-                starts,
-                views,
-                snapshots,
-            },
-            tasks_rx,
-            events_tx,
-        )
+        let (inbox, control) = (mailboxes.clone(), signals.clone());
+        thread::spawn(move || coordinate(inbox, control, tasks_tx, events_rx, history));
+        (Controller { signals, mailboxes }, tasks_rx, events_tx)
     }
 
     #[test]
@@ -1634,5 +1712,226 @@ mod tests {
                     .expect("saturated producer ignored cancellation")
             );
         }
+    }
+
+    #[test]
+    fn the_backend_choice_and_fallback_reason_follow_the_ntfs_drive_root_predicate() {
+        let cases = [
+            ("C:\\", true),
+            ("z:\\", true),
+            ("C:", false),
+            ("C:\\folder", false),
+            ("\\\\?\\C:\\", false),
+            ("\\\\host\\share\\", false),
+            ("C:/", false),
+            ("", false),
+        ];
+        for (root, whole_drive) in cases {
+            let request = |backend| Start {
+                generation: 1,
+                root: root.into(),
+                backend,
+            };
+            assert_eq!(
+                crate::ntfs::drive_root_letter(std::path::Path::new(root)).is_some(),
+                whole_drive,
+                "{root:?}"
+            );
+            let ntfs = Scan::new(request(BackendChoice::Ntfs));
+            assert_eq!(ntfs.kind == TaskKind::Ntfs, whole_drive, "{root:?}");
+            // The explanation is shown exactly when the predicate says the path cannot qualify.
+            assert_eq!(ntfs.fallback_reason.is_some(), !whole_drive, "{root:?}");
+            let normal = Scan::new(request(BackendChoice::Normal));
+            assert_eq!(normal.kind, TaskKind::Directory);
+            assert!(normal.fallback_reason.is_none());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "model is shared although the scan is active")]
+    fn mutating_a_shared_model_fails_loudly_instead_of_copying_it() {
+        let mut model = Arc::new(Model::new("fixture".into()));
+        let _history_copy = model.clone();
+        model_mut(&mut model);
+    }
+
+    #[test]
+    fn a_terminal_scan_ignores_late_events_of_its_own_generation() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                root.parent,
+                vec![fixture_entry("kept", false, 5)],
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        let complete = wait_snapshot(&controller, |s| s.progress.state == ScanState::Complete);
+        assert_eq!(complete.progress.logical, 5);
+        // The model of a finished scan is shared with history. Every event kind that mutates a
+        // model must be dropped, and a late cancel must not rewrite the outcome.
+        for event in [
+            Event::Entries(generation, 0, vec![fixture_entry("late", false, 1000)]),
+            Event::Error(generation, 0, "late".into(), "late failure".into()),
+            Event::Skipped(generation),
+            Event::Done(generation, 0),
+        ] {
+            events.send(event).unwrap();
+        }
+        controller.cancel();
+        controller.request_view(ViewRequest {
+            revision: 7,
+            ..Default::default()
+        });
+        let after = wait_snapshot(&controller, |s| s.view.revision == 7);
+        assert_eq!(after.progress.state, ScanState::Complete);
+        assert_eq!(
+            (
+                after.progress.files,
+                after.progress.logical,
+                after.progress.errors_total,
+                after.progress.skipped
+            ),
+            (1, 5, 0, 0)
+        );
+    }
+
+    #[test]
+    fn idle_wait_polls_only_the_two_situations_that_send_no_message() {
+        assert_eq!(idle_wait(false, None), IDLE_WAIT);
+        assert_eq!(idle_wait(true, None), POLL_INTERVAL);
+        let left = Duration::from_millis(120);
+        assert_eq!(idle_wait(false, Some(left)), left);
+        assert_eq!(idle_wait(true, Some(left)), POLL_INTERVAL);
+        // A publication that is blocked for another reason reports no time left; it must not
+        // turn into a busy loop.
+        assert_eq!(idle_wait(false, Some(Duration::ZERO)), POLL_INTERVAL);
+        // A long publication budget never stretches the safety net.
+        assert_eq!(idle_wait(false, Some(Duration::from_secs(60))), IDLE_WAIT);
+        assert!(IDLE_WAIT >= 100 * POLL_INTERVAL);
+    }
+
+    /// Far below `IDLE_WAIT`, so a command that waited for the safety-net timeout would miss it,
+    /// yet generous enough for a loaded CI machine.
+    const WAKE_LATENCY_LIMIT: Duration = Duration::from_millis(400);
+
+    #[test]
+    fn an_idle_coordinator_sleeps_instead_of_polling() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        let waits =
+            |controller: &Controller| controller.signals.coordinator_waits.load(Ordering::Relaxed);
+        // Phase 1: an active scan with its only task outstanding and nothing to do.
+        thread::sleep(Duration::from_millis(100));
+        let before = waits(&controller);
+        thread::sleep(Duration::from_millis(400));
+        let active_idle = waits(&controller) - before;
+        // Phase 2: the same after the scan is terminal.
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        wait_snapshot(&controller, |s| s.progress.state == ScanState::Complete);
+        thread::sleep(Duration::from_millis(100));
+        let before = waits(&controller);
+        thread::sleep(Duration::from_millis(400));
+        let terminal_idle = waits(&controller) - before;
+        // Polling every 2 ms would be ~200 waits in 400 ms; the safety net allows at most one.
+        assert!(
+            active_idle <= 2,
+            "active idle coordinator woke {active_idle} times"
+        );
+        assert!(
+            terminal_idle <= 2,
+            "terminal idle coordinator woke {terminal_idle} times"
+        );
+    }
+
+    #[test]
+    fn commands_and_events_wake_an_idle_coordinator_without_polling_delay() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("first".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A worker event reaches a coordinator that has been asleep.
+        thread::sleep(Duration::from_millis(50));
+        let begun = Instant::now();
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        wait_snapshot(&controller, |s| s.progress.state == ScanState::Complete);
+        assert!(
+            begun.elapsed() < WAKE_LATENCY_LIMIT,
+            "event: {:?}",
+            begun.elapsed()
+        );
+        // A view request reaches a terminal, idle coordinator.
+        thread::sleep(Duration::from_millis(50));
+        let begun = Instant::now();
+        controller.request_view(ViewRequest {
+            revision: 11,
+            ..Default::default()
+        });
+        wait_snapshot(&controller, |s| s.view.revision == 11);
+        assert!(
+            begun.elapsed() < WAKE_LATENCY_LIMIT,
+            "view: {:?}",
+            begun.elapsed()
+        );
+        // A start reaches it, and the scheduler hands out the first task at once.
+        thread::sleep(Duration::from_millis(50));
+        let begun = Instant::now();
+        controller.start("second".into(), BackendChoice::Normal);
+        let task = tasks
+            .recv_timeout(WAKE_LATENCY_LIMIT)
+            .expect("start was not noticed");
+        assert_eq!(task.path, PathBuf::from("second"));
+        assert!(
+            begun.elapsed() < WAKE_LATENCY_LIMIT,
+            "start: {:?}",
+            begun.elapsed()
+        );
+        // So does a cancel of that now-idle active scan.
+        thread::sleep(Duration::from_millis(50));
+        let begun = Instant::now();
+        controller.cancel();
+        wait_snapshot(&controller, |s| s.progress.state == ScanState::Cancelled);
+        assert!(
+            begun.elapsed() < WAKE_LATENCY_LIMIT,
+            "cancel: {:?}",
+            begun.elapsed()
+        );
+    }
+
+    #[test]
+    fn dropping_the_controller_stops_an_idle_coordinator_at_once() {
+        let (controller, tasks, _events) = controlled_io();
+        thread::sleep(Duration::from_millis(50));
+        drop(controller);
+        // The coordinator owns the task sender; its exit closes the channel. A timeout here
+        // means the shutdown never woke it.
+        let outcome = tasks.recv_timeout(WAKE_LATENCY_LIMIT);
+        assert!(
+            matches!(
+                outcome,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            ),
+            "the coordinator kept running after its controller was dropped"
+        );
+    }
+
+    #[test]
+    fn an_idle_worker_blocks_until_its_task_channel_closes() {
+        let (tasks_tx, tasks_rx) = bounded::<Task>(QUEUE);
+        let (events_tx, _events_rx) = bounded::<Event>(QUEUE);
+        let signals = Arc::new(Signals::default());
+        let (finished_tx, finished_rx) = bounded::<()>(1);
+        thread::spawn(move || {
+            worker(tasks_rx, events_tx, signals);
+            let _ = finished_tx.send(());
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert!(finished_rx.try_recv().is_err(), "worker left while idle");
+        drop(tasks_tx);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not exit when the coordinator closed the task channel");
     }
 }

@@ -7,23 +7,34 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 # build in a stale dist folder that the benchmark and release scripts never read.
 $version = Get-ReleaseVersion -ProjectRoot $projectRoot
 if (-not $PackageDirectory) { $PackageDirectory = "dist\$version" }
+# The package README is a copy of this file. Assert-ReleasePayload would reject a
+# stale version only after the full release build, so check it before compiling.
+$portableReadme = Join-Path $PSScriptRoot 'portable-readme.txt'
+Assert-ReleaseReadmeVersion -Path $portableReadme -Version $version
 $localCargo = Join-Path $projectRoot '.tools\cargo\bin\cargo.exe'
-if (Test-Path -LiteralPath $localCargo) {
-    $env:RUSTUP_HOME = Join-Path $projectRoot '.tools\rustup'
-    $env:CARGO_HOME = Join-Path $projectRoot '.tools\cargo'
-    $env:PATH = (Join-Path $env:CARGO_HOME 'bin') + ';' + $env:PATH
-    $cargoCommand = $localCargo
-} else { $cargoCommand = (Get-Command cargo -ErrorAction Stop).Source }
-$env:CARGO_INCREMENTAL = '0'
+# This script runs in the caller's session, so what it sets would outlive it.
+# Remember the toolchain variables first; the final finally block restores them
+# (a variable that was unset is removed again).
+$toolchainVariables = @('RUSTUP_HOME', 'CARGO_HOME', 'PATH', 'CARGO_INCREMENTAL')
+$previousEnvironment = @{}
+foreach ($name in $toolchainVariables) {
+    $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
 Push-Location $projectRoot
 try {
+    if (Test-Path -LiteralPath $localCargo) {
+        $env:RUSTUP_HOME = Join-Path $projectRoot '.tools\rustup'
+        $env:CARGO_HOME = Join-Path $projectRoot '.tools\cargo'
+        $env:PATH = (Join-Path $env:CARGO_HOME 'bin') + ';' + $env:PATH
+        $cargoCommand = $localCargo
+    } else { $cargoCommand = (Get-Command cargo -ErrorAction Stop).Source }
+    $env:CARGO_INCREMENTAL = '0'
     $rustcCommand = (Get-Command rustc -ErrorAction Stop).Source
     $rustcInfo = & $rustcCommand -Vv
     if ($LASTEXITCODE -ne 0) { throw 'Compiler version inspection failed' }
     $rustRelease = ($rustcInfo | Where-Object { $_ -like 'release: *' }) -replace '^release: ', ''
     $rustCommit = ($rustcInfo | Where-Object { $_ -like 'commit-hash: *' }) -replace '^commit-hash: ', ''
     if (-not $rustRelease -or -not $rustCommit) { throw 'Compiler version inspection was incomplete' }
-    $portableReadme = Join-Path $PSScriptRoot 'portable-readme.txt'
     $validationNotes = if ([IO.Path]::IsPathRooted($ValidationFile)) { $ValidationFile } else { Join-Path $projectRoot $ValidationFile }
     $performanceNotes = if ([IO.Path]::IsPathRooted($PerformanceFile)) { $PerformanceFile } else { Join-Path $projectRoot $PerformanceFile }
     $packagingNotes = Join-Path $projectRoot 'docs\packaging.md'
@@ -73,4 +84,9 @@ try {
     $hashLines = @(Get-PackageChecksums -Directory $packageRoot)
     [IO.File]::WriteAllLines((Join-Path $packageRoot 'SHA256SUMS.txt'), [string[]]$hashLines, [Text.UTF8Encoding]::new($false))
     Write-Output "Portable application: $(Join-Path $packageRoot 'DiskScope.exe')"
-} finally { Pop-Location }
+} finally {
+    Pop-Location
+    foreach ($name in $toolchainVariables) {
+        [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process')
+    }
+}

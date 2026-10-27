@@ -11,6 +11,49 @@ pub enum ElevationOutcome {
     Cancelled,
 }
 
+/// How the current process token relates to UAC.
+///
+/// `TokenIsElevated` alone cannot tell the two elevated cases apart, yet they
+/// need different explanations: only [`ElevationKind::Elevated`] has a limited
+/// twin of the same session, so only there does "open DiskScope normally"
+/// mean anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElevationKind {
+    /// The token is not elevated.
+    Standard,
+    /// Elevated through UAC consent: a split token whose limited twin exists.
+    Elevated,
+    /// Elevated without a UAC split. UAC is turned off (`EnableLUA=0`), or
+    /// Windows does not apply Admin Approval Mode to the account (the built-in
+    /// Administrator, service accounts). There is no standard window to
+    /// switch to.
+    AlwaysElevated,
+}
+
+/// `TOKEN_ELEVATION_TYPE_Default` from winnt.h: the token has no linked
+/// limited token. Held as a plain number so the mapping below is testable on
+/// every platform; a Windows-only test checks it against windows-sys.
+#[cfg(any(windows, test))]
+const TOKEN_ELEVATION_TYPE_DEFAULT: i32 = 1;
+
+/// Combines `TokenIsElevated` with the raw `TOKEN_ELEVATION_TYPE`.
+///
+/// Only the positive evidence of an elevated token without a linked limited
+/// token is reported as [`ElevationKind::AlwaysElevated`], because that is the
+/// one case where the UI tells the user UAC is not in play. Every other
+/// elevated token (the consented `Full` type and anything unexpected) keeps
+/// the generic administrator description.
+#[cfg(any(windows, test))]
+fn classify_elevation(is_elevated: bool, token_elevation_type: i32) -> ElevationKind {
+    if !is_elevated {
+        ElevationKind::Standard
+    } else if token_elevation_type == TOKEN_ELEVATION_TYPE_DEFAULT {
+        ElevationKind::AlwaysElevated
+    } else {
+        ElevationKind::Elevated
+    }
+}
+
 /// Read the current process token, rather than trusting command-line state.
 pub fn is_elevated() -> Result<bool, String> {
     #[cfg(windows)]
@@ -20,6 +63,20 @@ pub fn is_elevated() -> Result<bool, String> {
     #[cfg(not(windows))]
     {
         Ok(false)
+    }
+}
+
+/// Read how the current process token came to be elevated, if it is.
+/// This only explains the session to the user; it never changes what the
+/// session is allowed to do.
+pub fn elevation_kind() -> Result<ElevationKind, String> {
+    #[cfg(windows)]
+    {
+        windows::elevation_kind()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(ElevationKind::Standard)
     }
 }
 
@@ -93,12 +150,16 @@ fn windows_error(action: &str, code: u32) -> String {
 #[cfg(windows)]
 mod windows {
     use super::{
-        ElevationOutcome, Path, quote_windows_argument, shell_launch_failure, windows_error,
+        ElevationKind, ElevationOutcome, Path, classify_elevation, quote_windows_argument,
+        shell_launch_failure, windows_error,
     };
     use std::{ffi::OsStr, mem::size_of, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE},
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        Security::{
+            GetTokenInformation, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_INFORMATION_CLASS,
+            TOKEN_QUERY, TokenElevation, TokenElevationType,
+        },
         System::{
             Com::{
                 COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -171,38 +232,93 @@ mod windows {
         Ok(wide)
     }
 
-    pub(super) fn is_elevated() -> Result<bool, String> {
+    /// Opens the current process token for querying only. No token privilege
+    /// is enabled.
+    fn open_process_token() -> Result<OwnedNativeHandle, String> {
         let mut token = ptr::null_mut();
-        // Query only. No token privilege is enabled and the pseudo process handle is not closed.
+        // Query only. The pseudo process handle needs no closing; the token
+        // handle is wrapped at once so it is closed on every path.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(windows_error("Could not query the process token", unsafe {
                 GetLastError()
             }));
         }
-        let token = OwnedNativeHandle::from_returned(token)
-            .ok_or("Windows did not return a valid process token handle.")?;
-        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        OwnedNativeHandle::from_returned(token)
+            .ok_or_else(|| "Windows did not return a valid process token handle.".into())
+    }
+
+    /// Reads one fixed-size token information class into a `T`.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be a plain `repr(C)` value for which every bit pattern is
+    /// valid, and `class` must be a class whose output is exactly one `T`.
+    /// The two callers pass `TOKEN_ELEVATION` for `TokenElevation` and
+    /// `TOKEN_ELEVATION_TYPE` (an `i32`) for `TokenElevationType`.
+    /// `what` names the value in error messages.
+    unsafe fn query_token<T: Copy>(
+        token: &OwnedNativeHandle,
+        class: TOKEN_INFORMATION_CLASS,
+        mut value: T,
+        what: &str,
+    ) -> Result<T, String> {
         let mut returned = 0;
-        let expected_size = size_of::<TOKEN_ELEVATION>() as u32;
-        if unsafe {
+        let expected_size = size_of::<T>() as u32;
+        // SAFETY: `token` is a live token handle with TOKEN_QUERY access and
+        // `value` is a writable, initialized `T` of exactly `expected_size`
+        // bytes that outlives the call.
+        let succeeded = unsafe {
             GetTokenInformation(
                 token.0,
-                TokenElevation,
-                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                class,
+                (&mut value as *mut T).cast(),
                 expected_size,
                 &mut returned,
             )
-        } == 0
-        {
+        } != 0;
+        if !succeeded {
             return Err(windows_error(
-                "Could not read the process elevation",
+                &format!("Could not read the {what}"),
                 unsafe { GetLastError() },
             ));
         }
         if returned != expected_size {
-            return Err("Windows returned an unexpected process elevation token size.".into());
+            return Err(format!("Windows returned an unexpected {what} token size."));
         }
+        Ok(value)
+    }
+
+    fn token_is_elevated(token: &OwnedNativeHandle) -> Result<bool, String> {
+        // SAFETY: TOKEN_ELEVATION is a plain repr(C) struct holding one u32, and
+        // TokenElevation produces exactly one TOKEN_ELEVATION.
+        let elevation = unsafe {
+            query_token(
+                token,
+                TokenElevation,
+                TOKEN_ELEVATION { TokenIsElevated: 0 },
+                "process elevation",
+            )
+        }?;
         Ok(elevation.TokenIsElevated != 0)
+    }
+
+    pub(super) fn is_elevated() -> Result<bool, String> {
+        token_is_elevated(&open_process_token()?)
+    }
+
+    pub(super) fn elevation_kind() -> Result<ElevationKind, String> {
+        let token = open_process_token()?;
+        let elevated = token_is_elevated(&token)?;
+        if !elevated {
+            // The type only matters for an elevated token, so a standard
+            // session needs no second query.
+            return Ok(ElevationKind::Standard);
+        }
+        // SAFETY: TOKEN_ELEVATION_TYPE is an i32 for which every bit pattern is
+        // valid, and TokenElevationType produces exactly one of them.
+        let token_type: TOKEN_ELEVATION_TYPE =
+            unsafe { query_token(&token, TokenElevationType, 0, "process elevation type") }?;
+        Ok(classify_elevation(elevated, token_type))
     }
 
     pub(super) fn restart_elevated(root: Option<&Path>) -> Result<ElevationOutcome, String> {
@@ -349,6 +465,61 @@ mod tests {
     #[test]
     fn embedded_nul_is_rejected_instead_of_truncating_a_path() {
         assert!(quote_windows_argument(&[b'C' as u16, 0, b'x' as u16]).is_err());
+    }
+
+    #[test]
+    fn elevation_kind_needs_both_the_elevated_flag_and_the_missing_limited_twin() {
+        // TOKEN_ELEVATION_TYPE: 1 Default, 2 Full, 3 Limited (winnt.h).
+        const DEFAULT: i32 = 1;
+        const FULL: i32 = 2;
+        const LIMITED: i32 = 3;
+        // A non-elevated token is Standard whatever its type says; this is
+        // the ordinary UAC administrator running unelevated (Limited).
+        for token_type in [0, DEFAULT, FULL, LIMITED, 99] {
+            assert_eq!(
+                classify_elevation(false, token_type),
+                ElevationKind::Standard,
+                "type {token_type}"
+            );
+        }
+        // Run as administrator with UAC consent.
+        assert_eq!(classify_elevation(true, FULL), ElevationKind::Elevated);
+        // Elevated with no linked limited token: UAC off or exempt account.
+        assert_eq!(
+            classify_elevation(true, DEFAULT),
+            ElevationKind::AlwaysElevated
+        );
+        // Contradictory or unknown types never claim that UAC is off.
+        for token_type in [0, LIMITED, 99, -1] {
+            assert_eq!(
+                classify_elevation(true, token_type),
+                ElevationKind::Elevated,
+                "type {token_type}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_hosts_are_never_elevated() {
+        assert_eq!(elevation_kind(), Ok(ElevationKind::Standard));
+        assert_eq!(is_elevated(), Ok(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_token_type_constant_matches_windows_sys() {
+        use windows_sys::Win32::Security::TokenElevationTypeDefault;
+        assert_eq!(TOKEN_ELEVATION_TYPE_DEFAULT, TokenElevationTypeDefault);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevation_kind_agrees_with_the_elevated_flag() {
+        let elevated = is_elevated().unwrap();
+        let kind = elevation_kind().unwrap();
+        eprintln!("Current process elevation kind: {kind:?}");
+        assert_eq!(kind == ElevationKind::Standard, !elevated);
     }
 
     #[cfg(windows)]

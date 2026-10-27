@@ -38,6 +38,8 @@ The validated release uses Rust 1.99.1. Standard-library notices are verified ag
 .\scripts\test-installer.ps1 -DefaultDirectory -NoShortcuts
 ```
 
+`build.ps1` first checks, before compiling anything, that the first line of `scripts/portable-readme.txt` begins with `DiskScope <version>` for the Cargo.toml version, so a version bump that forgot the README fails at once instead of after the release build. It also restores `PATH`, `CARGO_HOME`, `RUSTUP_HOME` and `CARGO_INCREMENTAL` when it finishes, so running it does not change the calling PowerShell session.
+
 The release script derives its version from Cargo.toml, verifies all payload hashes and required notices, copies an isolated snapshot under `target/release-packaging`, and packages both formats from that snapshot. Unexpected files, mismatched versions, reparse points, path traversal, and overlapping input/output paths are rejected. The ZIP uses stable entry timestamps. NSIS warnings are treated as build failures. Completed artifacts are copied to the release directory and their hashes checked again. Build snapshots are retained for inspection under the ignored `target` directory.
 
 Silent setup supports `/S` and `/NoShortcuts`. An optional `/D=absolute path` must be the final argument, without quotation marks around the path, as required by NSIS. Without `/D`, updates use the registered installation location. Do not move an installation by passing a different directory. Normal uninstall is `Uninstall.exe /S`; the Installed apps entry supplies the quoted command automatically.

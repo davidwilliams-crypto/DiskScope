@@ -25,8 +25,30 @@ Rust commit, owning installer component, pinned distribution archive URL/hash,
 and notice hash. The compiler binary is excluded. The build script supplies its
 actual compiler release/commit to the notice collector and rejects a mismatch.
 
-To verify coverage without building or changing `dist`:
+To verify coverage without building or changing `dist`, capture the same Cargo
+metadata the release script uses and run the collector into the ignored
+`target` directory. `target` does not exist in a checkout that was never built,
+so create it first, and set the console to UTF-8 as `scripts/build.ps1` does:
+otherwise PowerShell decodes Cargo's UTF-8 output with the console code page and
+corrupts non-ASCII paths (for example a user profile with accented characters).
 
 ```powershell
-python scripts/package-notices.py .superpowers/sdd/diskscope/cargo-metadata.json .superpowers/sdd/diskscope/notice-check
+New-Item -ItemType Directory -Force target | Out-Null
+$previous = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc |
+        Set-Content -Encoding utf8 target\cargo-metadata.json
+} finally {
+    [Console]::OutputEncoding = $previous
+}
+python scripts/package-notices.py target\cargo-metadata.json target\notice-check
 ```
+
+Write the metadata as UTF-8, as above: Windows PowerShell 5.1 would redirect
+with `>` as UTF-16, which the collector cannot read. Add `--offline` to the
+`cargo metadata` command when the registry cache is already populated. Without
+extra arguments the collector packages the checked-in Rust 1.99.1 supplement
+without comparing it to any compiler; pass the compiler's `release:` and
+`commit-hash:` values from `rustc -Vv` as two more arguments to verify it against
+the compiler you have, as `scripts/build.ps1` does.

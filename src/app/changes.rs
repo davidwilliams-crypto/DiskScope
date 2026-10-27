@@ -2,6 +2,8 @@ use super::*;
 
 impl DiskScopeApp {
     pub(super) fn focus_changed_item(&mut self, path: PathBuf) {
+        // Both features steer the request's single focus path.
+        self.cancel_restore();
         self.remember_context();
         focus_change_request(&mut self.request, path);
         self.changes = false;

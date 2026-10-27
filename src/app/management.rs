@@ -1,6 +1,6 @@
 use super::*;
 use diskscope::{
-    admin::ElevationOutcome,
+    admin::{ElevationKind, ElevationOutcome},
     file_actions::{self, ActionError, ActionOutcome, RecycleBlock, RecyclePlan, RecycleVerdict},
 };
 use std::num::NonZeroIsize;
@@ -8,9 +8,28 @@ use std::num::NonZeroIsize;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AccessMode {
     Standard,
+    /// Elevated through UAC consent; a standard window of the same user exists.
     Admin,
+    /// Elevated without a UAC split (UAC off, or an account Windows exempts
+    /// from Admin Approval Mode). The policy is the same as for `Admin`; only
+    /// the explanation differs, because there is no standard window to open.
+    AlwaysAdmin,
     Unknown(String),
 }
+
+/// Why an always-elevated session cannot save anything or use the Recycle Bin.
+/// Shown in the access tooltip and the settings window.
+const ALWAYS_ADMIN_EXPLANATION: &str = concat!(
+    "This account always runs with full administrator rights: UAC is turned off, ",
+    "or Windows does not apply Admin Approval Mode to it ",
+    "(for example the built-in Administrator account). ",
+    "There is no standard window to switch to. ",
+    "History and preferences are unavailable because elevated sessions never ",
+    "write the user profile. ",
+    "The Recycle Bin is unavailable in every administrator session because ",
+    "Windows resolves the path itself, which could redirect the action. ",
+    "Permanent deletion stays available behind its own confirmation.",
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileAction {
@@ -32,16 +51,83 @@ struct Eligibility {
 }
 
 impl AccessMode {
+    /// Classifies the process token. An elevated token also asks Windows how it
+    /// came to be elevated; that second question only refines the explanation
+    /// and never changes what the session may do.
     pub(crate) fn from_probe(probe: Result<bool, String>) -> Self {
+        Self::from_probe_with(probe, diskscope::admin::elevation_kind)
+    }
+
+    /// [`Self::from_probe`] with the elevation-kind lookup injected, so the
+    /// mapping is testable without a Windows token. `kind` is only called for
+    /// an elevated token.
+    fn from_probe_with(
+        probe: Result<bool, String>,
+        kind: impl FnOnce() -> Result<ElevationKind, String>,
+    ) -> Self {
         match probe {
             Ok(false) => Self::Standard,
-            Ok(true) => Self::Admin,
+            // An unreadable or contradictory kind keeps the generic
+            // administrator description rather than guessing that UAC is off.
+            Ok(true) => match kind() {
+                Ok(ElevationKind::AlwaysElevated) => Self::AlwaysAdmin,
+                Ok(_) | Err(_) => Self::Admin,
+            },
             Err(error) => Self::Unknown(error),
         }
     }
 
+    /// True for every elevated session, whatever the reason.
+    pub(crate) fn is_administrator(&self) -> bool {
+        matches!(self, Self::Admin | Self::AlwaysAdmin)
+    }
+
     pub(crate) fn persistence_allowed(&self) -> bool {
         matches!(self, Self::Standard)
+    }
+
+    /// Why the Recycle Bin cannot be used in this session, if it cannot.
+    fn recycle_refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::Admin => Some(
+                "Recycle Bin requires a Standard window. Open DiskScope normally to recycle this file.",
+            ),
+            Self::AlwaysAdmin => Some(concat!(
+                "The Recycle Bin is unavailable because this account always runs as ",
+                "administrator. Permanent deletion is still available.",
+            )),
+            Self::Standard | Self::Unknown(_) => None,
+        }
+    }
+
+    /// Extra settings text for a session whose limits need more than the one
+    /// line in [`Self::history_message`].
+    pub(super) fn settings_note(&self) -> Option<&'static str> {
+        matches!(self, Self::AlwaysAdmin).then_some(ALWAYS_ADMIN_EXPLANATION)
+    }
+
+    /// The label and the hover text for the access indicator.
+    fn indicator(&self) -> (&'static str, String) {
+        match self {
+            Self::Standard => (
+                "Standard",
+                "Running with ordinary Windows access. Administrator mode may reveal more metadata."
+                    .to_owned(),
+            ),
+            Self::Admin => (
+                "Administrator",
+                concat!(
+                    "Running with administrator access. File permissions are respected; ",
+                    "some locations can still be inaccessible."
+                )
+                .to_owned(),
+            ),
+            Self::AlwaysAdmin => ("Administrator (always)", ALWAYS_ADMIN_EXPLANATION.to_owned()),
+            Self::Unknown(error) => (
+                "Access unknown",
+                format!("Windows could not verify this process token: {error}"),
+            ),
+        }
     }
 
     pub(super) fn history_message(&self) -> &'static str {
@@ -50,6 +136,11 @@ impl AccessMode {
             Self::Admin => {
                 "Administrator session: history and preferences are not saved. More files may be visible; these scans cannot be compared with ordinary-user baselines."
             }
+            Self::AlwaysAdmin => concat!(
+                "Administrator session (this account is always elevated): history and ",
+                "preferences are not saved. More files may be visible; these scans cannot ",
+                "be compared with ordinary-user baselines."
+            ),
             Self::Unknown(_) => {
                 "Access level could not be verified. History and preferences are not saved, and file actions are unavailable. Read-only scans remain available."
             }
@@ -90,10 +181,10 @@ fn unavailable(access: &AccessMode, action: FileAction, e: &Eligibility) -> Opti
         Some("Select one regular file. Folders and reparse points cannot be removed here.")
     } else if !e.identity_known {
         Some("This file has no reliable identity. Rescan before changing it.")
-    } else if matches!(access, AccessMode::Admin) && action == FileAction::Recycle {
-        Some(
-            "Recycle Bin requires a Standard window. Open DiskScope normally to recycle this file.",
-        )
+    } else if action == FileAction::Recycle
+        && let Some(reason) = access.recycle_refusal()
+    {
+        Some(reason)
     } else {
         None
     }
@@ -334,14 +425,12 @@ impl DiskScopeApp {
     }
 
     pub(super) fn access_controls(&mut self, ui: &mut egui::Ui, p: Palette) {
-        let (label, explanation) = match &self.access_mode {
-            AccessMode::Standard => ("Standard", "Running with ordinary Windows access. Administrator mode may reveal more metadata.".to_owned()),
-            AccessMode::Admin => ("Administrator", "Running with administrator access. File permissions are respected; some locations can still be inaccessible.".to_owned()),
-            AccessMode::Unknown(error) => ("Access unknown", format!("Windows could not verify this process token: {error}")),
-        };
+        let (label, explanation) = self.access_mode.indicator();
         ui.label(RichText::new(label).small().color(p.accent))
             .on_hover_text(explanation);
-        if !matches!(self.access_mode, AccessMode::Admin)
+        // An elevated window cannot be elevated again, and an always-elevated
+        // account has no ordinary window to return to either.
+        if !self.access_mode.is_administrator()
             && ui
                 .add_enabled(
                     !self.management.busy() && !self.picker_open,
@@ -354,10 +443,7 @@ impl DiskScopeApp {
     }
 
     fn restart_as_administrator(&mut self, ctx: &egui::Context) {
-        if self.management.busy()
-            || self.picker_open
-            || matches!(self.access_mode, AccessMode::Admin)
-        {
+        if self.management.busy() || self.picker_open || self.access_mode.is_administrator() {
             return;
         }
         self.management.elevating = true;
@@ -553,7 +639,7 @@ impl DiskScopeApp {
                         && self.generation == binding.generation
                         && self.root_path == binding.root;
                     if rescanned {
-                        self.begin_scan(binding.root.clone());
+                        self.rescan_keeping_place(binding.root.clone(), binding.node);
                     }
                     self.notice = Some(effects.notice);
                     if let Some(mut report) = effects.report {
@@ -734,6 +820,7 @@ impl DiskScopeApp {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{rendered_texts, settle_frames};
     use super::*;
     use eframe::App;
     use std::cell::Cell;
@@ -1238,6 +1325,340 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.starts_with("Moved to Recycle Bin"))
         );
+    }
+
+    /// True once the newest request has been answered for the current scan,
+    /// the scan has stopped and no restore is pending.
+    fn settled(app: &DiskScopeApp) -> bool {
+        !app.dirty
+            && app.restore.is_none()
+            && app.snapshot.progress.generation == app.generation
+            && !app.snapshot.progress.state.is_active()
+            && app.visible.view.generation == app.generation
+            && app.visible.view.revision == app.request.revision
+    }
+
+    /// Polls and submits view requests like the frame loop until `done` holds.
+    fn pump_until(app: &mut DiskScopeApp, what: &str, done: impl Fn(&DiskScopeApp) -> bool) {
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            app.logic(&ctx, &mut frame);
+            app.submit_view();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn row_named(app: &DiskScopeApp, name: &str) -> Row {
+        app.visible
+            .view
+            .rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row named {name}"))
+            .clone()
+    }
+
+    fn visible_names(app: &DiskScopeApp) -> Vec<String> {
+        app.visible
+            .view
+            .rows
+            .iter()
+            .map(|row| row.name.clone())
+            .collect()
+    }
+
+    /// A real scan of `root/a/b/{one,two,three}.bin` (300, 200 and 100 bytes)
+    /// that the user has opened down to `b`, sorted by name with a name
+    /// search, with `two.bin` selected.
+    fn browsing_in_a_nested_folder() -> (tempfile::TempDir, DiskScopeApp, Row) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, size) in [("one.bin", 300), ("two.bin", 200), ("three.bin", 100)] {
+            std::fs::write(folder.join(name), vec![0u8; size]).unwrap();
+        }
+        std::fs::write(dir.path().join("top.txt"), b"x").unwrap();
+        let storage = RecordingStorage::default();
+        let mut app = test_app(AccessMode::Admin, PathBuf::new(), &storage);
+        app.begin_scan(dir.path().to_path_buf());
+        pump_until(&mut app, "the first scan", settled);
+        app.destination(ViewMode::Explorer);
+        pump_until(&mut app, "the Explorer view", settled);
+        for name in ["a", "b"] {
+            let id = row_named(&app, name).id;
+            app.action(Action::Navigate(id));
+            pump_until(&mut app, "opening a folder", settled);
+        }
+        app.request.sort = SortKey::Name;
+        app.request.descending = false;
+        app.request.search = "bin".into();
+        app.mark_query_changed();
+        pump_until(&mut app, "the sorted, searched listing", settled);
+        assert_eq!(visible_names(&app), ["one.bin", "three.bin", "two.bin"]);
+        let two = row_named(&app, "two.bin");
+        app.action(Action::Select(two.id));
+        pump_until(&mut app, "the selection", settled);
+        assert_eq!(
+            app.visible.view.selected.as_ref().map(|row| row.id),
+            Some(two.id)
+        );
+        (dir, app, two)
+    }
+
+    /// Finishes a file action on `removed` the way the worker thread would.
+    fn finish_action(
+        app: &mut DiskScopeApp,
+        removed: &Row,
+        result: Result<ActionOutcome, ActionError>,
+    ) {
+        let binding = Binding {
+            sequence: 1,
+            generation: app.generation,
+            node: removed.id,
+            root: app.root_path.clone(),
+            path: removed.path.clone(),
+            action: FileAction::Recycle,
+        };
+        app.management.operation = Some(Operation::Running(binding.clone()));
+        app.management
+            .tx
+            .send(ManagementResult::Completed(binding, result))
+            .unwrap();
+        app.poll_management(&egui::Context::default());
+    }
+
+    fn recycled(row: &Row) -> Result<ActionOutcome, ActionError> {
+        Ok(ActionOutcome::Recycled {
+            original_path: row.path.clone(),
+        })
+    }
+
+    #[test]
+    fn rescan_after_a_file_action_returns_to_the_same_folder_with_the_same_query() {
+        let (dir, mut app, two) = browsing_in_a_nested_folder();
+        let folder = dir.path().join("a").join("b");
+        let old_generation = app.generation;
+        std::fs::remove_file(&two.path).unwrap();
+        finish_action(&mut app, &two, recycled(&two));
+        // Immediately after the action: a new scan with the place pending.
+        assert_ne!(app.generation, old_generation);
+        assert!(app.restore.is_some());
+        assert_eq!(app.request.root, 0, "node ids from the old scan are gone");
+        assert_eq!(app.request.selected, None);
+        assert_eq!(app.request.mode, ViewMode::Explorer);
+        assert_eq!(app.request.sort, SortKey::Name);
+        assert!(!app.request.descending);
+        assert_eq!(app.request.search, "bin");
+        assert_eq!(
+            app.request.focus_path.as_deref(),
+            Some(folder.join("three.bin").as_path()),
+            "two.bin was last, so its previous neighbour is the target"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Moved to Recycle Bin"))
+        );
+        pump_until(&mut app, "the rescan", settled);
+        assert_eq!(app.visible.view.root_path, folder);
+        assert_eq!(visible_names(&app), ["one.bin", "three.bin"]);
+        let selected = app.visible.view.selected.as_ref().expect("a neighbour");
+        assert_eq!(selected.name, "three.bin");
+        assert_eq!(app.request.selected, Some(selected.id));
+        assert_eq!(app.request.mode, ViewMode::Explorer);
+        assert_eq!(app.request.sort, SortKey::Name);
+        assert_eq!(app.request.search, "bin");
+        assert!(app.request.focus_path.is_none());
+        // Back/Forward still start empty: their entries hold old node ids.
+        assert!(!app.history.can_back() && !app.history.can_forward());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Moved to Recycle Bin")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn an_emptied_folder_is_reopened_empty_without_a_lost_folder_notice() {
+        let (dir, mut app, two) = browsing_in_a_nested_folder();
+        let folder = dir.path().join("a").join("b");
+        for name in ["one.bin", "two.bin", "three.bin"] {
+            std::fs::remove_file(folder.join(name)).unwrap();
+        }
+        finish_action(&mut app, &two, recycled(&two));
+        pump_until(&mut app, "the rescan", settled);
+        // The folder still exists, so the user lands in it, not above it.
+        assert_eq!(app.visible.view.root_path, folder);
+        assert!(app.visible.view.rows.is_empty());
+        assert_eq!(app.request.selected, None);
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.starts_with("Moved to Recycle Bin"), "{notice}");
+        assert!(!notice.contains("no longer in the scan"), "{notice}");
+    }
+
+    #[test]
+    fn a_folder_deleted_meanwhile_reopens_its_parent_with_a_notice() {
+        let (dir, mut app, two) = browsing_in_a_nested_folder();
+        std::fs::remove_dir_all(dir.path().join("a").join("b")).unwrap();
+        finish_action(&mut app, &two, recycled(&two));
+        pump_until(&mut app, "the rescan", settled);
+        assert_eq!(app.visible.view.root_path, dir.path().join("a"));
+        assert_eq!(app.request.selected, None);
+        assert_eq!(app.request.mode, ViewMode::Explorer);
+        assert_eq!(app.request.sort, SortKey::Name);
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.starts_with("Moved to Recycle Bin"), "{notice}");
+        assert!(
+            notice.contains("b is no longer in the scan, so DiskScope opened its closest remaining parent folder, a."),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn the_report_and_notice_ordering_survives_a_restoring_rescan() {
+        let (_dir, mut app, two) = browsing_in_a_nested_folder();
+        std::fs::remove_file(&two.path).unwrap();
+        finish_action(&mut app, &two, Err(ActionError::DeletedNotRecycled));
+        let Some(Operation::Report(report)) = &app.management.operation else {
+            panic!("a destroyed file must still be acknowledged");
+        };
+        assert!(report.body.contains("rescanning"), "{}", report.body);
+        assert!(app.restore.is_some());
+        pump_until(&mut app, "the rescan", settled);
+        // The modal is still up, and the restore ran underneath it without
+        // replacing the file action's notice.
+        assert!(matches!(
+            app.management.operation,
+            Some(Operation::Report(_))
+        ));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Deleted instead of recycled"))
+        );
+        assert_eq!(
+            app.visible.view.selected.as_ref().unwrap().name,
+            "three.bin"
+        );
+    }
+
+    #[test]
+    fn without_a_displayed_view_the_rescan_keeps_the_query_but_not_the_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RecordingStorage::default();
+        let mut app = app_for_binding(&storage, directory.path());
+        app.request.sort = SortKey::Files;
+        app.request.search = "needle".into();
+        // The fixture has no admitted view for generation 7.
+        complete(
+            &mut app,
+            Ok(ActionOutcome::Recycled {
+                original_path: binding(1).path,
+            }),
+        );
+        assert!(app.restore.is_none());
+        assert_eq!(app.request.sort, SortKey::Files);
+        assert_eq!(app.request.search, "needle");
+        assert_eq!(app.request.root, 0);
+    }
+
+    #[test]
+    fn an_always_elevated_token_is_told_apart_and_nothing_else_changes() {
+        let never = || -> Result<ElevationKind, String> {
+            panic!("a token that is not elevated needs no second question")
+        };
+        assert_eq!(
+            AccessMode::from_probe_with(Ok(false), never),
+            AccessMode::Standard
+        );
+        assert_eq!(
+            AccessMode::from_probe_with(Err("denied".into()), never),
+            AccessMode::Unknown("denied".into())
+        );
+        for (kind, expected) in [
+            (Ok(ElevationKind::AlwaysElevated), AccessMode::AlwaysAdmin),
+            (Ok(ElevationKind::Elevated), AccessMode::Admin),
+            // A contradictory or unreadable answer never claims UAC is off.
+            (Ok(ElevationKind::Standard), AccessMode::Admin),
+            (Err("no token".to_owned()), AccessMode::Admin),
+        ] {
+            assert_eq!(
+                AccessMode::from_probe_with(Ok(true), || kind.clone()),
+                expected,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn always_elevated_sessions_follow_the_administrator_policy_with_their_own_words() {
+        let always = AccessMode::AlwaysAdmin;
+        // Same policy as a consented administrator window.
+        assert!(always.is_administrator());
+        assert!(!always.persistence_allowed());
+        assert!(unavailable(&always, FileAction::Permanent, &eligible()).is_none());
+        let reason = unavailable(&always, FileAction::Recycle, &eligible()).unwrap();
+        // Different advice: there is no normal window to open.
+        let consented = unavailable(&AccessMode::Admin, FileAction::Recycle, &eligible()).unwrap();
+        assert_ne!(reason, consented);
+        assert!(consented.contains("Open DiskScope normally"));
+        assert!(!reason.contains("normally"), "{reason}");
+        assert!(reason.contains("always runs as administrator"), "{reason}");
+        // The explanation names the cause and the consequence honestly.
+        let (label, hover) = always.indicator();
+        assert_eq!(label, "Administrator (always)");
+        for fragment in [
+            "UAC",
+            "Admin Approval Mode",
+            "no standard window",
+            "never write the user profile",
+            "Recycle Bin is unavailable in every administrator session",
+        ] {
+            assert!(hover.contains(fragment), "{fragment}: {hover}");
+        }
+        assert!(always.history_message().contains("always elevated"));
+        assert_ne!(
+            always.history_message(),
+            AccessMode::Admin.history_message()
+        );
+        assert_eq!(always.settings_note(), Some(ALWAYS_ADMIN_EXPLANATION));
+        assert_eq!(AccessMode::Admin.settings_note(), None);
+    }
+
+    #[test]
+    fn settings_explain_an_always_elevated_session_and_offer_no_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RecordingStorage::default();
+        let mut shown = Vec::new();
+        for access in [
+            AccessMode::Standard,
+            AccessMode::Admin,
+            AccessMode::AlwaysAdmin,
+        ] {
+            let mut app = test_app(access.clone(), directory.path().join("history"), &storage);
+            app.settings_open = true;
+            let ctx = egui::Context::default();
+            let output = settle_frames(&ctx, |ui| {
+                app.settings_window(ui.ctx(), app.preferences.theme.palette())
+            });
+            shown.push((access, rendered_texts(&output.shapes)));
+        }
+        let has = |index: usize, text: &str| shown[index].1.iter().any(|t| t == text);
+        // Only a Standard window can offer a restart.
+        assert!(has(0, "Restart as administrator…"));
+        assert!(!has(1, "Restart as administrator…"));
+        assert!(!has(2, "Restart as administrator…"));
+        // The explanation is visible text, not only a tooltip, and only for
+        // the always-elevated session.
+        assert!(has(2, ALWAYS_ADMIN_EXPLANATION));
+        assert!(!has(1, ALWAYS_ADMIN_EXPLANATION));
+        assert!(has(2, "Administrator (always)"));
+        assert!(has(1, "Administrator"));
     }
 
     #[test]
