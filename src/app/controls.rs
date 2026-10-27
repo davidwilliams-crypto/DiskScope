@@ -151,14 +151,8 @@ impl DiskScopeApp {
                         self.action(Action::Select(row.id));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let allocated = row
-                            .allocated
-                            .map(|n| format!("{} B", format_count(n)))
-                            .unwrap_or_else(|| "unknown".into());
-                        ui.label(format!(
-                            "{} B logical · {allocated} allocated",
-                            format_count(row.logical)
-                        ));
+                        let figures = comparison_figures(row.logical, row.allocated);
+                        ui.label(figures.summary).on_hover_text(figures.exact);
                     });
                 });
                 ux::size_bar(ui, share(row.logical, max), p.accent, p);
@@ -204,7 +198,26 @@ impl DiskScopeApp {
         self.palette_query.clear();
         self.palette_index = 0;
     }
+    fn palette_facts(&self) -> PaletteFacts {
+        let selected = self.request.selected;
+        PaletteFacts {
+            scan_loaded: self.generation != 0,
+            scan_state: self.scan_state(),
+            can_back: self.history.can_back(),
+            can_forward: self.history.can_forward(),
+            has_selection: selected.is_some(),
+            selection_pinned: selected.is_some_and(|id| self.request.pinned.contains(&id)),
+            pins_full: self.request.pinned.len() >= MAX_PINS,
+            history_saved: self.access_mode.persistence_allowed(),
+            on_changes_page: self.changes,
+        }
+    }
     fn run_command(&mut self, command: Command, ctx: &egui::Context) {
+        // The palette shows an unavailable command as disabled. Refusing here
+        // as well keeps Enter, and any other caller, from running one.
+        if command.unavailable(&self.palette_facts()).is_some() {
+            return;
+        }
         self.palette_open = false;
         match command {
             Command::Overview => self.destination(ViewMode::Overview),
@@ -282,6 +295,7 @@ impl DiskScopeApp {
                     self.palette_index = 0;
                 }
                 let commands = command_matches(&self.palette_query);
+                let facts = self.palette_facts();
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                     self.palette_index =
                         (self.palette_index + 1).min(commands.len().saturating_sub(1));
@@ -290,22 +304,30 @@ impl DiskScopeApp {
                     self.palette_index = self.palette_index.saturating_sub(1);
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    chosen = commands.get(self.palette_index).copied();
+                    // Enter on a command that cannot run does nothing, and the
+                    // palette stays open so its reason stays readable.
+                    chosen = commands
+                        .get(self.palette_index)
+                        .copied()
+                        .filter(|command| command.unavailable(&facts).is_none());
                 }
                 for (index, command) in commands.iter().enumerate() {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 32.0],
-                            egui::Button::new(command.label()).fill(
-                                if index == self.palette_index {
-                                    p.wash
-                                } else {
-                                    p.surface
-                                },
-                            ),
-                        )
-                        .clicked()
-                    {
+                    let reason = command.unavailable(&facts);
+                    let mut button =
+                        egui::Button::new(command.label()).fill(if index == self.palette_index {
+                            p.wash
+                        } else {
+                            p.surface
+                        });
+                    if let Some(reason) = reason {
+                        button = button.shortcut_text(RichText::new(reason).small().color(p.muted));
+                    }
+                    let response = ui
+                        .add_enabled_ui(reason.is_none(), |ui| {
+                            ui.add_sized([ui.available_width(), 32.0], button)
+                        })
+                        .inner;
+                    if response.clicked() {
                         chosen = Some(*command);
                     }
                 }
@@ -367,6 +389,9 @@ impl DiskScopeApp {
                         .small()
                         .color(p.muted),
                 );
+                if let Some(note) = self.access_mode.settings_note() {
+                    ui.label(RichText::new(note).small().color(p.muted));
+                }
                 ui.label(
                     RichText::new(
                         "Scans read metadata. Recycle Bin and permanent deletion are separate, confirmed single-file actions.",
@@ -415,6 +440,29 @@ impl DiskScopeApp {
             });
     }
 }
+/// The two texts for one pinned row: sizes in the binary units every other
+/// view uses, and the exact byte counts for hover.
+struct ComparisonFigures {
+    summary: String,
+    exact: String,
+}
+
+fn comparison_figures(logical: u64, allocated: Option<u64>) -> ComparisonFigures {
+    let exact_bytes = |bytes: u64| format!("{} B", format_count(bytes));
+    ComparisonFigures {
+        summary: format!(
+            "{} logical · {} allocated",
+            format_bytes(logical),
+            allocated.map_or_else(|| "unknown".to_owned(), format_bytes)
+        ),
+        exact: format!(
+            "Logical: {}\nAllocated: {}",
+            exact_bytes(logical),
+            allocated.map_or_else(|| "unknown".to_owned(), exact_bytes)
+        ),
+    }
+}
+
 /// Explains what the file-action keys do and what they cannot promise.
 pub(super) const FILE_ACTION_HELP: &str = "Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE. Move to Recycle Bin is checked first and stops when Windows would clearly delete the file instead, but Windows makes the final decision; if it asks about permanent deletion, choose No.";
 
@@ -492,7 +540,9 @@ pub(super) fn date_time_label(seconds: u64) -> String {
 }
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{rendered_texts, settle_frames};
     use super::*;
+
     #[test]
     fn dates_and_size_reject_invalid_filters() {
         assert_eq!(parse_date("1970-01-01", false), Ok(Some(0)));
@@ -503,5 +553,180 @@ mod tests {
         assert!(parse_date("2023-02-29", false).is_err());
         assert!(parse_mib("NaN").is_err());
         assert_eq!(parse_mib("1.5"), Ok(Some(1572864)));
+    }
+
+    /// An app with no scan and no history, as at startup.
+    fn idle_app() -> (DiskScopeApp, egui::Context) {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let app =
+            DiskScopeApp::with_history_directory(&cc, None, PathBuf::new(), AccessMode::Admin);
+        (app, ctx)
+    }
+
+    fn palette_texts(app: &mut DiskScopeApp, ctx: &egui::Context) -> Vec<String> {
+        let output = settle_frames(ctx, |ui| {
+            app.command_palette(ui.ctx(), app.preferences.theme.palette())
+        });
+        rendered_texts(&output.shapes)
+    }
+
+    fn enter_key() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// One palette frame with `events`, for keyboard tests.
+    fn palette_frame(app: &mut DiskScopeApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.command_palette(ui.ctx(), app.preferences.theme.palette()),
+        );
+    }
+
+    #[test]
+    fn palette_shows_why_a_command_cannot_run_and_nothing_for_the_others() {
+        let (mut app, ctx) = idle_app();
+        app.open_palette();
+        let texts = palette_texts(&mut app, &ctx);
+        for reason in [
+            "No scan is running.",
+            "Nothing earlier to go back to.",
+            "Nothing later to go forward to.",
+            "Scan a folder first.",
+            "Select a folder or file first.",
+            "Scan history is not saved in this window.",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == reason),
+                "{reason}: {texts:?}"
+            );
+        }
+        // Commands that always work carry no reason.
+        for label in ["Overview", "Edit filters", "Switch theme"] {
+            assert!(texts.iter().any(|text| text == label), "{label}");
+        }
+        assert!(!texts.iter().any(|text| text.contains("Already")));
+    }
+
+    #[test]
+    fn enter_on_an_unavailable_command_runs_nothing_and_keeps_the_palette_open() {
+        let (mut app, ctx) = idle_app();
+        app.open_palette();
+        app.palette_query = "back".into();
+        palette_frame(&mut app, &ctx, vec![]);
+        palette_frame(&mut app, &ctx, vec![enter_key()]);
+        assert!(app.palette_open, "the reason must stay readable");
+        assert!(!app.history.can_back() && !app.history.can_forward());
+        assert_eq!(app.request.mode, ViewMode::Overview);
+        // Negative control: the same key runs an available command.
+        let theme = app.preferences.theme;
+        app.palette_query = "theme".into();
+        app.palette_index = 0;
+        palette_frame(&mut app, &ctx, vec![]);
+        palette_frame(&mut app, &ctx, vec![enter_key()]);
+        assert!(!app.palette_open);
+        assert_ne!(app.preferences.theme, theme);
+    }
+
+    #[test]
+    fn stop_needs_a_running_scan_and_flags_an_acknowledgement_only_then() {
+        let (mut app, ctx) = idle_app();
+        app.palette_open = true;
+        app.run_command(Command::Stop, &ctx);
+        assert!(app.palette_open, "an unavailable command is not run");
+        assert_eq!(app.cancellation.generation, None);
+        // With a running scan the same command goes through.
+        app.generation = 3;
+        let snapshot = Arc::make_mut(&mut app.snapshot);
+        snapshot.progress.generation = 3;
+        snapshot.progress.state = ScanState::Scanning;
+        app.run_command(Command::Stop, &ctx);
+        assert!(!app.palette_open);
+        assert_eq!(app.cancellation.generation, Some(3));
+        // A second Stop while the first is pending is refused.
+        app.palette_open = true;
+        app.run_command(Command::Stop, &ctx);
+        assert!(app.palette_open);
+    }
+
+    #[test]
+    fn pin_needs_a_selection_and_honours_the_comparison_limit() {
+        let (mut app, ctx) = idle_app();
+        app.run_command(Command::Pin, &ctx);
+        assert!(app.request.pinned.is_empty());
+        app.request.selected = Some(5);
+        app.run_command(Command::Pin, &ctx);
+        assert_eq!(app.request.pinned, [5]);
+        // Full comparison: another selection cannot be pinned, but the
+        // pinned one can still be unpinned.
+        app.request.pinned = (1..=MAX_PINS as NodeId).collect();
+        app.request.selected = Some(9);
+        assert!(Command::Pin.unavailable(&app.palette_facts()).is_some());
+        app.request.selected = Some(2);
+        assert!(Command::Pin.unavailable(&app.palette_facts()).is_none());
+    }
+
+    #[test]
+    fn comparison_tray_uses_binary_units_and_keeps_exact_bytes_for_hover() {
+        let figures = comparison_figures(1_234_567, Some(4096));
+        assert_eq!(figures.summary, "1.2 MiB logical · 4.0 KiB allocated");
+        assert_eq!(figures.exact, "Logical: 1,234,567 B\nAllocated: 4,096 B");
+        let unknown = comparison_figures(512, None);
+        assert_eq!(unknown.summary, "512 B logical · unknown allocated");
+        assert_eq!(unknown.exact, "Logical: 512 B\nAllocated: unknown");
+    }
+
+    #[test]
+    fn rendered_tray_shows_binary_units_instead_of_raw_byte_counts() {
+        let (mut app, ctx) = idle_app();
+        app.request.pinned = vec![1];
+        let mut snapshot = UiSnapshot::default();
+        snapshot.view.pinned_rows = vec![Row {
+            id: 1,
+            parent: Some(0),
+            depth: 0,
+            name: "archive.iso".into(),
+            path: PathBuf::from("/scan/archive.iso"),
+            is_dir: false,
+            reparse: false,
+            identity: None,
+            hard_link: false,
+            logical: 1_234_567,
+            allocated: Some(4096),
+            files: 1,
+            folders: 0,
+            modified: None,
+            has_children: false,
+        }];
+        app.visible = Arc::new(snapshot);
+        let output = settle_frames(&ctx, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                app.comparison_tray(ui, app.preferences.theme.palette());
+            });
+        });
+        let texts = rendered_texts(&output.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "1.2 MiB logical · 4.0 KiB allocated"),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("1,234,567")),
+            "raw byte counts belong in the hover text only: {texts:?}"
+        );
     }
 }
