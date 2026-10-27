@@ -9,6 +9,8 @@ use std::{
 
 /// Snapshot output is bounded even if a caller requests an excessive page size.
 pub const MAX_PAGE_ROWS: usize = 2048;
+/// Type bucket and filter token for files whose name has no extension.
+pub const NO_EXTENSION: &str = "(no extension)";
 
 /// Exact append-only root aggregates owned by a private normal Scan, never by
 /// public Model. Callers must append exactly the IDs returned by insert_batch
@@ -442,7 +444,7 @@ fn extension(node: &Node) -> String {
     Path::new(&node.name)
         .extension()
         .map(|s| format!(".{}", s.to_string_lossy().to_lowercase()))
-        .unwrap_or_else(|| "(no extension)".into())
+        .unwrap_or_else(|| NO_EXTENSION.into())
 }
 
 enum MatchFlags {
@@ -781,14 +783,10 @@ fn row(model: &Model, id: NodeId, depth: u16) -> Row {
 }
 
 #[cfg(test)]
-#[path = "view/ranking_tests.rs"]
-mod ranking_tests;
-
-#[cfg(test)]
-#[path = "view/query_work_tests.rs"]
 mod query_work_tests;
 #[cfg(test)]
-#[path = "view/summary_tests.rs"]
+mod ranking_tests;
+#[cfg(test)]
 mod summary_tests;
 
 #[cfg(test)]

@@ -15,30 +15,37 @@ pub(super) fn reveal_command(
     Ok(command)
 }
 
+/// The shared Windows installation directory (usually `C:\Windows`), asked
+/// from the OS. PATH, the working directory and environment variables must
+/// not select system executables or assets.
 #[cfg(windows)]
-fn explorer_path() -> Result<PathBuf, String> {
+pub(crate) fn windows_directory() -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
-    // Ask the OS for its shared installation directory. PATH, the working
-    // directory and environment variables must not select the executable.
     let mut wide = vec![0u16; 32_768];
     // SAFETY: the output buffer is initialized, writable and sized in WCHARs.
     let count =
         unsafe { GetSystemWindowsDirectoryW(wide.as_mut_ptr(), wide.len() as u32) } as usize;
     if count == 0 || count >= wide.len() {
-        return Err("Windows could not locate its Explorer executable.".into());
+        return Err("Windows could not report its installation directory.".into());
     }
     let directory = PathBuf::from(std::ffi::OsString::from_wide(&wide[..count]));
     if !directory.is_absolute() {
         return Err("Windows returned an invalid system directory.".into());
     }
-    Ok(directory.join("explorer.exe"))
+    Ok(directory)
 }
 
 #[cfg(not(windows))]
+pub(crate) fn windows_directory() -> Result<PathBuf, String> {
+    Err("Only available on Windows.".into())
+}
+
 fn explorer_path() -> Result<PathBuf, String> {
-    Err("Explorer is only available on Windows.".into())
+    windows_directory()
+        .map(|directory| directory.join("explorer.exe"))
+        .map_err(|_| "Windows could not locate its Explorer executable.".into())
 }
 
 #[cfg(all(test, windows))]
@@ -83,11 +90,18 @@ pub(super) fn volume_worker(results: SyncSender<NativeResult>) -> SyncSender<(u6
         .spawn(move || {
             while let Ok((generation, path)) = receiver.recv() {
                 let volume = read_volume(&path);
-                let _ = results.try_send(NativeResult::Volume {
-                    generation,
-                    path,
-                    volume,
-                });
+                // Block rather than drop: the UI drains a few results per
+                // frame, and a lost result would leave the volume line empty.
+                if results
+                    .send(NativeResult::Volume {
+                        generation,
+                        path,
+                        volume,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .expect("volume worker");

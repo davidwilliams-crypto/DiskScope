@@ -6,34 +6,108 @@ impl DiskScopeApp {
             return;
         }
         let mut open = true;
-        egui::Window::new("Filter files").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx,|ui|{
-            ui.label(RichText::new("Conditions apply together. Folder map area stays logical; matches are highlighted.").color(p.muted));
-            ui.add_space(10.0);ui.label("File extensions (comma separated)");
-            ui.add(egui::TextEdit::singleline(&mut self.filter_extensions).hint_text(".mp4, .mkv").char_limit(1024).desired_width(f32::INFINITY));
-            ui.horizontal_wrapped(|ui|{for (name,extensions) in [("Video",".mp4,.mkv,.mov,.avi,.webm,.wmv"),("Archives",".zip,.7z,.rar,.tar,.gz,.iso"),("Images",".png,.jpg,.jpeg,.gif,.webp,.svg,.heic,.psd"),("Documents",".pdf,.doc,.docx,.txt,.md,.xlsx,.pptx"),("Code",".rs,.js,.ts,.py,.cs,.cpp,.c,.h,.json,.toml")]{if ui.small_button(name).clicked(){self.filter_extensions=extensions.into();}}});
-            egui::Grid::new("filter_fields").num_columns(2).spacing([18.0,14.0]).show(ui,|ui|{
-                ui.label("Minimum size · MiB");ui.add(egui::TextEdit::singleline(&mut self.filter_min).desired_width(190.0).hint_text("Any size"));ui.end_row();
-                ui.label("Maximum size · MiB");ui.add(egui::TextEdit::singleline(&mut self.filter_max).desired_width(190.0).hint_text("No maximum"));ui.end_row();
-                ui.label("Modified since · UTC");ui.add(egui::TextEdit::singleline(&mut self.filter_after).desired_width(190.0).hint_text("YYYY-MM-DD"));ui.end_row();
-                ui.label("Modified through · UTC");ui.add(egui::TextEdit::singleline(&mut self.filter_before).desired_width(190.0).hint_text("YYYY-MM-DD"));ui.end_row();
+        egui::Window::new("Filter files")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Conditions apply together. Folder map area stays logical; matches are highlighted.",
+                    )
+                    .color(p.muted),
+                );
+                ui.add_space(10.0);
+                ui.label("File extensions (comma separated)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter_extensions)
+                        .hint_text(".mp4, .mkv")
+                        .char_limit(1024)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for category in &FILE_CATEGORIES {
+                        if ui.small_button(category.label).clicked() {
+                            self.filter_extensions = category.filter_text();
+                        }
+                    }
+                });
+                egui::Grid::new("filter_fields")
+                    .num_columns(2)
+                    .spacing([18.0, 14.0])
+                    .show(ui, |ui| {
+                        for (label, field, hint) in [
+                            ("Minimum size · MiB", &mut self.filter_min, "Any size"),
+                            ("Maximum size · MiB", &mut self.filter_max, "No maximum"),
+                            ("Modified since · UTC", &mut self.filter_after, "YYYY-MM-DD"),
+                            ("Modified through · UTC", &mut self.filter_before, "YYYY-MM-DD"),
+                        ] {
+                            ui.label(label);
+                            ui.add(
+                                egui::TextEdit::singleline(field)
+                                    .desired_width(190.0)
+                                    .hint_text(hint),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                ui.label(
+                    RichText::new(
+                        "1 MiB = 1,048,576 bytes. Unknown dates cannot match a date condition.",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+                ui.add_space(8.0);
+                if ui.button("Apply filters").clicked() {
+                    match self.parsed_filter_fields() {
+                        Some((min, max, after, before)) => {
+                            self.remember_context();
+                            apply_extensions(&mut self.request.filters, &self.filter_extensions);
+                            let f = &mut self.request.filters;
+                            f.min_bytes = min;
+                            f.max_bytes = max;
+                            f.modified_after = after;
+                            f.modified_before = before;
+                            self.filter_error = None;
+                            self.mark_query_changed();
+                            self.filter_open = false;
+                        }
+                        None => {
+                            self.filter_error = Some(
+                                "Check filter values: use positive MiB, valid YYYY-MM-DD dates, and a minimum no greater than the maximum.",
+                            );
+                        }
+                    }
+                }
+                if let Some(error) = self.filter_error {
+                    ui.colored_label(p.accent, error);
+                }
             });
-            ui.label(RichText::new("1 MiB = 1,048,576 bytes. Unknown dates cannot match a date condition.").small().color(p.muted));
-            ui.add_space(8.0);
-            if ui.button("Apply filters").clicked(){
-                let parsed=(parse_mib(&self.filter_min),parse_mib(&self.filter_max),parse_date(&self.filter_after,false),parse_date(&self.filter_before,true));
-                match parsed { (Ok(min),Ok(max),Ok(after),Ok(before)) if min.zip(max).is_none_or(|(a,b)|a<=b) && after.zip(before).is_none_or(|(a,b)|a<=b)=>{
-                    self.remember_context();apply_extensions(&mut self.request.filters,&self.filter_extensions);let f=&mut self.request.filters;f.min_bytes=min;f.max_bytes=max;f.modified_after=after;f.modified_before=before;self.mark_query_changed();self.filter_open=false;
-                },_=>{self.notice=Some("Check filter values: use positive MiB, valid YYYY-MM-DD dates, and a minimum no greater than the maximum.".into());}}
-            }
-            if let Some(notice)=self.notice.as_ref(){ui.colored_label(p.accent,notice);}
-        });
         self.filter_open &= open;
+        if !self.filter_open {
+            self.filter_error = None;
+        }
+    }
+    /// The size and date fields as filter bounds, or `None` when any field is
+    /// invalid or a minimum exceeds its maximum.
+    fn parsed_filter_fields(&self) -> Option<FilterBounds> {
+        let min = parse_mib(&self.filter_min).ok()?;
+        let max = parse_mib(&self.filter_max).ok()?;
+        let after = parse_date(&self.filter_after, false).ok()?;
+        let before = parse_date(&self.filter_before, true).ok()?;
+        let ordered =
+            |low: Option<u64>, high: Option<u64>| low.zip(high).is_none_or(|(a, b)| a <= b);
+        (ordered(min, max) && ordered(after, before)).then_some((min, max, after, before))
     }
     pub(super) fn pin(&mut self, id: NodeId) {
         if toggle_pin(&mut self.request.pinned, id) {
             self.dirty = true;
         } else {
-            self.notice = Some("Compare up to four objects. Unpin one to add another.".into());
+            self.notice = Some(format!(
+                "Compare up to {MAX_PINS} objects. Unpin one to add another."
+            ));
         }
     }
     pub(super) fn comparison_window(&mut self, ctx: &egui::Context, p: Palette) {
@@ -53,15 +127,51 @@ impl DiskScopeApp {
         if self.request.pinned.is_empty() {
             return;
         }
-        ux::card(p).show(ui,|ui|{
-            ui.horizontal_wrapped(|ui|{ui.label(RichText::new(format!("Pinned comparison · {}/4",self.request.pinned.len())).strong());if ui.small_button("Clear pins").clicked(){self.request.pinned.clear();self.dirty=true;}});
-            let max=rows.iter().map(|r|r.logical).max().unwrap_or(1);
-            for row in rows {ui.horizontal_wrapped(|ui|{
-                if ui.small_button("×").on_hover_text("Unpin").clicked(){self.pin(row.id);}
-                if ui.add(egui::Button::new(&row.name).frame(false)).clicked(){self.action(Action::Select(row.id));}
-                ui.with_layout(Layout::right_to_left(Align::Center),|ui|{ui.label(format!("{} B logical · {} allocated",format_count(row.logical),row.allocated.map(|n|format!("{} B",format_count(n))).unwrap_or_else(||"unknown".into())));});
-            });ux::size_bar(ui,share(row.logical,max),p.accent,p);}
-            ui.label(RichText::new(if snapshot.view.pinned_overlap {"Overlapping folders selected. Individual values overlap; do not add them."}else{"Individual logical sizes · allocation may include shared hardlinks. These are not reclaimable-space totals."}).small().color(p.muted));
+        ux::card(p).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Pinned comparison · {}/{MAX_PINS}",
+                        self.request.pinned.len()
+                    ))
+                    .strong(),
+                );
+                if ui.small_button("Clear pins").clicked() {
+                    self.request.pinned.clear();
+                    self.dirty = true;
+                }
+            });
+            let max = rows.iter().map(|r| r.logical).max().unwrap_or(1);
+            for row in rows {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("×").on_hover_text("Unpin").clicked() {
+                        self.pin(row.id);
+                    }
+                    if ui.add(egui::Button::new(&row.name).frame(false)).clicked() {
+                        self.action(Action::Select(row.id));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let allocated = row
+                            .allocated
+                            .map(|n| format!("{} B", format_count(n)))
+                            .unwrap_or_else(|| "unknown".into());
+                        ui.label(format!(
+                            "{} B logical · {allocated} allocated",
+                            format_count(row.logical)
+                        ));
+                    });
+                });
+                ux::size_bar(ui, share(row.logical, max), p.accent, p);
+            }
+            ui.label(
+                RichText::new(if snapshot.view.pinned_overlap {
+                    "Overlapping folders selected. Individual values overlap; do not add them."
+                } else {
+                    "Individual logical sizes · allocation may include shared hardlinks. These are not reclaimable-space totals."
+                })
+                .small()
+                .color(p.muted),
+            );
         });
     }
     pub(super) fn breakdown(&mut self, ui: &mut egui::Ui, p: Palette) {
@@ -121,11 +231,7 @@ impl DiskScopeApp {
                 self.filter_open = true;
             }
             Command::Theme => {
-                self.preferences.theme = if self.preferences.theme == Theme::Dark {
-                    Theme::Light
-                } else {
-                    Theme::Dark
-                };
+                self.preferences.theme = self.preferences.theme.next();
                 self.apply_appearance(ctx);
             }
         }
@@ -227,20 +333,48 @@ impl DiskScopeApp {
             self.preferences.text_scale,
             self.preferences.reduced_motion,
         );
-        egui::Window::new("Appearance & settings").open(&mut open).collapsible(false).default_width(370.0).show(ctx,|ui|{
-            overline(ui,"COLOR THEME",p);
-            ui.horizontal_wrapped(|ui|{ui.selectable_value(&mut self.preferences.theme,Theme::Dark,"Graphite");ui.selectable_value(&mut self.preferences.theme,Theme::Light,"Warm light");ui.selectable_value(&mut self.preferences.theme,Theme::HighContrast,"High contrast");});
-            ui.add_space(12.0);overline(ui,"TEXT & COMFORT",p);
-            ui.horizontal_wrapped(|ui|{ui.selectable_value(&mut self.preferences.text_scale,TextScale::Normal,"100%");ui.selectable_value(&mut self.preferences.text_scale,TextScale::Large,"125%");ui.selectable_value(&mut self.preferences.text_scale,TextScale::Largest,"150%");});
-            ui.checkbox(&mut self.preferences.reduced_motion,"Reduced motion");
-            ui.checkbox(&mut self.preferences.map_focus,"Give the map more room");
-            ui.add_space(12.0);overline(ui,"SCANNING",p);
-            ui.checkbox(&mut self.preferences.ntfs_preview,"NTFS preview acceleration").on_hover_text("Experimental. Unsupported cases fall back to the normal folder scan.");
-            ui.add_space(12.0);overline(ui,"WINDOWS ACCESS",p);
-            self.access_controls(ui,p);
-            ui.label(RichText::new(self.access_mode.history_message()).small().color(p.muted));
-            ui.label(RichText::new("Scans read metadata. Recycle Bin and permanent deletion are separate, confirmed single-file actions.").small().color(p.muted));
-        });
+        egui::Window::new("Appearance & settings")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(370.0)
+            .show(ctx, |ui| {
+                overline(ui, "COLOR THEME", p);
+                ui.horizontal_wrapped(|ui| {
+                    for theme in Theme::ALL {
+                        ui.selectable_value(&mut self.preferences.theme, theme, theme.label());
+                    }
+                });
+                ui.add_space(12.0);
+                overline(ui, "TEXT & COMFORT", p);
+                ui.horizontal_wrapped(|ui| {
+                    for scale in TextScale::ALL {
+                        ui.selectable_value(&mut self.preferences.text_scale, scale, scale.label());
+                    }
+                });
+                ui.checkbox(&mut self.preferences.reduced_motion, "Reduced motion");
+                ui.checkbox(&mut self.preferences.map_focus, "Give the map more room");
+                ui.add_space(12.0);
+                overline(ui, "SCANNING", p);
+                ui.checkbox(&mut self.preferences.ntfs_preview, "NTFS preview acceleration")
+                    .on_hover_text(
+                        "Experimental. Unsupported cases fall back to the normal folder scan.",
+                    );
+                ui.add_space(12.0);
+                overline(ui, "WINDOWS ACCESS", p);
+                self.access_controls(ui, p);
+                ui.label(
+                    RichText::new(self.access_mode.history_message())
+                        .small()
+                        .color(p.muted),
+                );
+                ui.label(
+                    RichText::new(
+                        "Scans read metadata. Recycle Bin and permanent deletion are separate, confirmed single-file actions.",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+            });
         self.settings_open = open;
         if previous
             != (
@@ -256,13 +390,38 @@ impl DiskScopeApp {
         if !self.help_open {
             return;
         }
-        egui::Window::new("Keyboard help").open(&mut self.help_open).collapsible(false).show(ctx,|ui|{
-            for (key,action) in [("Ctrl K","Open commands"),("↑ / ↓, Enter","Choose and run a command"),("Alt ← / Alt →","Back / Forward with your context"),("Tab / Shift Tab","Move keyboard focus"),("Space / Enter","Activate the focused control or map item"),("Delete","Open Recycle Bin confirmation for the selected file"),("Shift Delete","Open permanent-delete confirmation for the selected file"),("Escape","Cancel a confirmation or close a dialog"),("F1","Keyboard help")]{detail(ui,key,action,p);}
-            ui.label("Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE.");
-            ui.add_space(10.0);ui.label("Map items have names and logical sizes. The table offers the same objects and paths.");
-        });
+        egui::Window::new("Keyboard help")
+            .open(&mut self.help_open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                for (key, action) in [
+                    ("Ctrl K", "Open commands"),
+                    ("↑ / ↓, Enter", "Choose and run a command"),
+                    ("Alt ← / Alt →", "Back / Forward with your context"),
+                    ("Tab / Shift Tab", "Move keyboard focus"),
+                    ("Space / Enter", "Activate the focused control or map item"),
+                    ("Delete", "Check Recycle Bin availability, then open the confirmation for the selected file"),
+                    ("Shift Delete", "Open permanent-delete confirmation for the selected file"),
+                    ("Escape", "Cancel a confirmation or close a dialog"),
+                    ("F1", "Keyboard help"),
+                ] {
+                    detail(ui, key, action, p);
+                }
+                ui.label(FILE_ACTION_HELP);
+                ui.add_space(10.0);
+                ui.label(
+                    "Map items have names and logical sizes. The table offers the same objects and paths.",
+                );
+            });
     }
 }
+/// Explains what the file-action keys do and what they cannot promise.
+pub(super) const FILE_ACTION_HELP: &str = "Enter never confirms a file action. Permanent deletion also requires the checkbox and typing DELETE. Move to Recycle Bin is checked first and stops when Windows would clearly delete the file instead, but Windows makes the final decision; if it asks about permanent deletion, choose No.";
+
+/// `(min_bytes, max_bytes, modified_after, modified_before)` as parsed from
+/// the filter dialog.
+type FilterBounds = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
+
 fn parse_mib(text: &str) -> Result<Option<u64>, ()> {
     if text.trim().is_empty() {
         return Ok(None);

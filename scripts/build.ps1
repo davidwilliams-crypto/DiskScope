@@ -1,7 +1,12 @@
-param([switch]$Offline, [string]$PackageDirectory = 'dist\0.3.0', [string]$ValidationFile = 'docs\validation-360-fixes.md', [string]$PerformanceFile = 'docs\performance-c-drive-2026-10-26.md')
+param([switch]$Offline, [string]$PackageDirectory, [string]$ValidationFile = 'docs\validation-360-fixes.md', [string]$PerformanceFile = 'docs\performance-c-drive-2026-10-26.md')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'package-tools.ps1')
+. (Join-Path $PSScriptRoot 'release-tools.ps1')
+# The package directory follows Cargo.toml so a version bump cannot leave the
+# build in a stale dist folder that the benchmark and release scripts never read.
+$version = Get-ReleaseVersion -ProjectRoot $projectRoot
+if (-not $PackageDirectory) { $PackageDirectory = "dist\$version" }
 $localCargo = Join-Path $projectRoot '.tools\cargo\bin\cargo.exe'
 if (Test-Path -LiteralPath $localCargo) {
     $env:RUSTUP_HOME = Join-Path $projectRoot '.tools\rustup'
@@ -32,6 +37,16 @@ try {
     $packageRoot = if ([IO.Path]::IsPathRooted($PackageDirectory)) { $PackageDirectory } else { Join-Path $projectRoot $PackageDirectory }
     New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
     $packageRoot = (Resolve-Path -LiteralPath $packageRoot).ProviderPath
+    # Remove generated output from an earlier build of this version. Nothing else
+    # is touched, so a user-supplied directory never loses unrelated files; but a
+    # leftover licenses\<old-crate> folder must not be hashed into the manifest.
+    foreach ($generated in @('licenses', 'THIRD_PARTY_NOTICES.md', 'SHA256SUMS.txt')) {
+        $stale = Join-Path $packageRoot $generated
+        if (Test-Path -LiteralPath $stale) {
+            if ((Get-Item -LiteralPath $stale -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing to clean a reparse point: $stale" }
+            Remove-Item -LiteralPath $stale -Recurse -Force
+        }
+    }
     Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\diskscope.exe') -Destination (Join-Path $packageRoot 'DiskScope.exe') -Force
     Copy-Item -LiteralPath $portableReadme -Destination (Join-Path $packageRoot 'README.txt') -Force
     Copy-Item -LiteralPath $validationNotes -Destination (Join-Path $packageRoot 'VALIDATION.md') -Force
@@ -40,12 +55,19 @@ try {
     $metadataPath = Join-Path (Join-Path $projectRoot 'target') ('diskscope-cargo-metadata-' + [guid]::NewGuid().ToString('N') + '.json')
     $metadataArgs = @('metadata','--locked','--format-version','1','--filter-platform','x86_64-pc-windows-msvc')
     if ($Offline) { $metadataArgs += '--offline' }
+    # cargo prints UTF-8 JSON; PowerShell decodes native output with the console
+    # code page, which would corrupt non-ASCII manifest paths (e.g. a user profile
+    # with accented characters) before they are written back out.
+    $previousOutputEncoding = [Console]::OutputEncoding
     try {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
         & $cargoCommand @metadataArgs | Set-Content -LiteralPath $metadataPath -Encoding utf8
         if ($LASTEXITCODE -ne 0) { throw 'Dependency metadata failed' }
+        [Console]::OutputEncoding = $previousOutputEncoding
         & python (Join-Path $PSScriptRoot 'package-notices.py') $metadataPath $packageRoot $rustRelease $rustCommit
         if ($LASTEXITCODE -ne 0) { throw 'Notice collection failed' }
     } finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
         if (Test-Path -LiteralPath $metadataPath) { Remove-Item -LiteralPath $metadataPath }
     }
     $hashLines = @(Get-PackageChecksums -Directory $packageRoot)

@@ -72,7 +72,24 @@ fn parse_args(args: Vec<OsString>) -> Result<Command, String> {
     })
 }
 
+/// The release build uses the Windows GUI subsystem, which starts without a
+/// console. Attaching to the parent console lets `--help`, `--version`, scan
+/// JSON and error text reach a terminal that launched the executable. Without
+/// a parent console the call fails harmlessly and output stays discarded.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: AttachConsole takes a process id constant and touches no memory
+    // owned by this program.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() {
+    attach_parent_console();
     let command = match parse_args(std::env::args_os().skip(1).collect()) {
         Ok(command) => command,
         Err(error) => {
@@ -83,7 +100,13 @@ fn main() {
     let initial_path = match command {
         Command::Help => {
             println!(
-                "DiskScope {}\n\nDiskScope.exe [FOLDER]\nDiskScope.exe --scan PATH [--json OUTPUT.json] [--backend normal|ntfs] [--timeout SECONDS]\n\nScans are read-only. Junctions and directory links are skipped. NTFS mode requests no elevation and falls back when unavailable.",
+                "DiskScope {}\n\n\
+                 DiskScope.exe [FOLDER]\n\
+                 DiskScope.exe --scan PATH [--json OUTPUT.json] [--backend normal|ntfs] [--timeout SECONDS]\n\
+                 DiskScope.exe --help | --version\n\n\
+                 Scans are read-only. Directory junctions and links are listed but not followed. \
+                 NTFS mode requests no elevation and falls back when unavailable. \
+                 Exit codes: 0 complete, 1 failure, 2 argument error, 3 timeout, 4 partial results.",
                 env!("CARGO_PKG_VERSION")
             );
             return;
@@ -187,15 +210,50 @@ fn run_scan(
     }
     let snapshot = latest.unwrap_or_else(|| std::sync::Arc::new(UiSnapshot::default()));
     let p = &snapshot.progress;
+    let errors: Vec<_> = p
+        .errors
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "path_display": e.path.to_string_lossy(),
+                "message": e.message,
+            })
+        })
+        .collect();
+    let largest_files: Vec<_> = snapshot
+        .view
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "path_display": r.path.to_string_lossy(),
+                "logical_bytes": r.logical,
+                "allocated_bytes": r.allocated,
+                "hardlink": r.hard_link,
+            })
+        })
+        .collect();
     let report = serde_json::json!({
-        "application":"DiskScope","version":env!("CARGO_PKG_VERSION"),"root_display":root.to_string_lossy(),
-        "state":if timed_out {"Timed out"}else{p.state.label()},"complete":!timed_out&&p.state==ScanState::Complete&&p.errors_total==0,
-        "backend":p.backend,"files":p.files,"folders":p.folders,"logical_bytes":p.logical,
-        "unique_allocated_bytes":p.unique_allocated,"hardlink_aliases":p.hardlinks,"skipped_reparse_entries":p.skipped,
-        "errors_total":p.errors_total,"first_result_ms":first_result_ms,"scan_elapsed_ms":p.elapsed.as_secs_f64()*1000.0,"wall_elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
-        "message":p.message,"accounting":"Logical bytes count file entries. Unique allocation deduplicates file IDs. ADS and filesystem metadata excluded.",
-        "errors":p.errors.iter().map(|e|serde_json::json!({"path_display":e.path.to_string_lossy(),"message":e.message})).collect::<Vec<_>>(),
-        "largest_files":snapshot.view.rows.iter().map(|r|serde_json::json!({"path_display":r.path.to_string_lossy(),"logical_bytes":r.logical,"allocated_bytes":r.allocated,"hardlink":r.hard_link})).collect::<Vec<_>>()
+        "application": "DiskScope",
+        "version": env!("CARGO_PKG_VERSION"),
+        "root_display": root.to_string_lossy(),
+        "state": if timed_out { "Timed out" } else { p.state.label() },
+        "complete": !timed_out && p.state == ScanState::Complete && p.errors_total == 0,
+        "backend": p.backend,
+        "files": p.files,
+        "folders": p.folders,
+        "logical_bytes": p.logical,
+        "unique_allocated_bytes": p.unique_allocated,
+        "hardlink_aliases": p.hardlinks,
+        "skipped_reparse_entries": p.skipped,
+        "errors_total": p.errors_total,
+        "first_result_ms": first_result_ms,
+        "scan_elapsed_ms": p.elapsed.as_secs_f64() * 1000.0,
+        "wall_elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "message": p.message,
+        "accounting": "Logical bytes count file entries. Unique allocation deduplicates file IDs. ADS and filesystem metadata excluded.",
+        "errors": errors,
+        "largest_files": largest_files,
     });
     let encoded = serde_json::to_vec_pretty(&report)?;
     if let Some(path) = output {

@@ -1,6 +1,4 @@
-use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
-};
+use eframe::egui::{self, Color32, FontId, Stroke, TextStyle};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +25,19 @@ pub struct Palette {
 }
 
 impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::Dark, Theme::Light, Theme::HighContrast];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Graphite",
+            Self::Light => "Warm light",
+            Self::HighContrast => "High contrast",
+        }
+    }
+    /// The next theme in [`Theme::ALL`], wrapping around.
+    pub fn next(self) -> Theme {
+        let index = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
     pub fn palette(self) -> Palette {
         let rgb = Color32::from_rgb;
         match self {
@@ -125,19 +136,27 @@ impl Theme {
 }
 
 /// System font I/O is confined to initialization, before the update callback.
+/// The font is read from the real Windows directory, so installations on a
+/// drive other than `C:` still get Segoe UI; failures keep egui's bundled font.
 pub fn load_system_font(ctx: &egui::Context) {
     #[cfg(windows)]
-    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-        let mut definitions = FontDefinitions::default();
-        definitions
-            .font_data
-            .insert("Segoe UI".into(), FontData::from_owned(bytes).into());
-        definitions
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, "Segoe UI".into());
-        ctx.set_fonts(definitions);
+    {
+        use eframe::egui::{FontData, FontDefinitions, FontFamily};
+        let Ok(directory) = crate::app::windows_directory() else {
+            return;
+        };
+        if let Ok(bytes) = std::fs::read(directory.join("Fonts").join("segoeui.ttf")) {
+            let mut definitions = FontDefinitions::default();
+            definitions
+                .font_data
+                .insert("Segoe UI".into(), FontData::from_owned(bytes).into());
+            definitions
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "Segoe UI".into());
+            ctx.set_fonts(definitions);
+        }
     }
     #[cfg(not(windows))]
     let _ = ctx;
@@ -151,6 +170,14 @@ pub enum TextScale {
     Largest,
 }
 impl TextScale {
+    pub const ALL: [TextScale; 3] = [TextScale::Normal, TextScale::Large, TextScale::Largest];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "100%",
+            Self::Large => "125%",
+            Self::Largest => "150%",
+        }
+    }
     pub fn factor(self) -> f32 {
         match self {
             Self::Normal => 1.0,

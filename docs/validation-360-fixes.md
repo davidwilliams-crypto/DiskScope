@@ -65,6 +65,7 @@ Independent review covered query correctness, history semantics, native handle l
 ## Limits
 
 - Windows Shell owns the final recycle leaf-name operation. Retained ancestors mitigate the reviewed ancestor replacement race; this is not atomic same-object recycling and does not lock DOS drive mappings. Distinct-principal adversarial exploitation has not been qualified. Permanent deletion still verifies and acts on the same handle.
+- Recycle outcomes are now verified against the filesystem, and a file the Shell deleted instead of recycling is typed, reported and rescanned; see docs/validation-recycle-bin-hardening.md in the source repository. The Recycle Bin preflight, sink veto, owner window and outcome check are type-checked and unit-tested on Linux only; the Windows validation matrix has not been run.
 - Raw NTFS remains experimental; a successful full-volume parity run was not performed.
 - No interactive UAC consent, full Narrator qualification or fuzz/sanitizer campaign was performed. The GUI smoke is a bounded interaction check.
 - Full-drive performance claims from older documents are not updated by these local measurements.

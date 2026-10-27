@@ -7,5 +7,6 @@ pub mod icicle;
 pub mod model;
 pub mod ntfs;
 pub mod platform;
+pub mod recycle_policy;
 pub mod treemap;
 pub mod view;

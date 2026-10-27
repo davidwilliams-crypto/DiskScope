@@ -11,7 +11,7 @@ This release adds explicit Windows administrator relaunch, single-file Recycle B
 | Formatting | `cargo fmt --all -- --check` passed |
 | All-target Clippy, default and diagnostics | Both passed with warnings denied |
 | Explicit permanent-action integration fixtures | 5 passed: selected file only, changed content, replaced path, open writer and preserved read-only attribute |
-| Explicit Recycle Bin fixture | Passed with ordinary token and non-null recycled destination; sibling preserved |
+| Explicit Recycle Bin fixture | Passed with ordinary token and non-null recycled destination; sibling preserved (happy path only; see the erratum below) |
 | Explicit junction fixtures | 2 passed: preparation and post-confirmation commit refusal |
 | Independent source review | Mapped-drive restriction finding fixed and re-reviewed; no remaining material findings |
 
@@ -35,7 +35,7 @@ The apparent missing query controls were confirmed to be a retained outer-pane s
 
 The explicit Restart as administrator button opened its waiting modal. The user approved Windows UAC directly. A replacement window showed **Administrator**, preserved `C:\`, began a normal read-only scan, and displayed the disabled-history/preferences notice. The user subsequently interacted with that window; no elevated scan-speed or full-coverage comparison is inferred. The final administrator window was left open. Real UAC cancellation was not forced; backend classification and application cancellation/error handling are covered by tests. Privileged file deletion was not tested on user files.
 
-The final-source normal-token Recycle Bin fixture was repeated with a ten-second bound: it passed in 0.09 seconds, confirmed the recycled destination, and preserved the sibling. No Shell confirmation was automatically answered. Existing Bin contents were preserved.
+The final-source normal-token Recycle Bin fixture was repeated with a ten-second bound: it passed in 0.09 seconds, confirmed the recycled destination, and preserved the sibling. No Shell confirmation was automatically answered. Existing Bin contents were preserved. This covered the happy path only: a fixed local volume where the Shell can recycle.
 
 The packaged executable's command-line smoke scan passed: exit 0, complete, 11 files, 5 folders, 18,366,464 logical bytes and zero errors. The portable directory includes 319 notice/license files for 166 packages, this validation report and the historical C-drive performance report. Final payload/ZIP verification checks all 343 manifest digests, all 344 archived files and ZIP CRCs; the archive has a separate SHA-256 sidecar. ZIP timestamps older than 1980 are clamped to the format's minimum without changing any payload bytes.
 
@@ -43,7 +43,9 @@ The packaged executable's command-line smoke scan passed: exit 0, complete, 11 f
 
 Administrator access can improve coverage and permit raw-volume access, but normal scanning is not guaranteed to become faster. More readable files can increase time and RAM. The experimental NTFS backend remains opt-in and lacks a qualified elevated C-drive accounting comparison.
 
-Permanent deletion acts on a pinned handle after identity, exact timestamp, size, regular-file and reparse checks. It does not override file ownership, ACLs, sharing locks or read-only attributes. Recycle Bin is unavailable in administrator mode because the Windows Shell action resolves a path; the normal-token action has no permanent-delete fallback. Only single local regular files can be acted on. Removing a hard-link alias may reclaim no storage.
+Permanent deletion acts on a pinned handle after identity, exact timestamp, size, regular-file and reparse checks. It does not override file ownership, ACLs, sharing locks or read-only attributes. Recycle Bin is unavailable in administrator mode because the Windows Shell action resolves a path; the normal-token action asks the Shell to recycle (see the erratum below: the Shell itself can delete a file it cannot recycle). Only single local regular files can be acted on. Removing a hard-link alias may reclaim no storage.
+
+**Erratum (27 October 2026).** The statement that the normal-token action has no permanent-delete fallback described DiskScope's intent and the validated happy path only (a fixed NTFS volume and a non-null recycled destination). The Windows Shell, not DiskScope, decides whether a file is recycled, and it can delete a file it cannot recycle: a volume with no Recycle Bin, a file larger than the Bin maximum, the "Remove files immediately" setting, or policy. Those conditions were not exercised in 0.3.0. See [Recycle Bin hardening](validation-recycle-bin-hardening.md).
 
 Elevated and unknown-access GUI sessions start with default preferences and an unavailable history service. eframe persistence is directed to the Windows NUL device and app save/load paths are disabled. The current process token determines the policy; command-line flags cannot claim administrator mode.
 
