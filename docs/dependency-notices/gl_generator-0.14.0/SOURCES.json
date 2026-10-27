@@ -1,0 +1,22 @@
+{
+  "package": "gl_generator-0.14.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/brendanzab/gl-rs/",
+  "crate_archive": "https://static.crates.io/crates/gl_generator/gl_generator-0.14.0.crate",
+  "crate_vcs_commit": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e",
+  "crate_path_in_vcs": "",
+  "files": [
+    {
+      "file": "LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_url": "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "NOTICE-CRATE.txt",
+      "sha256": "7eb15307bafc2e83b48490a5a4f1024f860d00c98b173fb5b8fa11e4e6692a31",
+      "source_url": "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/gl_generator/lib.rs",
+      "source_type": "complete leading copyright/license comment from cached source"
+    }
+  ]
+}

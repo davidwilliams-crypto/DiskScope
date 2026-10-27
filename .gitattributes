@@ -1,0 +1,2 @@
+# Keep upstream notice bytes unchanged so recorded provenance hashes survive checkout.
+docs/dependency-notices/** -text -whitespace

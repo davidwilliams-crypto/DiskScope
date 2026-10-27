@@ -1,0 +1,28 @@
+{
+  "package": "accesskit_winit-0.32.2",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/AccessKit/accesskit",
+  "crate_archive": "https://static.crates.io/crates/accesskit_winit/accesskit_winit-0.32.2.crate",
+  "crate_vcs_commit": "1bbcf100942bac96c2c3a4a91cb67b0b20201a24",
+  "crate_path_in_vcs": "platforms/winit",
+  "files": [
+    {
+      "file": "LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "source_url": "https://raw.githubusercontent.com/AccessKit/accesskit/1bbcf100942bac96c2c3a4a91cb67b0b20201a24/LICENSE-MIT",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+      "source_url": "https://raw.githubusercontent.com/AccessKit/accesskit/1bbcf100942bac96c2c3a4a91cb67b0b20201a24/LICENSE-APACHE",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "LICENSE.chromium",
+      "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+      "source_url": "https://raw.githubusercontent.com/AccessKit/accesskit/1bbcf100942bac96c2c3a4a91cb67b0b20201a24/LICENSE.chromium",
+      "source_type": "upstream file, unmodified"
+    }
+  ]
+}

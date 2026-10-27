@@ -1,0 +1,163 @@
+Copyright and license notices embedded in the registry inputs shipped with khronos_api 3.1.0.
+
+
+
+Source files:
+https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/gl.xml
+https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/gl.xml
+
+Copyright (c) 2013-2018 The Khronos Group Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+------------------------------------------------------------------------
+
+This file, gl.xml, is the OpenGL and OpenGL API Registry. The canonical
+version of the registry, together with documentation, schema, and Python
+generator scripts used to generate C header files for OpenGL and OpenGL ES,
+can always be found in the Khronos Registry at
+        https://github.com/KhronosGroup/OpenGL-Registry
+
+
+Source files:
+https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/glx.xml
+
+Copyright (c) 2013-2018 The Khronos Group Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+------------------------------------------------------------------------
+
+This file, glx.xml, is the GLX API Registry. The canonical version of the
+registry, together with documentation, schema, and Python generator scripts
+used to generate C header files for GLX, can always be found in the Khronos
+Registry at
+        https://github.com/KhronosGroup/OpenGL-Registry
+
+
+Source files:
+https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/wgl.xml
+https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/wgl.xml
+
+Copyright (c) 2013-2018 The Khronos Group Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+------------------------------------------------------------------------
+
+This file, wgl.xml, is the WGL API Registry. The older ".spec" file
+format has been retired and will no longer be updated with new
+extensions and API versions. The canonical version of the registry,
+together with documentation, schema, and Python generator scripts used
+to generate C header files for WGL, can always be found in the Khronos
+Registry at
+        https://github.com/KhronosGroup/OpenGL-Registry
+
+
+Source files:
+https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/egl.xml
+https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/b6b558e7042d67fc7543383bb0e13a075f21d8ab/api/egl.xml
+
+Copyright (c) 2013-2017 The Khronos Group Inc.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and/or associated documentation files (the
+    "Materials"), to deal in the Materials without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Materials, and to
+    permit persons to whom the Materials are furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Materials.
+
+    THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
+
+
+Source files:
+https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/egl_angle_ext.xml
+
+Copyright 2018 The ANGLE Project Authors. All rights reserved.
+    Use of this source code is governed by a BSD-style license that can be
+    found in the LICENSE file.
+
+    egl_angle_ext.xml
+        Includes data used to auto-generate ANGLE classes.
+
+
+Source files:
+https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/gl_angle_ext.xml
+
+Copyright 2018 The ANGLE Project Authors. All rights reserved.
+    Use of this source code is governed by a BSD-style license that can be
+    found in the LICENSE file.
+
+    gl_angle_ext.xml
+        Includes data used to auto-generate ANGLE classes.
+
+
+Source files:
+https://raw.githubusercontent.com/KhronosGroup/WebGL/c987f075bfdca44119175c41f547d849c08983a3/specs/latest/1.0/webgl.idl
+https://raw.githubusercontent.com/KhronosGroup/WebGL/c987f075bfdca44119175c41f547d849c08983a3/specs/latest/2.0/webgl2.idl
+
+// AUTOGENERATED FILE -- DO NOT EDIT -- SEE Makefile
+//
+// WebGL IDL definitions scraped from the Khronos specification:
+// https://www.khronos.org/registry/webgl/specs/latest/
+
+// Copyright (c) 2018 The Khronos Group Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and/or associated documentation files (the
+// "Materials"), to deal in the Materials without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Materials, and to
+// permit persons to whom the Materials are furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Materials.
+//
+// THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+// CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+// TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+// MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.

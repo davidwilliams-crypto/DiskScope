@@ -1,0 +1,18 @@
+.superpowers/
+__pycache__/
+.tools/
+target/
+target-scanner/
+target-gui/
+dist/
+research/artifacts/
+research/*.json
+research/diskscope-ui-fixture/
+research/benchmark-fixture/
+research/benchmark/
+research/benchmark-*/
+
+# Local research captures and development coordination are not public source.
+research/
+docs/superpowers/
+docs/execution-decisions.md

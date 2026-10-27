@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-msvc]
+# Ship the C runtime inside the executable so portable and installed releases
+# do not require a separately installed Visual C++ Redistributable.
+rustflags = ["-C", "target-feature=+crt-static"]

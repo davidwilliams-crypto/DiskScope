@@ -1,0 +1,79 @@
+{
+  "package": "khronos_api-3.1.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/brendanzab/gl-rs/",
+  "crate_archive": "https://static.crates.io/crates/khronos_api/khronos_api-3.1.0.crate",
+  "crate_vcs_commit": "f150967b1c44ae888e6676f93f639ebc82771bdc",
+  "crate_path_in_vcs": "",
+  "files": [
+    {
+      "file": "LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_url": "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "NOTICE-CRATE.txt",
+      "sha256": "7eb15307bafc2e83b48490a5a4f1024f860d00c98b173fb5b8fa11e4e6692a31",
+      "source_url": "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/khronos_api/src/lib.rs",
+      "source_type": "complete leading copyright/license comment from cached source"
+    },
+    {
+      "file": "LICENSE-ANGLE",
+      "sha256": "bf4da21bd20bcfb5b60b7ecc67fa864a79be049e21d6178076887f178dd6c71a",
+      "source_url": "https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/LICENSE",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "NOTICE-REGISTRY.txt",
+      "sha256": "494b66e7b1516069c75145e20ee5647e46bb57aa427270decf5f069f7f532e11",
+      "source_type": "complete embedded copyright/license comments from exact cached registry files",
+      "source_files": [
+        {
+          "source_url": "https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/gl.xml",
+          "sha256": "7dae830ddacefd2af92aef2b438ff89f90fb5496f596dec8282b212eb4fc51e3"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/glx.xml",
+          "sha256": "338cee03c97e78aa167dd667407ab973f4bc656c58cf9002aa54fa78b2f9ff32"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/wgl.xml",
+          "sha256": "41e0a2182217b099b1628757956cb103cea9660e830f4d2f9fa07bf3a3679feb"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/egl.xml",
+          "sha256": "523fc17745545daca85c5b107b4a4c1a23dd3de39f70e499c77249e3dd6569ec"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/egl_angle_ext.xml",
+          "sha256": "98c60fa9fe46f50dd4e101c2262b4293adeeae48a18c39ad63dc085e639b6096"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/gl.xml",
+          "sha256": "baac3f2e27b4949773f4ee2e6ed8e43a2ae96a428b9d73ae9d1e9c0c404cae1f"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/gl_angle_ext.xml",
+          "sha256": "dcf1ca2ce9536bd2ea6cab6e93ce0a37821793a9ed12f280f005a3459e2905e8"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/google/angle/7403dd2cd3764fe96660fe09892e764e9ae1dbca/scripts/wgl.xml",
+          "sha256": "41e0a2182217b099b1628757956cb103cea9660e830f4d2f9fa07bf3a3679feb"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/b6b558e7042d67fc7543383bb0e13a075f21d8ab/api/egl.xml",
+          "sha256": "523fc17745545daca85c5b107b4a4c1a23dd3de39f70e499c77249e3dd6569ec"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/KhronosGroup/WebGL/c987f075bfdca44119175c41f547d849c08983a3/specs/latest/1.0/webgl.idl",
+          "sha256": "9bd8707845fb68ff349f95b320582160423ee4cdf47294cbd980933b3b25dae9"
+        },
+        {
+          "source_url": "https://raw.githubusercontent.com/KhronosGroup/WebGL/c987f075bfdca44119175c41f547d849c08983a3/specs/latest/2.0/webgl2.idl",
+          "sha256": "4e9ba68c298e76e85f312f86d474975da4ce656e35c2ad4a8c706437d50253a1"
+        }
+      ]
+    }
+  ]
+}

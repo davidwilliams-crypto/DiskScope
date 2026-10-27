@@ -1,0 +1,28 @@
+{
+  "package": "accesskit_windows-0.29.2",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/AccessKit/accesskit",
+  "crate_archive": "https://static.crates.io/crates/accesskit_windows/accesskit_windows-0.29.2.crate",
+  "crate_vcs_commit": "5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3",
+  "crate_path_in_vcs": "platforms/windows",
+  "files": [
+    {
+      "file": "LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "source_url": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE-MIT",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+      "source_url": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE-APACHE",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "LICENSE.chromium",
+      "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+      "source_url": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE.chromium",
+      "source_type": "upstream file, unmodified"
+    }
+  ]
+}
