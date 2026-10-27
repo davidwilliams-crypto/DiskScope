@@ -249,12 +249,14 @@ mod windows {
 
     /// Reads one fixed-size token information class into a `T`.
     ///
+    /// # Safety
+    ///
     /// `T` must be a plain `repr(C)` value for which every bit pattern is
     /// valid, and `class` must be a class whose output is exactly one `T`.
     /// The two callers pass `TOKEN_ELEVATION` for `TokenElevation` and
     /// `TOKEN_ELEVATION_TYPE` (an `i32`) for `TokenElevationType`.
     /// `what` names the value in error messages.
-    fn query_token<T: Copy>(
+    unsafe fn query_token<T: Copy>(
         token: &OwnedNativeHandle,
         class: TOKEN_INFORMATION_CLASS,
         mut value: T,
@@ -287,12 +289,16 @@ mod windows {
     }
 
     fn token_is_elevated(token: &OwnedNativeHandle) -> Result<bool, String> {
-        let elevation = query_token(
-            token,
-            TokenElevation,
-            TOKEN_ELEVATION { TokenIsElevated: 0 },
-            "process elevation",
-        )?;
+        // SAFETY: TOKEN_ELEVATION is a plain repr(C) struct holding one u32, and
+        // TokenElevation produces exactly one TOKEN_ELEVATION.
+        let elevation = unsafe {
+            query_token(
+                token,
+                TokenElevation,
+                TOKEN_ELEVATION { TokenIsElevated: 0 },
+                "process elevation",
+            )
+        }?;
         Ok(elevation.TokenIsElevated != 0)
     }
 
@@ -308,8 +314,10 @@ mod windows {
             // session needs no second query.
             return Ok(ElevationKind::Standard);
         }
+        // SAFETY: TOKEN_ELEVATION_TYPE is an i32 for which every bit pattern is
+        // valid, and TokenElevationType produces exactly one of them.
         let token_type: TOKEN_ELEVATION_TYPE =
-            query_token(&token, TokenElevationType, 0, "process elevation type")?;
+            unsafe { query_token(&token, TokenElevationType, 0, "process elevation type") }?;
         Ok(classify_elevation(elevated, token_type))
     }
 

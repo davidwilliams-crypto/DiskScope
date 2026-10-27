@@ -24,8 +24,10 @@ const ALWAYS_ADMIN_EXPLANATION: &str = concat!(
     "or Windows does not apply Admin Approval Mode to it ",
     "(for example the built-in Administrator account). ",
     "There is no standard window to switch to. ",
-    "History, preferences and the Recycle Bin are unavailable because elevated ",
-    "sessions never write the user profile. ",
+    "History and preferences are unavailable because elevated sessions never ",
+    "write the user profile. ",
+    "The Recycle Bin is unavailable in every administrator session because ",
+    "Windows resolves the path itself, which could redirect the action. ",
     "Permanent deletion stays available behind its own confirmation.",
 );
 
@@ -1615,6 +1617,7 @@ mod tests {
             "Admin Approval Mode",
             "no standard window",
             "never write the user profile",
+            "Recycle Bin is unavailable in every administrator session",
         ] {
             assert!(hover.contains(fragment), "{fragment}: {hover}");
         }

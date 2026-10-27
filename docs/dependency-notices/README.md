@@ -27,11 +27,21 @@ actual compiler release/commit to the notice collector and rejects a mismatch.
 
 To verify coverage without building or changing `dist`, capture the same Cargo
 metadata the release script uses and run the collector into the ignored
-`target` directory:
+`target` directory. `target` does not exist in a checkout that was never built,
+so create it first, and set the console to UTF-8 as `scripts/build.ps1` does:
+otherwise PowerShell decodes Cargo's UTF-8 output with the console code page and
+corrupts non-ASCII paths (for example a user profile with accented characters).
 
 ```powershell
-cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc |
-    Set-Content -Encoding utf8 target\cargo-metadata.json
+New-Item -ItemType Directory -Force target | Out-Null
+$previous = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc |
+        Set-Content -Encoding utf8 target\cargo-metadata.json
+} finally {
+    [Console]::OutputEncoding = $previous
+}
 python scripts/package-notices.py target\cargo-metadata.json target\notice-check
 ```
 

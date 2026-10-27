@@ -111,6 +111,8 @@ struct FallBack {
     from: PathBuf,
     /// The scan stopped early, so the folder may exist without having been read.
     incomplete: bool,
+    /// The path now names a file, so the folder was replaced rather than missed.
+    now_a_file: bool,
 }
 
 /// What a snapshot means for a pending restore.
@@ -146,7 +148,9 @@ fn folder_name(path: &Path) -> String {
 
 fn lost_folder_notice(lost: &FallBack, landed_in: Option<&Path>) -> String {
     let name = folder_name(&lost.from);
-    let why = if lost.incomplete {
+    let why = if lost.now_a_file {
+        "is no longer a folder"
+    } else if lost.incomplete {
         "was not found in these incomplete results"
     } else {
         "is no longer in the scan"
@@ -218,8 +222,9 @@ impl PendingRestore {
                 });
             }
             // The path now names a file, which cannot turn back into a folder
-            // during this scan: treat the folder as lost.
-            return self.fall_back(state);
+            // during this scan: treat the folder as lost, but say it was
+            // replaced rather than blaming incomplete results.
+            return self.fall_back(state, true);
         }
         if state.is_active() {
             return RestoreStep::Wait;
@@ -229,15 +234,16 @@ impl PendingRestore {
             // The neighbour is gone too; the folder itself is still wanted.
             return RestoreStep::Retarget;
         }
-        self.fall_back(state)
+        self.fall_back(state, false)
     }
 
     /// Moves to the parent folder, or lands on the scan root when the walk is
-    /// used up.
-    fn fall_back(&mut self, state: ScanState) -> RestoreStep {
+    /// used up. `now_a_file` is set when the path resolved to a file.
+    fn fall_back(&mut self, state: ScanState, now_a_file: bool) -> RestoreStep {
         let lost = self.fallen_back.get_or_insert_with(|| FallBack {
             from: self.folder.clone(),
-            incomplete: state != ScanState::Complete,
+            incomplete: state != ScanState::Complete && !now_a_file,
+            now_a_file,
         });
         match self.folder.parent() {
             Some(parent) if parent != self.scan_root && parent.starts_with(&self.scan_root) => {
@@ -955,7 +961,11 @@ mod tests {
             panic!("a file is a definite answer");
         };
         assert_eq!(landing.root, 0);
-        assert!(landing.notice.is_some());
+        // The folder was replaced, so the notice must not blame incomplete
+        // results even though the scan is still running.
+        let notice = landing.notice.expect("a lost folder is announced");
+        assert!(notice.contains("is no longer a folder"), "{notice}");
+        assert!(!notice.contains("incomplete"), "{notice}");
     }
 
     #[test]

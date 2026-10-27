@@ -78,6 +78,9 @@ const MAX_HEADER_LEN: usize =
 /// loading needs memory proportional to this constant, never to a file or node count.
 const VERIFY_CHUNK_BYTES: usize = 1024 * 1024;
 const _: () = assert!(VERIFY_CHUNK_BYTES >= MAX_HEADER_LEN);
+// Today the magic's version digits and SCHEMA are both 2. They are independent
+// in principle (a newer build may bump either), so nothing relies on this; the
+// assert only stops one from being changed without the other being looked at.
 const _: () = assert!(MAGIC_VERSION == SCHEMA);
 
 // FNV-1a, 64 bit. Part of the wire format: changing either constant orphans every saved file.
@@ -721,8 +724,8 @@ impl LoadReport {
         }
         if self.unexamined > 0 {
             parts.push(format!(
-                "{} older than the newest {MAX_EXAMINED_FILES} {} not examined; \
-                 Clear saved scan history removes {}.",
+                "{} older than the newest {MAX_EXAMINED_FILES} {} not examined yet; \
+                 each start looks at more, or Clear saved scan history removes {}.",
                 count(self.unexamined, "history file", "history files"),
                 if self.unexamined == 1 { "was" } else { "were" },
                 if self.unexamined == 1 { "it" } else { "them" },

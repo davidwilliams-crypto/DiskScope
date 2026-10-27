@@ -214,9 +214,10 @@ pub fn exit_code(timed_out: bool, state: ScanState) -> i32 {
         ScanState::Complete => EXIT_COMPLETE,
         ScanState::Failed => EXIT_FAILURE,
         ScanState::Partial | ScanState::Cancelled => EXIT_PARTIAL,
-        // The wait loop only returns these when it timed out, which is handled
-        // above. If one ever reached here the scan did not finish, and "success"
-        // would be the wrong thing to tell a script.
+        // The wait loop returns one of these only on a timeout (handled above)
+        // or, for `Idle`, when the controller published nothing at all. Either
+        // way the scan did not finish, and "success" would be the wrong thing to
+        // tell a script.
         ScanState::Idle
         | ScanState::Preparing
         | ScanState::Scanning
