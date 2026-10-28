@@ -38,21 +38,28 @@ impl Theme {
         let index = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
         Self::ALL[(index + 1) % Self::ALL.len()]
     }
+    pub fn on_accent(self) -> Color32 {
+        match self {
+            Self::Light => Color32::WHITE,
+            Self::Dark | Self::HighContrast => Color32::from_rgb(17, 23, 30),
+        }
+    }
+
     pub fn palette(self) -> Palette {
         let rgb = Color32::from_rgb;
         match self {
             Self::Dark => Palette {
-                page: rgb(19, 21, 23),
-                side: rgb(23, 26, 28),
-                surface: rgb(29, 32, 35),
-                raised: rgb(37, 42, 45),
-                line: rgb(55, 61, 64),
-                text: rgb(226, 234, 240),
-                muted: rgb(147, 165, 179),
-                faint: rgb(157, 170, 177),
-                accent: rgb(123, 215, 197),
-                wash: rgb(30, 57, 56),
-                selected: rgb(33, 60, 67),
+                page: rgb(17, 23, 30),
+                side: rgb(13, 18, 24),
+                surface: rgb(23, 30, 38),
+                raised: rgb(34, 43, 53),
+                line: rgb(63, 75, 87),
+                text: rgb(236, 239, 242),
+                muted: rgb(171, 184, 196),
+                faint: rgb(155, 170, 183),
+                accent: rgb(238, 168, 111),
+                wash: rgb(61, 43, 32),
+                selected: rgb(59, 48, 39),
             },
             Self::Light => Palette {
                 page: rgb(241, 238, 232),
@@ -63,9 +70,9 @@ impl Theme {
                 text: rgb(31, 48, 60),
                 muted: rgb(84, 106, 121),
                 faint: rgb(87, 103, 110),
-                accent: rgb(20, 113, 102),
-                wash: rgb(224, 242, 237),
-                selected: rgb(218, 237, 237),
+                accent: rgb(151, 67, 29),
+                wash: rgb(249, 232, 217),
+                selected: rgb(244, 223, 202),
             },
             Self::HighContrast => Palette {
                 page: rgb(0, 0, 0),
@@ -103,7 +110,7 @@ impl Theme {
         visuals.widgets.inactive.bg_fill = p.raised;
         visuals.widgets.inactive.weak_bg_fill = p.surface;
         visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.line);
-        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.muted);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
         visuals.widgets.hovered.bg_fill = p.raised;
         visuals.widgets.hovered.weak_bg_fill = p.raised;
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.accent);
@@ -115,19 +122,19 @@ impl Theme {
         let mut style = (*ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(10.0, 9.0);
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        style.spacing.interact_size.y = 26.0;
+        style.spacing.interact_size.y = 32.0;
         style
             .text_styles
-            .insert(TextStyle::Body, FontId::proportional(13.0));
+            .insert(TextStyle::Body, FontId::proportional(14.0));
         style
             .text_styles
-            .insert(TextStyle::Button, FontId::proportional(13.0));
+            .insert(TextStyle::Button, FontId::proportional(14.0));
         style
             .text_styles
-            .insert(TextStyle::Small, FontId::proportional(11.0));
+            .insert(TextStyle::Small, FontId::proportional(12.0));
         style
             .text_styles
-            .insert(TextStyle::Heading, FontId::proportional(20.0));
+            .insert(TextStyle::Heading, FontId::proportional(22.0));
         style
             .text_styles
             .insert(TextStyle::Monospace, FontId::monospace(11.0));
@@ -169,6 +176,7 @@ pub enum TextScale {
     Large,
     Largest,
 }
+
 impl TextScale {
     pub const ALL: [TextScale; 3] = [TextScale::Normal, TextScale::Large, TextScale::Largest];
     pub fn label(self) -> &'static str {
@@ -183,6 +191,44 @@ impl TextScale {
             Self::Normal => 1.0,
             Self::Large => 1.25,
             Self::Largest => 1.5,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn luminance(color: Color32) -> f32 {
+        let linear = |channel: u8| {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    #[test]
+    fn readable_text_and_primary_actions_in_every_theme() {
+        for theme in [Theme::Dark, Theme::Light, Theme::HighContrast] {
+            let p = theme.palette();
+            for (foreground, background) in [
+                (p.text, p.surface),
+                (p.muted, p.surface),
+                (p.faint, p.side),
+                (p.accent, p.wash),
+                (theme.on_accent(), p.accent),
+            ] {
+                let a = luminance(foreground);
+                let b = luminance(background);
+                assert!(
+                    (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5,
+                    "Insufficient text contrast in {theme:?}"
+                );
+            }
         }
     }
 }

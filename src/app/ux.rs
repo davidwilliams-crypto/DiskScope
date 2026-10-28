@@ -64,7 +64,7 @@ impl DiskScopeApp {
     }
     pub(super) fn sidebar(&mut self, ui: &mut egui::Ui, p: Palette) {
         egui::Panel::left("navigation")
-            .exact_size(180.0)
+            .exact_size(194.0)
             .resizable(false)
             .frame(egui::Frame::new().fill(p.side).inner_margin(18.0))
             .show_inside(ui, |ui| {
@@ -88,12 +88,12 @@ impl DiskScopeApp {
                     ui.label(RichText::new("DiskScope").size(21.0).strong());
                 });
                 ui.label(
-                    RichText::new("SPACE TO UNDERSTAND")
-                        .size(9.0)
+                    RichText::new("DISK USAGE ANALYZER")
+                        .size(10.0)
                         .color(p.faint),
                 );
                 ui.add_space(31.0);
-                overline(ui, "WORKSPACE", p);
+                overline(ui, "VIEWS", p);
                 for (mode, label) in [
                     (ViewMode::Overview, "Overview"),
                     (ViewMode::Explorer, "Explorer"),
@@ -109,8 +109,9 @@ impl DiskScopeApp {
                                 p.muted
                             }))
                             .fill(if selected { p.wash } else { p.side })
+                            .selected(selected)
                             .stroke(Stroke::NONE)
-                            .min_size(egui::vec2(144.0, 37.0)),
+                            .min_size(egui::vec2(158.0, 38.0)),
                         )
                         .clicked()
                     {
@@ -125,8 +126,9 @@ impl DiskScopeApp {
                             p.muted
                         }))
                         .fill(if self.changes { p.wash } else { p.side })
+                        .selected(self.changes)
                         .stroke(Stroke::NONE)
-                        .min_size(egui::vec2(144.0, 37.0)),
+                        .min_size(egui::vec2(158.0, 38.0)),
                     )
                     .clicked()
                 {
@@ -184,33 +186,47 @@ impl DiskScopeApp {
                     if ui.button("Keyboard help  F1").clicked() {
                         self.help_open = true;
                     }
-                    if ui.button("Appearance & settings").clicked() {
+                    if ui.button("Settings").clicked() {
                         self.settings_open = true;
                     }
                 });
             });
     }
-    pub(super) fn overview(&mut self, ui: &mut egui::Ui, p: Palette) {
-        if self.generation == 0 {
-            ui.add_space(38.0);
+    fn welcome(&mut self, ui: &mut egui::Ui, p: Palette) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(24.0);
             card(p).show(ui, |ui| {
-                ui.label(RichText::new("Make room for what matters.").size(30.0).strong());
-                ui.add_space(12.0);
-                ui.label(
-                    "Choose a folder above to discover its largest folders and file types. History stores metadata only; Changes shows its storage location.",
-                );
-                ui.add_space(12.0);
-                if ui.button("Choose a folder…").clicked() {
+                ui.set_width(ui.available_width());
+                overline(ui, "START A SCAN", p);
+                ui.add_space(8.0);
+                ui.label(RichText::new("See where your space goes.").size(30.0).strong());
+                ui.label(RichText::new("Choose a drive or folder. Find the largest items, explore the map, and compare scans over time.").color(p.muted));
+                ui.add_space(18.0);
+                if ui.add_enabled(!self.picker_open, egui::Button::new(
+                    RichText::new("Choose a folder…").strong().color(self.preferences.theme.on_accent())
+                ).fill(p.accent).min_size(egui::vec2(180.0, 42.0))).clicked() {
                     self.choose_folder(ui.ctx());
                 }
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(
-                        "Scans read metadata. Single-file actions require a separate confirmation.",
-                    )
-                    .color(p.muted),
-                );
+                ui.add_space(18.0);
+                ui.separator();
+                for (title, description) in [
+                    ("01  Scan", "Read file sizes and dates without opening file contents."),
+                    ("02  Explore", "Open folders in the map or jump to Largest files."),
+                    ("03  Compare", "Use Changes to compare saved scans of the same folder."),
+                ] {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(title).strong());
+                    ui.label(RichText::new(description).color(p.muted));
+                }
+                ui.add_space(14.0);
+                ui.label(RichText::new("Scanning does not delete files. File actions always require confirmation.").small().color(p.muted));
             });
+        });
+    }
+
+    pub(super) fn overview(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if self.generation == 0 {
+            self.welcome(ui, p);
             return;
         }
         if self.request.root != 0 {
@@ -252,7 +268,7 @@ impl DiskScopeApp {
                 if let Some(largest) = view.rows.first() {
                     card(p).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        overline(ui, "START HERE", p);
+                        overline(ui, "LARGEST ITEM", p);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new(format!(
@@ -643,8 +659,9 @@ impl FilterField {
 
 pub(super) fn card(p: Palette) -> egui::Frame {
     egui::Frame::new()
-        .fill(p.side)
-        .corner_radius(9)
+        .fill(p.page)
+        .stroke(Stroke::new(1.0_f32, p.line))
+        .corner_radius(6)
         .inner_margin(18.0)
 }
 pub(super) fn size_bar(ui: &mut egui::Ui, fraction: f32, color: Color32, p: Palette) {

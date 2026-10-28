@@ -628,22 +628,19 @@ impl DiskScopeApp {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(if self.changes {
-                    "What changed?"
+                    "Scan changes"
                 } else {
                     match self.request.mode {
-                        ViewMode::Overview => "Your storage, understood.",
-                        ViewMode::Explorer => "Explore your folders",
-                        ViewMode::Largest => "The biggest files",
-                        ViewMode::Types => "Space by file type",
+                        ViewMode::Overview => "Storage overview",
+                        ViewMode::Explorer => "Folder explorer",
+                        ViewMode::Largest => "Largest files",
+                        ViewMode::Types => "File types",
                     }
                 })
                 .size(27.0)
                 .strong(),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Settings").clicked() {
-                    self.settings_open = true;
-                }
                 if ui.button("Commands  Ctrl K").clicked() {
                     self.open_palette();
                 }
@@ -664,7 +661,7 @@ impl DiskScopeApp {
             let response = ui.add_sized(
                 [edit_width, 33.0],
                 egui::TextEdit::singleline(&mut self.path_text)
-                    .hint_text("Choose a folder to explore…"),
+                    .hint_text("Folder or drive path — or use Browse"),
             );
             if response.changed() {
                 self.path_edited = true;
@@ -685,11 +682,7 @@ impl DiskScopeApp {
                     egui::Button::new(
                         RichText::new(if active { "Rescan" } else { "Scan" })
                             .strong()
-                            .color(if self.preferences.theme != Theme::Light {
-                                Color32::from_rgb(21, 49, 45)
-                            } else {
-                                Color32::WHITE
-                            }),
+                            .color(self.preferences.theme.on_accent()),
                     )
                     .fill(p.accent)
                     .min_size(egui::vec2(63.0, 33.0)),
@@ -2005,6 +1998,37 @@ mod tests {
             .iter()
             .find_map(|shape| find(&shape.shape, expected))
             .unwrap_or_else(|| panic!("Missing rendered text: {expected}"))
+    }
+
+    #[test]
+    fn welcome_action_stays_visible_at_large_text_sizes() {
+        use eframe::App as _;
+        for scale in [TextScale::Normal, TextScale::Large, TextScale::Largest] {
+            let (mut app, ctx) = table_fixture();
+            app.generation = 0;
+            app.request.mode = ViewMode::Overview;
+            app.preferences.text_scale = scale;
+            app.apply_appearance(&ctx);
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.ui(ui, &mut eframe::Frame::_new_kittest());
+                    },
+                );
+            }
+            let action = text_center(&output.shapes, "Choose a folder…");
+            assert!(
+                screen.contains(action),
+                "Primary action outside window at {scale:?}"
+            );
+            assert!(action.y > text_center(&output.shapes, "See where your space goes.").y);
+        }
     }
 
     #[test]

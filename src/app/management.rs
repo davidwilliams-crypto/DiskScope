@@ -164,7 +164,7 @@ fn unavailable(access: &AccessMode, action: FileAction, e: &Eligibility) -> Opti
     } else if e.busy {
         Some("Wait for the current operation to finish, or cancel the confirmation.")
     } else if e.changes {
-        Some("File actions are available from the current scan, outside What changed?.")
+        Some("File actions are available from the current scan, outside Scan changes.")
     } else if !e.terminal_scan {
         Some("Wait for the scan to stop before changing files.")
     } else if e.current_generation == 0
