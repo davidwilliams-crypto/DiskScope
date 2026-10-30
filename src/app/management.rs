@@ -1902,10 +1902,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.starts_with("Deleted instead of recycled"))
         );
-        assert_eq!(
-            app.visible.view.selected.as_ref().unwrap().name,
-            "three.bin"
-        );
+        let selected = app.visible.view.selected.as_ref().unwrap_or_else(|| panic!(
+            "restoring rescan lost neighbour: state={:?}, message={:?}, root={:?}, request={:?}, restore={:?}, snapshot_view={:?}, visible_view={:?}",
+            app.snapshot.progress.state, app.snapshot.progress.message, app.root_path,
+            app.request, app.restore, app.snapshot.view, app.visible.view,
+        ));
+        assert_eq!(selected.name, "three.bin");
     }
 
     #[test]

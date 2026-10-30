@@ -500,10 +500,11 @@ impl DiskScopeApp {
             ),
         };
         request.limit = PAGE_SIZE;
-        // The worker keeps answering with its last request until the new one
-        // arrives. Revisions that never go backwards keep those leftover
-        // answers from matching the new scan's first request.
-        request.revision = self.request.revision;
+        // The coordinator can finish a small new scan using its previous
+        // request before submit_view sends this scan's focus path. Reserve a
+        // new revision now so that terminal, unfocused answer cannot settle a
+        // restore using node ids from the previous scan.
+        request.revision = self.request.revision.wrapping_add(1);
         request.focus_path = restore
             .as_ref()
             .map(|restore| restore.focus_path().to_path_buf());
@@ -3222,6 +3223,63 @@ mod tests {
     }
 
     #[test]
+    fn restoring_rescan_rejects_terminal_view_built_before_its_focus_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _ctx) = table_fixture();
+        let previous_request = app.request.clone();
+        let neighbour = directory.path().join("neighbour.bin");
+        let restore =
+            PendingRestore::new(directory.path(), directory.path(), Some(neighbour.clone()))
+                .unwrap();
+        app.start_scan(
+            directory.path().to_path_buf(),
+            Some(SavedBrowse {
+                request: previous_request.clone(),
+                restore: Some(restore),
+            }),
+        );
+        // A small scan can finish before the frame submits its new view. The
+        // coordinator still has the old request, whose node ids are invalid in
+        // this generation, and can publish a terminal answer for that request.
+        let mut model = Model::new(directory.path().to_path_buf());
+        model.insert_batch(
+            0,
+            vec![Entry {
+                name: "neighbour.bin".into(),
+                is_dir: false,
+                reparse: false,
+                logical: 1,
+                allocated: Some(1),
+                modified: None,
+                identity: None,
+            }],
+        );
+        let unfocused = diskscope::view::build_view(&model, &previous_request, app.generation);
+        assert!(unfocused.selected.is_none());
+        assert!(
+            !admits_snapshot(
+                app.generation,
+                app.request.revision,
+                unfocused.generation,
+                unfocused.revision
+            ),
+            "an unfocused previous request must not tell a terminal restore its neighbour is absent"
+        );
+        assert_eq!(app.restore.as_ref().unwrap().focus_path(), neighbour);
+        app.submit_view();
+        let focused = snapshot_for(&app, &model, ScanState::Complete);
+        assert!(admits_snapshot(
+            app.generation,
+            app.request.revision,
+            focused.view.generation,
+            focused.view.revision
+        ));
+        assert!(!app.settle_focus(&focused));
+        assert!(app.restore.is_none());
+        assert_eq!(app.request.selected, Some(1));
+    }
+
+    #[test]
     fn restore_keeps_asking_across_snapshots_until_the_folder_exists() {
         let mut app = restoring_app("/scan/a/b", None);
         // The scan has not reached `b`: snapshot after snapshot, nothing moves.
@@ -3298,12 +3356,20 @@ mod tests {
     fn a_new_scan_continues_the_request_revision_instead_of_restarting_it() {
         let (mut app, _ctx) = table_fixture();
         app.request.revision = 41;
+        let previous_revision = app.request.revision;
         app.begin_scan(PathBuf::from("/scan-that-does-not-exist"));
-        assert_eq!(app.request.revision, 41);
+        assert!(app.request.revision > previous_revision);
+        // A new-generation answer may still carry the coordinator's old view
+        // revision before the first submit. It must already be inadmissible.
+        assert!(!admits_snapshot(
+            app.generation,
+            app.request.revision,
+            app.generation,
+            previous_revision,
+        ));
+        let reserved_revision = app.request.revision;
         app.submit_view();
-        // The worker may still hold the old scan's request (revision 41 or
-        // lower); the first request of the new scan must outrank it.
-        assert_eq!(app.request.revision, 42);
+        assert!(app.request.revision > reserved_revision);
     }
 
     #[test]

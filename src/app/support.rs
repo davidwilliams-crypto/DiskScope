@@ -68,43 +68,63 @@ impl DiskScopeApp {
         }
         controls::remember_dialog_focus(ctx, "Export investigation evidence");
         let mut open = true;
-        egui::Window::new("Export investigation evidence").open(&mut open)
-            .default_width(520.0).vscroll(true).show(ctx, |ui| {
-                ui.heading("Incident context · session only");
+        let viewport = ctx.content_rect();
+        let max_width = (viewport.width() - 40.0).max(1.0);
+        egui::Window::new("Export investigation evidence")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(560.0_f32.min(max_width))
+            .max_width(max_width)
+            .max_height((viewport.height() - 80.0).max(1.0))
+            .constrain_to(viewport.shrink(8.0))
+            .vscroll(true)
+            .show(ctx, |ui| {
+                ui.strong("Incident context · session only");
                 let label = ui.label("Ticket / incident reference (optional)");
                 ui.add(egui::TextEdit::singleline(&mut self.incident_ticket).char_limit(512).desired_width(f32::INFINITY)).labelled_by(label.id);
                 let label = ui.label("Endpoint label for this ticket (optional)");
                 ui.add(egui::TextEdit::singleline(&mut self.endpoint_label).char_limit(512).desired_width(f32::INFINITY)).labelled_by(label.id);
-                ui.label("Native hostname and volume metadata are observed in the background. Full reports include available identifiers; redacted reports omit them and both labels. Verify the endpoint against your ticket; identifiers can change or be shared by clones.");
-                ui.label(format!("{} action requests retained in this session. Requests, cancellation and completed calls are distinct; export before closing. Oldest records and long displays are bounded with explicit truncation.",self.action_journal.len()));
-                if self.generation == 0 {ui.label("Enter incident context now; scan a folder before saving evidence.");}
-                ui.label("Save a bounded JSON summary for the correct incident ticket. It includes scan coverage, errors, visible rows and any current action review. It is not a full inventory or restorable comparison baseline.");
-                ui.label("Displayed rows reflect your current view, filters and page. Export from Largest files for a size-focused list. Existing files are never overwritten.");
-                ui.checkbox(&mut self.export_redacted, "Redact customer paths, error messages and action details");
-                if !self.export_redacted { ui.label("Full report contains customer filenames, paths and action details. Review it before sharing; use an approved ticket location."); }
-                ui.label("Redacted reports retain counts and measurements. Native identities are observations, not proof of an endpoint's ownership. Associate the report with the correct ticket.");
+                ui.checkbox(&mut self.export_redacted, "Redact paths, incident labels and action details");
+                ui.label(if self.export_redacted {
+                    "Paths, native identifiers, labels and error/action text are omitted."
+                } else {
+                    "Full report includes customer paths, identifiers and action details. Review before sharing."
+                });
                 let label = ui.label("Destination JSON file (new file only)");
                 if ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(f32::INFINITY)).labelled_by(label.id).changed() { self.export_native_path = None; }
-                if ui.add_enabled(!self.export_busy, egui::Button::new("Choose destination…")).clicked() {
-                    self.export_busy = true;
-                    let tx = self.native_tx.clone(); let context = ctx.clone();
-                    if let Err(error) = std::thread::Builder::new().name("evidence-destination".into()).spawn(move || {
-                        let path = rfd::FileDialog::new().set_file_name("DiskScope-evidence.json").add_filter("JSON report", &["json"]).save_file();
-                        let _ = tx.send(NativeResult::ExportDestination(path)); context.request_repaint();
-                    }) { self.export_busy = false; self.notice = Some(format!("Could not open destination picker: {error}")); }
-                }
-                if ui.add_enabled(self.generation > 0 && !self.export_busy && !self.export_path.trim().is_empty(), egui::Button::new("Save evidence")).clicked() {
-                    self.export_busy = true;
-                    let path = self.export_native_path.clone().unwrap_or_else(|| PathBuf::from(&self.export_path));
-                    let snapshot = self.evidence_snapshot(); let evidence_context = self.evidence_context();
-                    let tx = self.native_tx.clone(); let context = ctx.clone();
-                    if let Err(error) = std::thread::Builder::new().name("evidence-export".into()).spawn(move || {
-                        let report = evidence::build_report(&snapshot, &evidence_context);
-                        let result = evidence::write_report_new(&report, &path).map(|()| path).map_err(|e| e.to_string());
-                        let _ = tx.send(NativeResult::Export(result)); context.request_repaint();
-                    }) { self.export_busy = false; self.notice = Some(format!("Could not start evidence export: {error}")); }
-                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!self.export_busy, egui::Button::new("Choose destination…")).clicked() {
+                        self.export_busy = true;
+                        let tx = self.native_tx.clone(); let context = ctx.clone();
+                        if let Err(error) = std::thread::Builder::new().name("evidence-destination".into()).spawn(move || {
+                            let path = rfd::FileDialog::new().set_file_name("DiskScope-evidence.json").add_filter("JSON report", &["json"]).save_file();
+                            let _ = tx.send(NativeResult::ExportDestination(path)); context.request_repaint();
+                        }) { self.export_busy = false; self.notice = Some(format!("Could not open destination picker: {error}")); }
+                    }
+                    if ui.add_enabled(self.generation > 0 && !self.export_busy && !self.export_path.trim().is_empty(), egui::Button::new("Save evidence")).clicked() {
+                        self.export_busy = true;
+                        let path = self.export_native_path.clone().unwrap_or_else(|| PathBuf::from(&self.export_path));
+                        let snapshot = self.evidence_snapshot(); let evidence_context = self.evidence_context();
+                        let tx = self.native_tx.clone(); let context = ctx.clone();
+                        if let Err(error) = std::thread::Builder::new().name("evidence-export".into()).spawn(move || {
+                            let report = evidence::build_report(&snapshot, &evidence_context);
+                            let result = evidence::write_report_new(&report, &path).map(|()| path).map_err(|e| e.to_string());
+                            let _ = tx.send(NativeResult::Export(result)); context.request_repaint();
+                        }) { self.export_busy = false; self.notice = Some(format!("Could not start evidence export: {error}")); }
+                    }
+                });
                 if self.export_busy { ui.label("Working in background…"); }
+                if self.generation == 0 { ui.label("Scan a folder before saving evidence."); }
+                ui.small(format!("{} action requests retained · bounded visible rows · new files only", self.action_journal.len()));
+                ui.collapsing("Report contents & limits", |ui| {
+                    ui.label("Save a bounded JSON summary for the correct incident ticket, using an approved ticket location. Existing files are never overwritten.");
+                    ui.label("It includes scan coverage, errors, visible rows and any current action review. It is not a full inventory or restorable comparison baseline.");
+                    ui.label("Displayed rows reflect your current view, filters and page. Export from Largest files for a size-focused list.");
+                    ui.label("Native hostname and volume metadata are observed in the background. Full reports include available identifiers; redacted reports omit them and both labels. Verify the endpoint against your ticket; identifiers can change or be shared by clones.");
+                    ui.label("Requests, cancellation and completed calls are distinct. Export before closing to retain the session journal. Oldest records and long displays are bounded with explicit truncation.");
+                    ui.label("Redacted reports retain counts and measurements. Native identities are observations, not proof of an endpoint's ownership. Associate the report with the correct ticket.");
+                    ui.label("Full reports contain customer filenames, paths, identifiers and action details. Review before sharing. Incident labels remain in this session only; explicit exports retain the selected report content.");
+                });
             });
         self.export_open = open;
         if !open {
@@ -117,6 +137,132 @@ impl DiskScopeApp {
 mod tests {
     use super::*;
     use eframe::App;
+
+    fn painted_text_rect(output: &egui::FullOutput, expected: &str, viewport: Rect) -> Rect {
+        fn find(shape: &egui::epaint::Shape, expected: &str) -> Option<Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == expected => {
+                    Some(text.visual_bounding_rect())
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, expected))
+                }
+                _ => None,
+            }
+        }
+        let (rect, clip) = output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, expected).map(|rect| (rect, shape.clip_rect)))
+            .unwrap_or_else(|| panic!("Missing painted control text: {expected}"));
+        assert!(
+            viewport.contains_rect(rect),
+            "{expected} outside viewport: {rect:?}"
+        );
+        assert!(
+            clip.contains_rect(rect),
+            "{expected} clipped: {rect:?} vs {clip:?}"
+        );
+        rect
+    }
+
+    #[test]
+    fn export_primary_fields_and_save_are_visible_without_scrolling_at_compact_text_scales() {
+        for scale in [TextScale::Normal, TextScale::Largest] {
+            for redacted in [true, false] {
+                let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+                let mut app = DiskScopeApp::new_session(
+                    &cc,
+                    None,
+                    AccessMode::Standard,
+                    SessionPolicy {
+                        helpdesk: true,
+                        no_history: true,
+                    },
+                );
+                app.preferences.text_scale = scale;
+                app.apply_appearance(&cc.egui_ctx);
+                app.export_open = true;
+                app.generation = 1;
+                app.export_redacted = redacted;
+                app.incident_ticket = "ticket-field-value".into();
+                app.endpoint_label = "endpoint-field-value".into();
+                app.export_path = "C:\\new-evidence.json".into();
+                let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 640.0));
+                let mut output = egui::FullOutput::default();
+                for _ in 0..3 {
+                    output = cc.egui_ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            ..Default::default()
+                        },
+                        |ui| app.export_window(ui.ctx()),
+                    );
+                }
+                for text in [
+                    "Ticket / incident reference (optional)",
+                    "ticket-field-value",
+                    "Endpoint label for this ticket (optional)",
+                    "endpoint-field-value",
+                    "Redact paths, incident labels and action details",
+                    "Destination JSON file (new file only)",
+                    "C:\\new-evidence.json",
+                    "Choose destination…",
+                    "Save evidence",
+                ] {
+                    painted_text_rect(&output, text, viewport);
+                }
+                painted_text_rect(
+                    &output,
+                    if redacted {
+                        "Paths, native identifiers, labels and error/action text are omitted."
+                    } else {
+                        "Full report includes customer paths, identifiers and action details. Review before sharing."
+                    },
+                    viewport,
+                );
+                let texts = test_support::rendered_texts(&output.shapes).join(" ");
+                assert!(texts.contains("Report contents & limits"));
+                assert!(!texts.contains("not a full inventory or restorable comparison baseline"));
+            }
+        }
+    }
+
+    #[test]
+    fn escape_closes_export_and_restores_the_incident_control_focus() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = DiskScopeApp::new_session(
+            &cc,
+            None,
+            AccessMode::Standard,
+            SessionPolicy {
+                helpdesk: true,
+                no_history: true,
+            },
+        );
+        let invoker = egui::Id::new("incident-control");
+        controls::set_dialog_invoker(&cc.egui_ctx, "Export investigation evidence", invoker);
+        app.export_open = true;
+        test_support::settle_frames(&cc.egui_ctx, |ui| app.export_window(ui.ctx()));
+        let _ = cc.egui_ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                app.keyboard(ui.ctx());
+                app.export_window(ui.ctx());
+            },
+        );
+        assert!(!app.export_open);
+        assert_eq!(cc.egui_ctx.memory(|m| m.focused()), Some(invoker));
+    }
     #[test]
     fn newest_attribution_request_is_retried_when_the_worker_queue_is_full() {
         let cc = eframe::CreationContext::_new_kittest(egui::Context::default());

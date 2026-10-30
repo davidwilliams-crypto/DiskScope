@@ -91,9 +91,50 @@ Production test preflight refuses existing installations, shortcuts, unsafe
 paths and unregistered default directories. Cases cover custom/default paths,
 shortcut choice, installed/portable payload parity, known-answer CLI scan,
 reinstall, move/locked-file refusal, uninstall and preservation of unrelated
-files/profile data. The workflow cannot supersede a developer's installed
-0.3.2 because it never executes locally. A green workflow supplies hosted
-Server evidence only. Actual client builds, upgrade/downgrade, ScreenConnect,
-UAC, Narrator, hardware, fleet EDR and approved publisher signing still need
-their manual evidence and named review. Do not relabel a green CI status as
-full installer/fleet qualification.
+files/profile data. Those fresh lifecycle cases exclude upgrade/downgrade.
+
+The separate hosted binary stage invokes:
+
+```powershell
+./scripts/test-installer-upgrade.ps1 `
+    -Installer 'target/hosted-qualification/packages/DiskScope-0.3.3-windows-x64-setup.exe' `
+    -PortableArchive 'target/hosted-qualification/packages/DiskScope-0.3.3-windows-x64-portable.zip' `
+    -OutputDirectory 'target/hosted-qualification/binary-upgrade-rollback'
+```
+
+This invocation is for the guarded hosted workflow only. It downloads published
+0.3.2 from this repository's official HTTPS release assets and requires installer
+SHA-256 `807263cd323d6f154d4122723e7fe87e4999098246ca7b68fbfcf93cc4a03704`
+and portable ZIP SHA-256
+`f15b5553d781e9f90d9764bb55490733c43d09d8b69504a67367c6ca53ea6874`
+before any baseline execution. It installs that baseline into a new fixture,
+upgrades to the exact built candidate, rolls binaries back to 0.3.2, then
+uninstalls. Each installed stage must match its complete required portable
+payload, contain no stale/unexpected files beyond the declared canary and
+installer files, and produce the expected CLI version and known-answer result.
+Opaque install-directory and profile canaries must survive each transition and
+uninstall. JSON records exact hashes, stage results, UTC times and failures.
+This measures binary transitions and file preservation; the opaque profile
+canary does not establish runtime history/snapshot-format compatibility.
+
+The script independently requires the intended GitHub-hosted Windows repository,
+event and run context, then refuses existing installation registrations in all
+user/machine registry views, shortcuts, default/profile directories and running
+DiskScope processes. Cleanup uses only a byte-verified uninstaller belonging to
+the exact fixture registration, plus the unchanged owned profile canary and its
+proven-empty, initially absent parent. It retains its bounded workspace fixture.
+`test-installer-upgrade-preflight.ps1` passed 18 pure/synthetic checks on both
+PowerShell 7 and Windows PowerShell 5.1: missing hosted context, self-hosted
+execution, existing registration/path/process, and missing/unrelated/relative
+uninstaller ownership are refused; positive assertion paths also run. These
+checks never execute an installer or write registry/profile data, and they
+supply no evidence that actual upgrade/rollback passed. The workflow requires
+them on both hosts before its native hosted stage.
+
+The workflow cannot supersede a developer's installed 0.3.2 because native
+installer qualification never executes locally. A green workflow supplies its
+recorded hosted Server evidence only; the added binary stage remains unqualified
+until it actually passes there. Runtime data-format compatibility, actual client
+builds, ScreenConnect, UAC, Narrator, hardware, fleet EDR and approved publisher
+signing still need their evidence and named review. Do not relabel a green CI
+status as full installer/fleet qualification.

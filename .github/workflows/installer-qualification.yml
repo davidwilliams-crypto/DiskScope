@@ -95,6 +95,9 @@ jobs:
           ./scripts/test-qualification.ps1
           powershell.exe -NoProfile -File ./scripts/test-qualification.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-installer-upgrade-preflight.ps1
+          powershell.exe -NoProfile -File ./scripts/test-installer-upgrade-preflight.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $exe = Join-Path $PWD 'target/hosted-qualification/payload/DiskScope.exe'
           ./scripts/test-helpdesk-tooling.ps1 -RequireJunction -Executable $exe
           powershell.exe -NoProfile -File ./scripts/test-helpdesk-tooling.ps1 -RequireJunction -Executable $exe
@@ -147,10 +150,24 @@ jobs:
                 candidate_sha256 = (Get-FileHash target/hosted-qualification/payload/DiskScope.exe).Hash.ToLowerInvariant()
                 installer_sha256 = (Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant()
                 portable_sha256 = (Get-FileHash -LiteralPath $archive).Hash.ToLowerInvariant()
-                scope = 'Hosted Windows Server: install, exact payload parity, scan, reinstall, move/locked-file refusal, uninstall, unrelated files and profile-data preservation. Upgrade/downgrade and manual client/fleet gates remain pending.'
+                scope = 'Hosted Windows Server fresh lifecycle case: install, exact payload parity, scan, reinstall, move/locked-file refusal, uninstall, unrelated files and profile-data preservation. This case excludes upgrade/downgrade; the separate binary-upgrade-rollback stage measures binary/file preservation. History-format compatibility and manual client/fleet gates remain pending.'
               } | ConvertTo-Json | Set-Content (Join-Path $packages ($case.id + '.json')) -Encoding utf8
             }
           }
+      - name: Published baseline binary upgrade and rollback on clean hosted account
+        run: |
+          . ./scripts/release-tools.ps1
+          $version = Get-ReleaseVersion -ProjectRoot $PWD
+          $packages = Join-Path $PWD 'target/hosted-qualification/packages'
+          $installer = Join-Path $packages "DiskScope-$version-windows-x64-setup.exe"
+          $archive = Join-Path $packages "DiskScope-$version-windows-x64-portable.zip"
+          # Script independently guards hosted environment, all registration
+          # views, shortcuts, default/profile paths and running app before writes.
+          # It verifies fixed published 0.3.2 digests before executing baseline.
+          # Opaque canaries establish file preservation, never history-format
+          # compatibility or a fleet/client-OS qualification claim.
+          ./scripts/test-installer-upgrade.ps1 -Installer $installer -PortableArchive $archive -OutputDirectory target/hosted-qualification/binary-upgrade-rollback *>&1 |
+            Tee-Object -FilePath target/hosted-qualification/binary-upgrade-rollback.log
       - name: Retain candidate hashes, raw evidence and lifecycle logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

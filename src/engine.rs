@@ -1081,6 +1081,38 @@ fn coordinate(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn native_memory_observation_enforces_an_explicit_low_process_budget_without_allocating_pressure()
+     {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new();
+        let generation = controller.start_with_resources(
+            fixture.path().to_path_buf(),
+            BackendChoice::Normal,
+            ScanLimits::default(),
+            crate::resources::MemoryBudget {
+                max_private_bytes: 1,
+                min_system_available_bytes: 0,
+                process_reserve_bytes: 0,
+            },
+        );
+        let snapshot = wait_snapshot(&controller, |s| {
+            s.progress.generation == generation && s.progress.state == ScanState::Partial
+        });
+        assert_eq!(snapshot.progress.files, 0);
+        assert_eq!(snapshot.progress.unique_allocated, None);
+        let observation = controller.resource_observation().unwrap();
+        assert!(observation.measured.unwrap().private_bytes > 1);
+        assert!(
+            controller
+                .resource_refusal_reason()
+                .unwrap()
+                .contains("process private bytes")
+        );
+        // This tests the real native sampler/guard wiring, not low-memory fleet
+        // behavior. No memory pressure or system settings are changed.
+    }
     fn healthy_memory() -> Result<crate::resources::MemoryObservation, crate::resources::ProbeError>
     {
         Ok(crate::resources::MemoryObservation {
