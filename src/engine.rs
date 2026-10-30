@@ -291,6 +291,13 @@ fn worker(tasks: Receiver<Task>, events: Sender<Event>, signals: Arc<Signals>) {
     }
 }
 
+#[derive(Default)]
+struct DirectoryCompletion {
+    listing_done: bool,
+    pending_children: usize,
+    failed: bool,
+}
+
 struct Scan {
     generation: u64,
     model: Arc<Model>,
@@ -304,9 +311,10 @@ struct Scan {
     current_path: PathBuf,
     backend: String,
     root_failed: bool,
-    /// Directories whose enumeration reported any error; their allocation
-    /// stays unknown even after their worker finishes.
-    failed_dirs: std::collections::HashSet<NodeId>,
+    /// Only unfinished directory subtrees, including failed ones. Successful
+    /// settlement removes a directory and updates its parent once, so progress
+    /// queries need no tree walk and completion work is linear overall.
+    incomplete_dirs: std::collections::HashMap<NodeId, DirectoryCompletion>,
     kind: TaskKind,
     fallback_reason: Option<String>,
     raw_progress: Option<crate::ntfs::NtfsProgress>,
@@ -365,7 +373,7 @@ impl Scan {
             }
             .into(),
             root_failed: false,
-            failed_dirs: std::collections::HashSet::new(),
+            incomplete_dirs: [(0, DirectoryCompletion::default())].into(),
             kind,
             fallback_reason,
             raw_progress: None,
@@ -383,7 +391,7 @@ impl Scan {
         self.state = ScanState::Preparing;
         self.elapsed = None;
         self.root_failed = false;
-        self.failed_dirs.clear();
+        self.incomplete_dirs = [(0, DirectoryCompletion::default())].into();
         self.kind = TaskKind::Directory;
         self.backend = "Normal fallback (NTFS reader unavailable)".into();
         self.fallback_reason = Some(format!(
@@ -401,16 +409,25 @@ impl Scan {
             let node = &mut model.nodes[id as usize];
             if node.is_dir {
                 // Reparse directories are never enumerated, so nothing inside
-                // them is pending; ordinary directories wait for their Done.
+                // them is pending; ordinary directories wait for their listing
+                // and every child subtree to finish successfully.
                 node.allocation_complete = node.reparse;
                 if node.reparse {
                     model.skipped = model.skipped.saturating_add(1);
+                } else {
+                    self.incomplete_dirs
+                        .insert(id, DirectoryCompletion::default());
+                    if let Some(completion) = self.incomplete_dirs.get_mut(&parent) {
+                        completion.pending_children += 1;
+                    }
                 }
             }
         }
     }
     fn directory_failed(&mut self, parent: NodeId) {
-        self.failed_dirs.insert(parent);
+        if let Some(completion) = self.incomplete_dirs.get_mut(&parent) {
+            completion.failed = true;
+        }
         if let Some(node) = model_mut(&mut self.model).nodes.get_mut(parent as usize) {
             node.allocation_complete = false;
         }
@@ -430,11 +447,30 @@ impl Scan {
         model.skipped = model.skipped.saturating_add(1);
     }
     fn directory_done(&mut self, parent: NodeId) {
-        if self.failed_dirs.contains(&parent) {
+        let Some(completion) = self.incomplete_dirs.get_mut(&parent) else {
             return;
-        }
-        if let Some(node) = model_mut(&mut self.model).nodes.get_mut(parent as usize) {
+        };
+        completion.listing_done = true;
+        let model = model_mut(&mut self.model);
+        let mut current = parent;
+        while self
+            .incomplete_dirs
+            .get(&current)
+            .is_some_and(|completion| {
+                completion.listing_done && completion.pending_children == 0 && !completion.failed
+            })
+        {
+            self.incomplete_dirs.remove(&current);
+            let node = &mut model.nodes[current as usize];
             node.allocation_complete = true;
+            let Some(parent) = node.parent else {
+                break;
+            };
+            let Some(completion) = self.incomplete_dirs.get_mut(&parent) else {
+                break;
+            };
+            completion.pending_children -= 1;
+            current = parent;
         }
     }
     /// Settles `allocation_complete` for every directory. A directory is
@@ -684,6 +720,7 @@ fn coordinate(
                         active.outstanding = active.outstanding.saturating_sub(1);
                         active.directory_done(parent);
                         active.current_path = active.model.path(parent);
+                        dirty = true;
                     }
                     _ => {}
                 }
@@ -1050,6 +1087,130 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn active_allocation_waits_for_child_subtree_after_root_listing_done() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let root = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                root.parent,
+                vec![
+                    fixture_entry("known.dat", false, 17),
+                    fixture_entry("pending", true, 0),
+                ],
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, root.parent)).unwrap();
+        let child = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        controller.request_view(ViewRequest {
+            revision: 401,
+            selected: Some(0),
+            ..Default::default()
+        });
+        let active = wait_snapshot(&controller, |s| s.view.revision == 401);
+        assert!(active.progress.state.is_active());
+        assert_eq!(active.progress.logical, 17);
+        assert_eq!(active.progress.unique_allocated, None);
+        assert_eq!(active.view.unique_allocated, None);
+        assert_eq!(active.view.selected.as_ref().unwrap().allocated, None);
+
+        events
+            .send(Event::Entries(
+                generation,
+                child.parent,
+                vec![fixture_entry("child.dat", false, 23)],
+            ))
+            .unwrap();
+        events.send(Event::Done(generation, child.parent)).unwrap();
+        let complete = wait_snapshot(&controller, |s| s.progress.state == ScanState::Complete);
+        assert_eq!(complete.progress.unique_allocated, Some(40));
+        assert_eq!(complete.view.unique_allocated, Some(40));
+        assert_eq!(complete.view.selected.as_ref().unwrap().allocated, Some(40));
+    }
+
+    #[test]
+    fn subtree_allocation_matches_pure_queries_through_completion_error_and_cancel() {
+        fn assert_queries(scan: &Scan, expected: Option<u64>, branch: Option<u64>) {
+            for mode in [
+                ViewMode::Overview,
+                ViewMode::Explorer,
+                ViewMode::Largest,
+                ViewMode::Types,
+            ] {
+                let request = ViewRequest {
+                    mode,
+                    selected: Some(2),
+                    ..Default::default()
+                };
+                let cached = scan.snapshot(&request);
+                let pure = crate::view::build_view(&scan.model, &request, scan.generation);
+                assert_eq!(cached.progress.unique_allocated, expected);
+                assert_eq!(cached.view.unique_allocated, expected);
+                assert_eq!(cached.view.selected.as_ref().unwrap().allocated, branch);
+                assert_eq!(format!("{:?}", cached.view), format!("{pure:?}"));
+            }
+            let sibling = scan.snapshot(&ViewRequest {
+                root: 3,
+                selected: Some(3),
+                ..Default::default()
+            });
+            assert_eq!(sibling.view.unique_allocated, Some(7));
+            assert_eq!(sibling.view.selected.as_ref().unwrap().allocated, Some(7));
+        }
+
+        for terminal in [
+            ScanState::Complete,
+            ScanState::Partial,
+            ScanState::Cancelled,
+        ] {
+            let mut scan = Scan::new(Start {
+                generation: 1,
+                root: "fixture".into(),
+                backend: BackendChoice::Normal,
+            });
+            scan.insert_entries(
+                0,
+                vec![
+                    fixture_entry("root.dat", false, 17),
+                    fixture_entry("branch", true, 0),
+                    fixture_entry("sibling", true, 0),
+                ],
+            );
+            scan.insert_entries(2, vec![fixture_entry("grandchild", true, 0)]);
+            scan.insert_entries(3, vec![fixture_entry("sibling.dat", false, 7)]);
+            scan.directory_done(0);
+            scan.directory_done(2);
+            scan.directory_done(3);
+            assert_queries(&scan, None, None);
+
+            scan.insert_entries(4, vec![fixture_entry("nested.dat", false, 23)]);
+            assert_queries(&scan, None, None);
+            match terminal {
+                ScanState::Complete => {
+                    scan.directory_done(4);
+                    // Settlement propagates through already finished listings
+                    // before terminal finalization is called.
+                    assert_queries(&scan, Some(47), Some(23));
+                }
+                ScanState::Partial => {
+                    scan.record_error(4, scan.model.path(4), "injected child failure".into());
+                    scan.directory_done(4);
+                    assert_queries(&scan, None, None);
+                }
+                ScanState::Cancelled => {}
+                _ => unreachable!(),
+            }
+            scan.finish(terminal);
+            assert_queries(
+                &scan,
+                (terminal == ScanState::Complete).then_some(47),
+                (terminal == ScanState::Complete).then_some(23),
+            );
+        }
+    }
+
     #[test]
     fn one_failed_directory_leaves_siblings_allocation_known_and_ancestors_unknown() {
         let (mut controller, tasks, events) = controlled_io();

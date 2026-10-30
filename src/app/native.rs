@@ -83,6 +83,42 @@ pub(super) struct VolumeSpace {
     pub total: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct Location {
+    pub path: PathBuf,
+    pub space: Option<VolumeSpace>,
+}
+
+pub(super) fn discover_locations(results: SyncSender<NativeResult>) {
+    let _ = std::thread::Builder::new()
+        .name("local-locations".into())
+        .spawn(move || {
+            let mut locations = Vec::new();
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+                // SAFETY: no input pointers; returned bitmask names mounted drives.
+                let drives = unsafe { GetLogicalDrives() };
+                for letter in b'A'..=b'Z' {
+                    if drives & (1 << (letter - b'A')) == 0 {
+                        continue;
+                    }
+                    let path = PathBuf::from(format!("{}:\\", char::from(letter)));
+                    let wide = [u16::from(letter), 58, 92, 0];
+                    // SAFETY: native NUL-terminated path. Avoid probing network drives.
+                    let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+                    if kind == 2 || kind == 3 {
+                        locations.push(Location {
+                            space: read_volume(&path),
+                            path,
+                        });
+                    }
+                }
+            }
+            let _ = results.send(NativeResult::Locations(locations));
+        });
+}
+
 pub(super) fn volume_worker(results: SyncSender<NativeResult>) -> SyncSender<(u64, PathBuf)> {
     let (sender, receiver) = mpsc::sync_channel::<(u64, PathBuf)>(1);
     std::thread::Builder::new()
@@ -97,6 +133,7 @@ pub(super) fn volume_worker(results: SyncSender<NativeResult>) -> SyncSender<(u6
                         generation,
                         path,
                         volume,
+                        measured_at: std::time::SystemTime::now(),
                     })
                     .is_err()
                 {

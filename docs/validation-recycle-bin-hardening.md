@@ -2,6 +2,8 @@
 
 Date: 27 October 2026. Follows the [27 October 2026 360 review](review-360-2026-10-27.md), open item 1.
 
+**30 October update:** All 11 automated native file-action fixtures now pass on Windows, including real recycling, owned prompts and Shell veto preservation. See [current validation](validation-investigation-ux-2026-10-30.md). The historical evidence below is retained; the hardware/policy matrix remains pending and must not be treated as fully qualified.
+
 ## The problem
 
 "Move to Recycle Bin" asks the Windows Shell to recycle one file. When the Shell cannot recycle a file it **deletes it**. No documented `IFileOperation` flag turns that into a failure; `FOF_WANTNUKEWARNING` only makes the Shell warn. The cases are a drive with no Recycle Bin (USB flash drives and memory cards), a file larger than the Bin's maximum size, a volume set to "Remove files immediately", and the `NoRecycleFiles` policy. In 0.3.0 the sink noticed the destruction only after the file was gone, reported a generic error and did not rescan. The user had confirmed only the simple Recycle dialog, not the checkbox and typed `DELETE` that permanent deletion requires.

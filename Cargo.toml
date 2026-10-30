@@ -2,8 +2,8 @@
 name = "diskscope"
 version = "0.3.0"
 edition = "2024"
-# Edition 2024, let-chains and File::try_lock.
-rust-version = "1.89"
+# Locked Windows GUI dependency floor (eframe/egui 0.34.3).
+rust-version = "1.92"
 description = "A responsive native Windows disk usage analyzer"
 
 [features]

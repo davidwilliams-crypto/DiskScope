@@ -11,6 +11,9 @@ Setup installs for the current Windows account, offers Start menu and desktop sh
 Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.0/DiskScope.exe`.
 
 - Overview with factual folder/type insights and real volume capacity when available.
+- Connected investigation workspace with explicit scanned location, coverage, draft-path distinction, compact navigation and a keyboard-operable file list at larger text sizes.
+- Session action outcomes separate verified path absence, logical scan change and observed available-space change. Recycling does not imply reclaimed space; incomplete or incompatible measurements remain unknown.
+- History grouped by location with compatible before/after choices, readable root identity and baseline eligibility.
 - After a Recycle Bin or permanent-delete action DiskScope rescans and returns you to the folder you were in, keeping the workspace, sort, filters and search; if that folder no longer exists it opens the closest remaining parent and says so.
 - Connected Explorer, Largest and Types with explicit type/size/date filters and removable chips.
 - Treemap and experimental icicle navigation, shared selection and folder breakdowns.
@@ -35,7 +38,7 @@ The optional **NTFS preview** attempts a read-only raw metadata scan for exact l
 
 ## Build
 
-Windows x64, Rust stable with the MSVC target, Visual Studio C++ Build Tools and a Windows SDK are required. Dependencies are locked in `Cargo.lock`.
+Windows x64, Rust 1.92 or later with the MSVC target, Visual Studio C++ Build Tools and a Windows SDK are required. Dependencies are locked in `Cargo.lock`; the Windows default dependency graph requires Rust 1.92 (eframe/egui 0.34.3). CI builds that graph using Rust 1.92.0.
 
 ```powershell
 cargo test --locked
@@ -50,7 +53,7 @@ The optional `scripts/dev.ps1` helper uses the project-local toolchain under the
 .\scripts\dev.ps1 -CargoArgs @('build','--release','--locked')
 ```
 
-`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.0`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.99.1). Ordinary `cargo build` only needs Rust 1.89 or later. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
+`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.0`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
 
 `scripts/package-release.ps1 -Offline` builds the application, installer, and portable ZIP; NSIS 3.12 is additionally required. Use `-SkipBuild` only to package an already built, checksum-verified portable directory. The Windows x64 target uses static CRT linking through `.cargo/config.toml`.
 
@@ -65,6 +68,6 @@ The executable uses the Windows GUI subsystem; use `Start-Process -Wait` when au
 
 ## Evidence and limits
 
-See the [27 October 2026 360 review](docs/review-360-2026-10-27.md), [Recycle Bin hardening](docs/validation-recycle-bin-hardening.md) (type-checked and unit-tested on Linux only; its Windows validation matrix has not been run), [360-review fixes and validation](docs/validation-360-fixes.md), [0.3.0 validation](docs/validation-0.3.0.md), [RAM analysis](docs/memory-2026-10-26.md), [0.2.1 validation](docs/validation-0.2.1.md), the [C-drive investigation](docs/performance-c-drive-2026-10-26.md), [0.2 UI validation](docs/validation-0.2.md) and the [earlier 0.1 measurements](docs/validation.md) for commands and coverage. Native keyboard/UI Automation/renderer checks do not establish a full Narrator qualification or measured novice/expert usability improvement. Timing a small cached folder or a UI callback does not establish full-drive scan speed or end-to-end input latency. No general claim that DiskScope is faster than WinDirStat is made.
+See [reliability and investigation UX validation](docs/validation-investigation-ux-2026-10-30.md), the [27 October 2026 360 review](docs/review-360-2026-10-27.md), [Recycle Bin hardening](docs/validation-recycle-bin-hardening.md) (automated Windows fixtures now pass; the manual hardware/policy matrix remains pending), [360-review fixes and validation](docs/validation-360-fixes.md), [0.3.0 validation](docs/validation-0.3.0.md), [RAM analysis](docs/memory-2026-10-26.md), [0.2.1 validation](docs/validation-0.2.1.md), the [C-drive investigation](docs/performance-c-drive-2026-10-26.md), [0.2 UI validation](docs/validation-0.2.md) and the [earlier 0.1 measurements](docs/validation.md) for commands and coverage. Native keyboard/UI Automation/renderer checks do not establish a full Narrator qualification or measured novice/expert usability improvement. Timing a small cached folder or a UI callback does not establish full-drive scan speed or end-to-end input latency. No general claim that DiskScope is faster than WinDirStat is made.
 
 The application uses original Rust source and interface assets. Local research captures, raw scan reports, toolchains, and build outputs are excluded from this repository. Third-party dependency notices accompany the packages. A distribution license for this project's own source has not been selected.

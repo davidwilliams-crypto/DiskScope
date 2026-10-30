@@ -632,6 +632,10 @@ impl DiskScopeApp {
                     self.management.operation = None;
                     self.management.running_since = None;
                     let effects = completion_effects(&binding.path, &result);
+                    let before_logical = (self.snapshot.progress.state == ScanState::Complete)
+                        .then_some(self.snapshot.progress.logical);
+                    let before_volume = self.volume.zip(self.volume_observed_at);
+                    let before_backend = self.snapshot.progress.backend.clone();
                     // begin_scan ignores requests while an operation is active,
                     // so it runs after the operation is cleared and before the
                     // report (an operation) and the notice (cleared by it).
@@ -640,6 +644,22 @@ impl DiskScopeApp {
                         && self.root_path == binding.root;
                     if rescanned {
                         self.rescan_keeping_place(binding.root.clone(), binding.node);
+                        self.action_review = Some(outcome::ActionReview {
+                            path: binding.path.clone(),
+                            root: binding.root.clone(),
+                            generation: self.generation,
+                            message: effects.notice.clone(),
+                            recycled: matches!(&result, Ok(ActionOutcome::Recycled { .. })),
+                            before_logical,
+                            before_backend,
+                            after_logical: None,
+                            before_volume,
+                            after_volume: None,
+                            state: None,
+                            presence: None,
+                            probe_started: false,
+                            volume_refresh_requested: false,
+                        });
                     }
                     self.notice = Some(effects.notice);
                     if let Some(mut report) = effects.report {
@@ -1481,6 +1501,31 @@ mod tests {
             "{:?}",
             app.notice
         );
+    }
+
+    #[test]
+    fn a_draft_location_does_not_skip_action_reconciliation_or_replace_the_draft() {
+        let (_dir, mut app, two) = browsing_in_a_nested_folder();
+        let root = app.root_path.clone();
+        let generation = app.generation;
+        let draft = root.join("different-location");
+        app.native_tx
+            .send(NativeResult::Folder(Some(draft.clone())))
+            .unwrap();
+        app.poll(&egui::Context::default());
+        std::fs::remove_file(&two.path).unwrap();
+        finish_action(&mut app, &two, recycled(&two));
+        assert_ne!(app.generation, generation);
+        assert_eq!(app.root_path, root);
+        assert_eq!(app.path_text, draft.to_string_lossy());
+        assert!(app.path_edited);
+        pump_until(&mut app, "reconciling the scanned location", settled);
+        assert!(!visible_names(&app).iter().any(|name| name == "two.bin"));
+        let review = app
+            .action_review
+            .as_ref()
+            .expect("persistent action evidence");
+        assert_eq!(review.root, root);
     }
 
     #[test]

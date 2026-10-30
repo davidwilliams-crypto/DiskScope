@@ -404,15 +404,46 @@ pub(super) fn comparison_matches(
     older == Some(actual.0) && newer == Some(actual.1)
 }
 
-/// The two most recent complete scans of `root`, as `(older, newer)` ids.
+/// The newest scan and its most recent compatible baseline for `root`.
 pub(super) fn previous_pair(
     scans: &[scan_history::ScanSummary],
     root: &std::path::Path,
 ) -> Option<(u64, u64)> {
     let mut matching = scans.iter().filter(|s| s.root == root);
     let newer = matching.next()?;
-    let older = matching.next()?;
+    let older = matching.find(|older| {
+        older.id != newer.id && scan_history::compatible_backends(&older.backend, &newer.backend)
+    })?;
     Some((older.id, newer.id))
+}
+
+/// Validate catalog choices before a request reaches the worker. Paths retain
+/// native identity; same-named folders and different backend families differ.
+pub(super) fn comparison_pair(
+    scans: &[scan_history::ScanSummary],
+    root: &Path,
+    older: Option<u64>,
+    newer: Option<u64>,
+) -> Result<(u64, u64), &'static str> {
+    let (older, newer) = older
+        .zip(newer)
+        .ok_or("Select a Before and an After scan.")?;
+    if older == newer {
+        return Err("Before and After must be different scans.");
+    }
+    let find = |id| scans.iter().find(|s| s.id == id);
+    let (a, b) = find(older)
+        .zip(find(newer))
+        .ok_or("A selected scan is no longer saved. Choose again.")?;
+    if a.root != root || b.root != root {
+        return Err("Choose two scans of the selected full root path.");
+    }
+    if !scan_history::compatible_backends(&a.backend, &b.backend) {
+        return Err(
+            "Normal scans and raw NTFS preview scans cannot be compared. Choose the same backend family.",
+        );
+    }
+    Ok((older, newer))
 }
 
 pub(super) fn overview_type_share(bytes: u64, view: &ViewSnapshot) -> f32 {
@@ -543,6 +574,55 @@ pub(super) fn command_matches(query: &str) -> Vec<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn baseline(id: u64, root: &str, backend: &str) -> scan_history::ScanSummary {
+        scan_history::ScanSummary {
+            id,
+            root: root.into(),
+            finished_unix: id,
+            logical: 1,
+            files: 1,
+            folders: 0,
+            backend: backend.into(),
+            live_generation: None,
+        }
+    }
+
+    #[test]
+    fn previous_pair_skips_incompatible_backends_and_same_named_other_roots() {
+        let scans = vec![
+            baseline(5, "/a/data", "Normal"),
+            baseline(4, "/b/data", "Normal"),
+            baseline(3, "/a/data", "NTFS volume preview (raw)"),
+            baseline(2, "/a/data", "Normal fallback (unsupported)"),
+        ];
+        assert_eq!(previous_pair(&scans, Path::new("/a/data")), Some((2, 5)));
+        assert_eq!(previous_pair(&scans[..3], Path::new("/a/data")), None);
+    }
+
+    #[test]
+    fn comparison_admission_requires_saved_distinct_same_root_same_family_scans() {
+        let scans = vec![
+            baseline(5, "/a/data", "Normal"),
+            baseline(4, "/a/data", "Normal fallback (unsupported)"),
+            baseline(3, "/a/data", "NTFS volume preview (raw)"),
+            baseline(2, "/b/data", "Normal"),
+            baseline(1, "/a/data", "NTFS volume preview (fast)"),
+        ];
+        let root = Path::new("/a/data");
+        for (before, after) in [
+            (None, Some(5)),
+            (Some(5), Some(5)),
+            (Some(99), Some(5)),
+            (Some(2), Some(5)),
+            (Some(3), Some(5)),
+        ] {
+            assert!(comparison_pair(&scans, root, before, after).is_err());
+        }
+        assert_eq!(comparison_pair(&scans, root, Some(4), Some(5)), Ok((4, 5)));
+        assert_eq!(comparison_pair(&scans, root, Some(5), Some(4)), Ok((5, 4)));
+        assert_eq!(comparison_pair(&scans, root, Some(1), Some(3)), Ok((1, 3)));
+    }
 
     fn file(name: &str, bytes: u64) -> Entry {
         Entry {

@@ -1,10 +1,48 @@
 use super::*;
 
+#[derive(Clone, Default)]
+struct DialogFocus {
+    invoker: Option<egui::Id>,
+}
+
+fn dialog_focus_key(title: &str) -> egui::Id {
+    egui::Id::new(("dialog_invoker", title))
+}
+
+/// Call when an invoking control is available, before opening its window.
+pub(super) fn set_dialog_invoker(ctx: &egui::Context, title: &str, invoker: egui::Id) {
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            dialog_focus_key(title),
+            DialogFocus {
+                invoker: Some(invoker),
+            },
+        )
+    });
+}
+
+/// Capture the previously focused control once, before the first window draw.
+pub(super) fn remember_dialog_focus(ctx: &egui::Context, title: &str) {
+    let focused = ctx.memory(|m| m.focused());
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_insert_with(dialog_focus_key(title), || DialogFocus { invoker: focused });
+    });
+}
+
+/// Use for both Escape and the title-bar close button.
+pub(super) fn restore_dialog_focus(ctx: &egui::Context, title: &str) {
+    let saved = ctx.data_mut(|d| d.remove_temp::<DialogFocus>(dialog_focus_key(title)));
+    if let Some(id) = saved.and_then(|s| s.invoker) {
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+}
+
 impl DiskScopeApp {
     pub(super) fn filter_window(&mut self, ctx: &egui::Context, p: Palette) {
         if !self.filter_open {
             return;
         }
+        remember_dialog_focus(ctx, "Filter files");
         let mut open = true;
         egui::Window::new("Filter files")
             .open(&mut open)
@@ -19,13 +57,13 @@ impl DiskScopeApp {
                     .color(p.muted),
                 );
                 ui.add_space(10.0);
-                ui.label("File extensions (comma separated)");
+                let label = ui.label("File extensions (comma separated)");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter_extensions)
                         .hint_text(".mp4, .mkv")
                         .char_limit(1024)
                         .desired_width(f32::INFINITY),
-                );
+                ).labelled_by(label.id);
                 ui.horizontal_wrapped(|ui| {
                     for category in &FILE_CATEGORIES {
                         if ui.small_button(category.label).clicked() {
@@ -43,12 +81,12 @@ impl DiskScopeApp {
                             ("Modified since · UTC", &mut self.filter_after, "YYYY-MM-DD"),
                             ("Modified through · UTC", &mut self.filter_before, "YYYY-MM-DD"),
                         ] {
-                            ui.label(label);
+                            let label = ui.label(label);
                             ui.add(
                                 egui::TextEdit::singleline(field)
                                     .desired_width(190.0)
                                     .hint_text(hint),
-                            );
+                            ).labelled_by(label.id);
                             ui.end_row();
                         }
                     });
@@ -88,6 +126,7 @@ impl DiskScopeApp {
         self.filter_open &= open;
         if !self.filter_open {
             self.filter_error = None;
+            restore_dialog_focus(ctx, "Filter files");
         }
     }
     /// The size and date fields as filter bounds, or `None` when any field is
@@ -114,12 +153,16 @@ impl DiskScopeApp {
         if !self.comparison_open {
             return;
         }
+        remember_dialog_focus(ctx, "Pinned comparison");
         let mut open = true;
         egui::Window::new("Pinned comparison")
             .open(&mut open)
             .default_width(650.0)
             .show(ctx, |ui| self.comparison_tray(ui, p));
         self.comparison_open = open;
+        if !open {
+            restore_dialog_focus(ctx, "Pinned comparison");
+        }
     }
     pub(super) fn comparison_tray(&mut self, ui: &mut egui::Ui, p: Palette) {
         let snapshot = self.visible.clone();
@@ -144,7 +187,9 @@ impl DiskScopeApp {
             let max = rows.iter().map(|r| r.logical).max().unwrap_or(1);
             for row in rows {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.small_button("×").on_hover_text("Unpin").clicked() {
+                    let unpin = ui.small_button("×").on_hover_text("Unpin");
+                    unpin.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), format!("Unpin {}", row.name)));
+                    if unpin.clicked() {
                         self.pin(row.id);
                     }
                     if ui.add(egui::Button::new(&row.name).frame(false)).clicked() {
@@ -219,6 +264,7 @@ impl DiskScopeApp {
             return;
         }
         self.palette_open = false;
+        restore_dialog_focus(ctx, "Commands");
         match command {
             Command::Overview => self.destination(ViewMode::Overview),
             Command::Explorer => self.destination(ViewMode::Explorer),
@@ -262,17 +308,57 @@ impl DiskScopeApp {
         if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.help_open = true;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.palette_open = false;
-            self.filter_open = false;
-            self.help_open = false;
-            self.settings_open = false;
+        let dialogs = [
+            ("Scan errors & skipped locations", self.show_errors),
+            ("Filter files", self.filter_open),
+            ("Commands", self.palette_open),
+            ("Appearance & settings", self.settings_open),
+            ("Keyboard help", self.help_open),
+            ("Pinned comparison", self.comparison_open),
+        ];
+        // Let egui dismiss an open menu/ComboBox before its owning window.
+        if !egui::Popup::is_any_open(ctx)
+            && dialogs.iter().any(|(_, open)| *open)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            let foremost = ctx
+                .memory(|m| {
+                    m.layer_ids()
+                        .filter_map(|layer| {
+                            dialogs.iter().position(|(title, open)| {
+                                *open
+                                    && layer
+                                        == egui::LayerId::new(
+                                            egui::Order::Middle,
+                                            egui::Id::new(title),
+                                        )
+                            })
+                        })
+                        .last()
+                })
+                .or_else(|| dialogs.iter().rposition(|(_, open)| *open));
+            if let Some(index) = foremost {
+                match index {
+                    0 => self.show_errors = false,
+                    1 => {
+                        self.filter_open = false;
+                        self.filter_error = None;
+                    }
+                    2 => self.palette_open = false,
+                    3 => self.settings_open = false,
+                    4 => self.help_open = false,
+                    5 => self.comparison_open = false,
+                    _ => unreachable!(),
+                }
+                restore_dialog_focus(ctx, dialogs[index].0);
+            }
         }
     }
     pub(super) fn command_palette(&mut self, ctx: &egui::Context, p: Palette) {
         if !self.palette_open {
             return;
         }
+        remember_dialog_focus(ctx, "Commands");
         let mut open = true;
         let mut chosen = None;
         egui::Window::new("Commands")
@@ -282,11 +368,14 @@ impl DiskScopeApp {
             .anchor(egui::Align2::CENTER_TOP, [0.0, 100.0])
             .default_width(480.0)
             .show(ctx, |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.palette_query)
-                        .hint_text("Where would you like to go?")
-                        .desired_width(f32::INFINITY),
-                );
+                let label = ui.label("Find a command");
+                let response = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.palette_query)
+                            .hint_text("Where would you like to go?")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .labelled_by(label.id);
                 if self.palette_focus {
                     response.request_focus();
                     self.palette_focus = false;
@@ -313,8 +402,9 @@ impl DiskScopeApp {
                 }
                 for (index, command) in commands.iter().enumerate() {
                     let reason = command.unavailable(&facts);
-                    let mut button =
-                        egui::Button::new(command.label()).fill(if index == self.palette_index {
+                    let mut button = egui::Button::new(command.label())
+                        .selected(index == self.palette_index)
+                        .fill(if index == self.palette_index {
                             p.wash
                         } else {
                             p.surface
@@ -341,6 +431,9 @@ impl DiskScopeApp {
                 );
             });
         self.palette_open &= open;
+        if !self.palette_open {
+            restore_dialog_focus(ctx, "Commands");
+        }
         if let Some(command) = chosen {
             self.run_command(command, ctx);
         }
@@ -349,6 +442,7 @@ impl DiskScopeApp {
         if !self.settings_open {
             return;
         }
+        remember_dialog_focus(ctx, "Appearance & settings");
         let mut open = true;
         let previous = (
             self.preferences.theme,
@@ -401,6 +495,9 @@ impl DiskScopeApp {
                 );
             });
         self.settings_open = open;
+        if !open {
+            restore_dialog_focus(ctx, "Appearance & settings");
+        }
         if previous
             != (
                 self.preferences.theme,
@@ -415,6 +512,7 @@ impl DiskScopeApp {
         if !self.help_open {
             return;
         }
+        remember_dialog_focus(ctx, "Keyboard help");
         egui::Window::new("Keyboard help")
             .open(&mut self.help_open)
             .collapsible(false)
@@ -427,7 +525,7 @@ impl DiskScopeApp {
                     ("Space / Enter", "Activate the focused control or map item"),
                     ("Delete", "Check Recycle Bin availability, then open the confirmation for the selected file"),
                     ("Shift Delete", "Open permanent-delete confirmation for the selected file"),
-                    ("Escape", "Cancel a confirmation or close a dialog"),
+                    ("Escape", "Cancel a confirmation or close the foremost dialog"),
                     ("F1", "Keyboard help"),
                 ] {
                     detail(ui, key, action, p);
@@ -438,6 +536,9 @@ impl DiskScopeApp {
                     "Map items have names and logical sizes. The table offers the same objects and paths.",
                 );
             });
+        if !self.help_open {
+            restore_dialog_focus(ctx, "Keyboard help");
+        }
     }
 }
 /// The two texts for one pinned row: sizes in the binary units every other
@@ -542,6 +643,156 @@ pub(super) fn date_time_label(seconds: u64) -> String {
 mod tests {
     use super::super::test_support::{rendered_texts, settle_frames};
     use super::*;
+
+    fn escape_key() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn running_a_palette_command_restores_its_invoking_control() {
+        let (mut app, ctx) = idle_app();
+        let invoker = egui::Id::new("command_button");
+        set_dialog_invoker(&ctx, "Commands", invoker);
+        app.open_palette();
+        app.palette_query = "theme".into();
+        palette_frame(&mut app, &ctx, vec![]);
+        palette_frame(&mut app, &ctx, vec![enter_key()]);
+        assert!(!app.palette_open);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(invoker));
+    }
+
+    #[test]
+    fn escape_defers_to_an_open_popup_before_closing_its_dialog() {
+        let (mut app, ctx) = idle_app();
+        app.filter_open = true;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![escape_key()],
+                ..Default::default()
+            },
+            |_| {
+                egui::Popup::open_id(&ctx, egui::Id::new("test_combo_popup"));
+                app.keyboard(&ctx);
+                assert!(
+                    app.filter_open,
+                    "the popup must dismiss before its owning window"
+                );
+                assert!(
+                    ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+                    "the popup still needs its Escape event"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn filter_inputs_expose_their_visible_names_in_the_accessibility_tree() {
+        let (mut app, ctx) = idle_app();
+        ctx.enable_accesskit();
+        app.filter_open = true;
+        let output = settle_frames(&ctx, |ui| {
+            app.filter_window(ui.ctx(), app.preferences.theme.palette())
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        let mut names = Vec::new();
+        for (_, node) in update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == egui::accesskit::Role::TextInput)
+        {
+            let labels: Vec<_> = node
+                .labelled_by()
+                .iter()
+                .filter_map(|label| {
+                    update
+                        .nodes
+                        .iter()
+                        .find(|(id, _)| id == label)
+                        .and_then(|(_, n)| n.value())
+                })
+                .collect();
+            names.extend(labels);
+        }
+        for name in [
+            "File extensions (comma separated)",
+            "Minimum size · MiB",
+            "Maximum size · MiB",
+            "Modified since · UTC",
+            "Modified through · UTC",
+        ] {
+            assert!(
+                names.contains(&name),
+                "missing filter input name {name}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_closes_comparison_and_errors_one_actual_frontmost_window_at_a_time() {
+        let (mut app, ctx) = idle_app();
+        app.comparison_open = true;
+        app.show_errors = true;
+        settle_frames(&ctx, |ui| {
+            app.error_window(ui.ctx(), app.preferences.theme.palette());
+            app.comparison_window(ui.ctx(), app.preferences.theme.palette());
+        });
+        // Bring the errors window above comparison, regardless of render order.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {
+            ctx.move_to_top(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("Scan errors & skipped locations"),
+            ));
+        });
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![escape_key()],
+                ..Default::default()
+            },
+            |_| {
+                app.keyboard(&ctx);
+            },
+        );
+        assert!(!app.show_errors);
+        assert!(app.comparison_open);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![escape_key()],
+                ..Default::default()
+            },
+            |_| {
+                app.keyboard(&ctx);
+            },
+        );
+        assert!(!app.comparison_open);
+    }
+
+    #[test]
+    fn escape_closes_only_the_frontmost_of_multiple_open_dialogs() {
+        let (mut app, ctx) = idle_app();
+        app.filter_open = true;
+        app.help_open = true;
+        settle_frames(&ctx, |ui| {
+            app.filter_window(ui.ctx(), app.preferences.theme.palette());
+            app.help_window(ui.ctx(), app.preferences.theme.palette());
+        });
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![escape_key()],
+                ..Default::default()
+            },
+            |_| {
+                app.keyboard(&ctx);
+            },
+        );
+        assert!(!app.help_open);
+        assert!(app.filter_open, "the window behind help must stay open");
+    }
 
     #[test]
     fn dates_and_size_reject_invalid_filters() {

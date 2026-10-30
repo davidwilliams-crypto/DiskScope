@@ -208,6 +208,19 @@ impl DiskScopeApp {
                     self.choose_folder(ui.ctx());
                 }
                 ui.add_space(18.0);
+                ui.horizontal_wrapped(|ui| {
+                    for location in self.locations.clone() {
+                        let label = format!("Scan {}{}", location.path.display(), location.space.map(|s| format!(" · {} available", format_bytes(s.available))).unwrap_or_default());
+                        if ui.button(label).clicked() { self.begin_scan(location.path); }
+                    }
+                });
+                if self.access_mode.persistence_allowed() && !self.preferences.recent_locations.is_empty() {
+                    ui.collapsing("Recent locations", |ui| {
+                        for path in self.preferences.recent_locations.clone().into_iter().take(5) {
+                            if ui.button(format!("Scan {}", path.display())).clicked() { self.begin_scan(path); }
+                        }
+                    });
+                }
                 ui.separator();
                 for (title, description) in [
                     ("01  Scan", "Read file sizes and dates without opening file contents."),
@@ -433,9 +446,40 @@ impl DiskScopeApp {
     }
     pub(super) fn explore_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         self.navigation(ui, p);
-        self.update_controls(ui, p);
-        self.filter_chips(ui, p);
+        if !investigation::compact(ui.ctx())
+            || self.preferences.stable_updates
+            || self.pending.is_some()
+        {
+            self.update_controls(ui, p);
+        }
+        if !investigation::compact(ui.ctx())
+            || self.request.filters.is_active()
+            || !self.request.search.is_empty()
+        {
+            self.filter_chips(ui, p);
+        }
         ui.add_space(6.0);
+        if investigation::compact(ui.ctx()) {
+            self.query_controls(ui, p);
+            let height = (ui.available_height() - 80.0).clamp(100.0, 240.0);
+            if self.request.mode == ViewMode::Types {
+                self.types_table(ui, height, p);
+            } else {
+                self.compact_file_list(ui, height, p);
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("compact_details")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::CollapsingHeader::new("Selected item · details and actions")
+                        .id_salt(("compact_selection", self.request.selected))
+                        .default_open(self.request.selected.is_some())
+                        .show(ui, |ui| self.inspector(ui, p));
+                    self.treemap(ui, 220.0, p);
+                    self.comparison_tray(ui, p);
+                });
+            return;
+        }
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(252.0)

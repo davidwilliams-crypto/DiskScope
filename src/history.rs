@@ -1929,7 +1929,9 @@ fn add_folder(c: &mut Comparison, folder: FolderChange) {
     c.folder_changes.insert(position, folder);
     c.folder_changes.truncate(8);
 }
-fn compatible_backends(a: &str, b: &str) -> bool {
+/// Whether two catalog backends use the same accounting family. UI admission
+/// uses this too; the worker still revalidates snapshots before comparison.
+pub fn compatible_backends(a: &str, b: &str) -> bool {
     let family = |s: &str| {
         if s == "Normal" || s.starts_with("Normal (") || s.starts_with("Normal fallback (") {
             1

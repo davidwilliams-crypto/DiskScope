@@ -1,0 +1,50 @@
+name: Windows validation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, diagnostics, no-gui]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Validate
+        shell: pwsh
+        run: |
+          $featureArgs = switch ('${{ matrix.features }}') {
+            'diagnostics' { @('--features', 'diagnostics') }
+            'no-gui' { @('--no-default-features') }
+            default { @() }
+          }
+          cargo test --locked @featureArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets @featureArgs -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Formatting and release tooling
+        if: matrix.features == 'default'
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/check-rust-floor.ps1
+          ./scripts/test-tooling.ps1
+          ./scripts/test-release.ps1
+          ./scripts/test-build-artifacts.ps1 -Integration
+  compiler-floor:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-pc-windows-msvc
+      - name: Build locked default GUI on declared minimum
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc

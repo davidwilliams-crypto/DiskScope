@@ -1,7 +1,9 @@
 mod changes;
 mod controls;
+mod investigation;
 mod management;
 mod native;
+mod outcome;
 mod state;
 #[cfg(test)]
 mod test_support;
@@ -133,12 +135,16 @@ fn errors_button(ui: &mut egui::Ui, errors_total: u64) -> bool {
     );
     let response = ui.add_enabled(errors_total > 0, egui::Button::new(label).small());
     let clicked = response.clicked();
+    if clicked {
+        controls::set_dialog_invoker(ui.ctx(), "Scan errors & skipped locations", response.id);
+    }
     response.on_disabled_hover_text(NO_ERRORS_HINT);
     clicked
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
+    recent_locations: Vec<PathBuf>,
     theme: Theme,
     map_focus: bool,
     ntfs_preview: bool,
@@ -147,12 +153,19 @@ struct Preferences {
     reduced_motion: bool,
 }
 enum NativeResult {
+    Locations(Vec<native::Location>),
     Folder(Option<PathBuf>),
     Reveal(Result<(), String>),
     Volume {
         generation: u64,
         path: PathBuf,
         volume: Option<native::VolumeSpace>,
+        measured_at: std::time::SystemTime,
+    },
+    ActionPresence {
+        generation: u64,
+        path: PathBuf,
+        presence: outcome::Presence,
     },
 }
 enum Action {
@@ -178,6 +191,8 @@ pub struct DiskScopeApp {
     dirty: bool,
     search_changed: Option<Instant>,
     volume: Option<native::VolumeSpace>,
+    volume_observed_at: Option<std::time::SystemTime>,
+    action_review: Option<outcome::ActionReview>,
     volume_tx: SyncSender<(u64, PathBuf)>,
     history: BrowseHistory,
     pending: Option<Arc<UiSnapshot>>,
@@ -209,10 +224,12 @@ pub struct DiskScopeApp {
     root_path: PathBuf,
     path_text: String,
     path_edited: bool,
+    draft_path: Option<PathBuf>,
     preferences: Preferences,
     native_tx: SyncSender<NativeResult>,
     native_rx: Receiver<NativeResult>,
     picker_open: bool,
+    locations: Vec<native::Location>,
     show_errors: bool,
     notice: Option<String>,
 }
@@ -244,6 +261,7 @@ impl DiskScopeApp {
             Preferences::default()
         };
         let (native_tx, native_rx) = mpsc::sync_channel(4);
+        native::discover_locations(native_tx.clone());
         let snapshot = Arc::new(UiSnapshot::default());
         let volume_tx = native::volume_worker(native_tx.clone());
         let history_service = if access_mode.persistence_allowed() {
@@ -273,6 +291,8 @@ impl DiskScopeApp {
             dirty: false,
             search_changed: None,
             volume: None,
+            volume_observed_at: None,
+            action_review: None,
             volume_tx,
             history: BrowseHistory::default(),
             pending: None,
@@ -300,10 +320,12 @@ impl DiskScopeApp {
             root_path: PathBuf::new(),
             path_text: String::new(),
             path_edited: false,
+            draft_path: None,
             preferences,
             native_tx,
             native_rx,
             picker_open: false,
+            locations: Vec::new(),
             show_errors: false,
             notice: None,
         };
@@ -333,9 +355,34 @@ impl DiskScopeApp {
         if self.management.busy() {
             return;
         }
+        let path = match std::path::absolute(path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(format!("Could not resolve this location: {error}"));
+                return;
+            }
+        };
+        // Absolute is lexical: resolving a junction here would bypass the
+        // scanner's deliberate refusal to follow a link used as the root.
+        let preserve_draft = keep.is_some() && self.path_edited;
+        if keep.is_none() {
+            self.action_review = None;
+        }
         self.root_path = path;
-        self.path_text = self.root_path.to_string_lossy().into_owned();
-        self.path_edited = false;
+        if self.access_mode.persistence_allowed() {
+            self.preferences
+                .recent_locations
+                .retain(|p| p != &self.root_path);
+            self.preferences
+                .recent_locations
+                .insert(0, self.root_path.clone());
+            self.preferences.recent_locations.truncate(5);
+        }
+        if !preserve_draft {
+            self.path_text = self.root_path.to_string_lossy().into_owned();
+            self.path_edited = false;
+            self.draft_path = None;
+        }
         let (mut request, restore) = match keep {
             Some(saved) => (saved.request, saved.restore),
             None => (
@@ -369,6 +416,7 @@ impl DiskScopeApp {
             },
         );
         self.volume = None;
+        self.volume_observed_at = None;
         let _ = self
             .volume_tx
             .try_send((self.generation, self.root_path.clone()));
@@ -422,21 +470,42 @@ impl DiskScopeApp {
                 break;
             };
             match result {
+                NativeResult::Locations(locations) => self.locations = locations,
                 NativeResult::Folder(path) => {
                     self.picker_open = false;
                     if let Some(path) = path {
-                        self.root_path = path;
-                        self.path_text = self.root_path.to_string_lossy().into_owned();
-                        self.path_edited = false;
+                        self.path_text = path.to_string_lossy().into_owned();
+                        self.draft_path = Some(path);
+                        self.path_edited = true;
                     }
                 }
                 NativeResult::Volume {
                     generation,
                     path,
                     volume,
+                    measured_at,
                 } => {
                     if generation == self.generation && path == self.root_path {
                         self.volume = volume;
+                        self.volume_observed_at = Some(measured_at);
+                        if let Some(review) = self.action_review.as_mut()
+                            && review.generation == generation
+                            && review.root == path
+                        {
+                            review.after_volume = volume.map(|space| (space, measured_at));
+                        }
+                    }
+                }
+                NativeResult::ActionPresence {
+                    generation,
+                    path,
+                    presence,
+                } => {
+                    if let Some(review) = self.action_review.as_mut()
+                        && review.generation == generation
+                        && review.path == path
+                    {
+                        review.presence = Some(presence);
                     }
                 }
                 NativeResult::Reveal(Err(message)) => self.notice = Some(message),
@@ -446,6 +515,7 @@ impl DiskScopeApp {
         if let Some(history) = self.history_service.poll() {
             self.history_snapshot = history;
         }
+        self.poll_action_review(ctx);
         ctx.request_repaint_after(Duration::from_millis(
             if self.snapshot.progress.state.is_active()
                 || self.picker_open
@@ -625,6 +695,10 @@ impl DiskScopeApp {
         });
     }
     fn header(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if investigation::compact(ui.ctx()) {
+            self.compact_header(ui, p);
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(if self.changes {
@@ -646,7 +720,9 @@ impl DiskScopeApp {
                 }
             });
         });
-        ui.horizontal_wrapped(|ui| self.access_controls(ui, p));
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Access and permissions", |ui| self.access_controls(ui, p));
+        });
         if !self.access_mode.persistence_allowed() {
             ui.label(
                 RichText::new(self.access_mode.history_message())
@@ -665,6 +741,7 @@ impl DiskScopeApp {
             );
             if response.changed() {
                 self.path_edited = true;
+                self.draft_path = None;
             }
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui
@@ -689,11 +766,7 @@ impl DiskScopeApp {
                 )
                 .clicked();
             if scan || enter {
-                let path = if self.path_edited {
-                    PathBuf::from(self.path_text.clone())
-                } else {
-                    self.root_path.clone()
-                };
+                let path = self.requested_path();
                 if !path.as_os_str().is_empty() {
                     self.begin_scan(path);
                 }
@@ -712,7 +785,9 @@ impl DiskScopeApp {
             }
         });
         ui.add_space(12.0);
-        self.scan_summary(ui, p);
+        if self.generation > 0 {
+            self.scan_summary(ui, p);
+        }
         self.notice_line(ui, p);
         ui.add_space(6.0);
         ui.separator();
@@ -835,6 +910,56 @@ impl DiskScopeApp {
         }
     }
     fn query_controls(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if investigation::compact(ui.ctx()) {
+            ui.horizontal_wrapped(|ui| {
+                let width = (ui.available_width() - 350.0).max(80.0);
+                if ui
+                    .add_sized(
+                        [width, 30.0],
+                        egui::TextEdit::singleline(&mut self.request.search)
+                            .desired_width(width)
+                            .hint_text("Search names…"),
+                    )
+                    .changed()
+                {
+                    self.search_changed = Some(Instant::now());
+                }
+                if ui.button("Filters").clicked() {
+                    self.sync_filter_fields();
+                    self.filter_open = true;
+                }
+                let old = self.request.sort;
+                egui::ComboBox::from_id_salt("compact_sort")
+                    .selected_text(sort_label(old))
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for (key, label) in [
+                            (SortKey::Logical, "Logical size"),
+                            (SortKey::Name, "Name"),
+                            (SortKey::Files, "File count"),
+                            (SortKey::Allocated, "Allocated"),
+                            (SortKey::Modified, "Modified"),
+                        ] {
+                            if self.request.mode != ViewMode::Types
+                                || !matches!(key, SortKey::Allocated | SortKey::Modified)
+                            {
+                                ui.selectable_value(&mut self.request.sort, key, label);
+                            }
+                        }
+                        if ui.button("Reverse order").clicked() {
+                            self.request.descending = !self.request.descending;
+                            self.mark_query_changed();
+                        }
+                    });
+                let scope_changed = ui
+                    .checkbox(&mut self.request.search_all, "Whole scan")
+                    .changed();
+                if old != self.request.sort || scope_changed {
+                    self.mark_query_changed();
+                }
+            });
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(match self.request.mode {
@@ -914,6 +1039,7 @@ impl DiskScopeApp {
         let view = &snapshot.view;
         let mut action = None;
         let selected = self.request.selected;
+        let mut row_focus = Vec::new();
         let width = ui.available_width();
         let width_id = ui.id().with("file_table_available_width");
         let width_changed = ui.data_mut(|data| {
@@ -1046,6 +1172,32 @@ impl DiskScopeApp {
                         );
                     });
                     let response = table_row.response();
+                    row_focus.push((response.id, row.id, row.is_dir));
+                    response.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::SelectableLabel,
+                            true,
+                            selected == Some(row.id),
+                            format!(
+                                "{} · {} · {}{}",
+                                row.name,
+                                if row.is_dir { "folder" } else { "file" },
+                                format_bytes(row.logical),
+                                if row.has_children {
+                                    if self.request.expanded.contains(&row.id) {
+                                        " · expanded"
+                                    } else {
+                                        " · collapsed"
+                                    }
+                                } else {
+                                    ""
+                                }
+                            ),
+                        )
+                    });
+                    if response.clicked() {
+                        response.request_focus();
+                    }
                     if response.double_clicked() && row.is_dir {
                         action = Some(Action::Navigate(row.id));
                     } else if response.clicked() && action.is_none() {
@@ -1073,19 +1225,51 @@ impl DiskScopeApp {
                     });
                 });
             });
-        if view.rows.is_empty() {
-            ui.label(
-                RichText::new(if self.generation == 0 {
-                    "Choose a folder, then Scan to begin."
-                } else if !self.request.search.is_empty() {
-                    "No matching items in this scope."
-                } else if self.snapshot.progress.state.is_active() {
-                    "Waiting for the first folders…"
+        if let Some(index) = row_focus
+            .iter()
+            .position(|(id, _, _)| ui.memory(|m| m.has_focus(*id)))
+        {
+            let (focus_id, node, is_dir) = row_focus[index];
+            let next = ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    Some((index + 1).min(row_focus.len() - 1))
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    Some(index.saturating_sub(1))
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                    Some(0)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                    Some(row_focus.len() - 1)
                 } else {
-                    "This folder contains no visible items."
-                })
-                .color(p.muted),
-            );
+                    None
+                }
+            });
+            if let Some(next) = next {
+                let (id, node, _) = row_focus[next];
+                ui.memory_mut(|m| m.request_focus(id));
+                action = Some(Action::Select(node));
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                && is_dir
+            {
+                action = Some(Action::Navigate(node));
+            } else if is_dir
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight))
+            {
+                if !self.request.expanded.contains(&node) {
+                    action = Some(Action::Toggle(node));
+                }
+            } else if is_dir
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft))
+            {
+                if self.request.expanded.contains(&node) {
+                    action = Some(Action::Toggle(node));
+                }
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+                action = Some(Action::Select(node));
+                ui.memory_mut(|m| m.request_focus(focus_id));
+            }
+        }
+        if view.rows.is_empty() {
+            self.empty_results(ui, p);
         }
         ui.horizontal(|ui| {
             let end = self
@@ -1168,13 +1352,34 @@ impl DiskScopeApp {
                     row.col(|ui| {
                         ui.add(egui::Label::new(format_count(item.files)).selectable(false));
                     });
-                    if row.response().clicked() {
+                    let response = row.response();
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            format!(
+                                "Explore {} · {} · {} files",
+                                item.extension,
+                                format_bytes(item.logical),
+                                format_count(item.files)
+                            ),
+                        )
+                    });
+                    if response.clicked()
+                        || (response.has_focus()
+                            && response.ctx.input(|i| {
+                                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+                            }))
+                    {
                         extension_lens = Some(item.extension.clone());
                     }
                 });
             });
         if let Some(extension) = extension_lens {
             self.set_extension_lens(&extension);
+        }
+        if view.types.is_empty() {
+            self.empty_results(ui, p);
         }
         ui.horizontal(|ui| {
             let end = self
@@ -1352,11 +1557,7 @@ impl DiskScopeApp {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                if self.generation == 0 {
-                    "Your space, at a glance"
-                } else {
-                    "Map appears as file sizes are discovered"
-                },
+                self.empty_message(true),
                 FontId::proportional(13.0),
                 p.faint,
             );
@@ -1560,6 +1761,10 @@ impl DiskScopeApp {
         );
     }
     fn error_window(&mut self, ctx: &egui::Context, p: Palette) {
+        if !self.show_errors {
+            return;
+        }
+        controls::remember_dialog_focus(ctx, "Scan errors & skipped locations");
         egui::Window::new("Scan errors & skipped locations")
             .open(&mut self.show_errors)
             .default_size([650.0, 350.0])
@@ -1578,20 +1783,24 @@ impl DiskScopeApp {
                     .color(p.muted),
                 );
                 ui.separator();
-                egui::ScrollArea::vertical().show_rows(ui, 50.0, progress.errors.len(), |ui, range| {
-                    for error in &progress.errors[range] {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for error in &progress.errors {
                         ui.add(
                             egui::Label::new(RichText::new(error.path.to_string_lossy()).strong())
-                                .truncate(),
+                            .wrap(),
                         )
                         .on_hover_text(error.path.to_string_lossy());
                         ui.label(RichText::new(&error.message).small().color(p.muted));
+                        if ui.button("Copy error and path").clicked() { ui.ctx().copy_text(format!("{}\n{}", error.path.display(), error.message)); }
                     }
                 });
                 if progress.errors.is_empty() {
                     ui.label("No error samples.");
                 }
             });
+        if !self.show_errors {
+            controls::restore_dialog_focus(ctx, "Scan errors & skipped locations");
+        }
     }
 }
 impl eframe::App for DiskScopeApp {
@@ -1619,7 +1828,11 @@ impl eframe::App for DiskScopeApp {
             self.mark_query_changed();
         }
         let p = self.preferences.theme.palette();
-        self.sidebar(ui, p);
+        if investigation::compact(&ctx) {
+            self.compact_navigation(ui, p);
+        } else {
+            self.sidebar(ui, p);
+        }
         egui::Panel::bottom("status")
             .frame(
                 egui::Frame::new()
@@ -1654,14 +1867,7 @@ impl eframe::App for DiskScopeApp {
                 if self.management.busy() {
                     ui.disable();
                 }
-                self.header(ui, p);
-                if self.changes {
-                    self.changes_page(ui, p);
-                } else if self.request.mode == ViewMode::Overview {
-                    self.overview(ui, p);
-                } else {
-                    self.explore_page(ui, p);
-                }
+                self.workspace(ui, p);
             });
         if !self.management.busy() {
             self.error_window(&ctx, p);
@@ -1891,6 +2097,302 @@ fn admits_snapshot(
 #[cfg(test)]
 mod tests {
     use super::test_support::{rendered_texts, settle_frames};
+
+    #[test]
+    fn choosing_a_draft_folder_keeps_the_scanned_root() {
+        let (mut app, ctx) = table_fixture();
+        let scanned = PathBuf::from(r"C:\scan-a");
+        let draft = PathBuf::from(r"C:\scan-b");
+        app.root_path = scanned.clone();
+        app.native_tx
+            .send(NativeResult::Folder(Some(draft.clone())))
+            .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.root_path, scanned);
+        assert_eq!(app.path_text, draft.to_string_lossy());
+        assert!(app.path_edited);
+    }
+
+    #[test]
+    fn filtered_empty_results_offer_recovery_instead_of_claiming_an_empty_folder() {
+        let (mut app, ctx) = table_fixture();
+        app.request.filters.min_bytes = Some(1000);
+        Arc::make_mut(&mut app.visible).view.rows.clear();
+        let output = table_frame(&mut app, &ctx, vec![]);
+        let texts = rendered_texts(&output.shapes);
+        assert!(texts.iter().any(|s| s == "No matches in this scope"));
+        assert!(texts.iter().any(|s| s == "Clear search and filters"));
+    }
+
+    #[test]
+    fn completed_empty_map_does_not_promise_more_discovery() {
+        let (mut app, ctx) = table_fixture();
+        Arc::make_mut(&mut app.visible).view.map.clear();
+        let p = app.preferences.theme.palette();
+        let output = settle_frames(&ctx, |ui| app.treemap(ui, 250.0, p));
+        let texts = rendered_texts(&output.shapes);
+        assert!(
+            !texts
+                .iter()
+                .any(|s| s.contains("as file sizes are discovered"))
+        );
+        assert!(texts.iter().any(|s| s.contains("No drawable file sizes")));
+    }
+
+    #[test]
+    fn compact_workspace_keeps_identification_and_size_inside_minimum_viewport() {
+        use eframe::App as _;
+        for factor in [1.0, 1.25, 1.5] {
+            let (mut app, ctx) = table_fixture();
+            let screen =
+                Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0 / factor, 640.0 / factor));
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                );
+            }
+            for label in ["NAME", "LOGICAL SIZE", "demo.mp4"] {
+                assert!(
+                    rendered_texts(&output.shapes).iter().any(|s| s == label),
+                    "Missing {label} at {factor}: {:?}",
+                    rendered_texts(&output.shapes)
+                );
+                let point = text_center(&output.shapes, label);
+                assert!(
+                    screen.contains(point),
+                    "{label} outside compact viewport at {factor}: {point:?}"
+                );
+            }
+            assert!(
+                !rendered_texts(&output.shapes)
+                    .iter()
+                    .any(|s| s == "CURRENT SCAN")
+            );
+        }
+    }
+
+    #[test]
+    fn compact_pending_results_keep_an_apply_control() {
+        use eframe::App as _;
+        let (mut app, ctx) = table_fixture();
+        app.preferences.stable_updates = true;
+        app.pending = Some(app.visible.clone());
+        let output = settle_frames(&ctx, |ui| {
+            ui.set_max_width(600.0);
+            app.ui(ui, &mut eframe::Frame::_new_kittest());
+        });
+        assert!(
+            rendered_texts(&output.shapes)
+                .iter()
+                .any(|s| s == "Apply update")
+        );
+    }
+
+    #[test]
+    fn compact_outcome_is_a_dismissible_overlay_and_does_not_displace_the_file_list() {
+        use eframe::App as _;
+        let (mut app, ctx) = table_fixture();
+        app.action_review = Some(outcome::ActionReview {
+            path: "removed.bin".into(),
+            root: app.root_path.clone(),
+            generation: app.generation,
+            message: "Moved to Recycle Bin".into(),
+            recycled: true,
+            before_logical: Some(100),
+            before_backend: "Normal".into(),
+            after_logical: Some(20),
+            before_volume: None,
+            after_volume: None,
+            state: Some(ScanState::Complete),
+            presence: Some(outcome::Presence::Absent),
+            probe_started: true,
+            volume_refresh_requested: true,
+        });
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 640.0 / 1.5));
+        let frame = |app: &mut DiskScopeApp, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+            )
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let point = text_center(&output.shapes, "Action outcome · verification");
+        assert!(screen.contains(text_center(&output.shapes, "demo.mp4")));
+        frame(&mut app, vec![egui::Event::PointerMoved(point)]);
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        let output = frame(&mut app, vec![]);
+        assert!(
+            rendered_texts(&output.shapes)
+                .iter()
+                .any(|s| s == "Path absence verified")
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let output = frame(&mut app, vec![]);
+        assert!(screen.contains(text_center(&output.shapes, "demo.mp4")));
+    }
+
+    #[test]
+    fn arrow_navigation_selects_the_next_row_without_changing_scope() {
+        let (mut app, ctx) = table_fixture();
+        let output = table_frame(&mut app, &ctx, vec![]);
+        let point = text_center(&output.shapes, "demo.mp4");
+        table_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        table_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let output = table_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let _ = output;
+        assert_eq!(app.request.selected, Some(2));
+        assert_eq!(app.request.root, 0);
+    }
+
+    #[test]
+    fn relative_scan_root_is_made_absolute_without_resolving_links() {
+        let (mut app, _) = table_fixture();
+        app.begin_scan(PathBuf::from("research/diskscope-ui-fixture"));
+        assert!(app.root_path.is_absolute());
+        assert_eq!(
+            app.root_path,
+            std::env::current_dir()
+                .unwrap()
+                .join("research/diskscope-ui-fixture")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn picked_native_path_survives_its_lossy_display() {
+        use std::os::windows::ffi::OsStringExt;
+        let (mut app, ctx) = table_fixture();
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&[67, 58, 92, 0xd800]));
+        app.native_tx
+            .send(NativeResult::Folder(Some(path.clone())))
+            .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.requested_path(), path);
+        app.begin_scan(app.requested_path());
+        assert_eq!(app.root_path, path);
+    }
+
+    #[test]
+    fn compact_keyboard_can_advance_more_than_one_row() {
+        use eframe::App as _;
+        let (mut app, ctx) = table_fixture();
+        let mut third = app.visible.view.rows[0].clone();
+        third.id = 999;
+        third.name = "third.bin".into();
+        Arc::make_mut(&mut app.visible).view.rows.push(third);
+        let frame = |app: &mut DiskScopeApp, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+            )
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let point = text_center(&output.shapes, "demo.mp4");
+        frame(&mut app, vec![egui::Event::PointerMoved(point)]);
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        for expected in [2, 999] {
+            frame(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            frame(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(app.request.selected, Some(expected));
+        }
+    }
     use super::*;
 
     fn table_fixture() -> (DiskScopeApp, egui::Context) {

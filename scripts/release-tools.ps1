@@ -1,4 +1,92 @@
 # Shared release packaging helpers. Compatible with Windows PowerShell 5.1 and 7.
+function Get-ReleaseCargoArtifact {
+    param([string[]]$Messages, [string]$PackageId, [string]$ManifestPath)
+    $artifacts = @()
+    $finished = $false
+    foreach ($line in $Messages) {
+        $message = $line | ConvertFrom-Json -ErrorAction Stop
+        if ($message.reason -eq 'build-finished') {
+            if (-not $message.success) { throw 'Cargo reported an unsuccessful build.' }
+            $finished = $true
+        }
+        if ($message.reason -eq 'compiler-artifact' -and $message.package_id -ceq $PackageId -and
+            $message.target.name -ceq 'diskscope' -and $message.target.kind -contains 'bin' -and
+            -not $message.profile.test -and $message.executable) {
+            if ([IO.Path]::GetFullPath($message.manifest_path) -ine [IO.Path]::GetFullPath($ManifestPath)) { throw 'Cargo artifact has an unexpected manifest.' }
+            $artifacts += $message
+        }
+    }
+    if (-not $finished -or $artifacts.Count -ne 1) { throw "Expected exactly one DiskScope executable from a completed Cargo build; found $($artifacts.Count)." }
+    $artifact = $artifacts[0]
+    if (-not [IO.Path]::IsPathRooted($artifact.executable) -or [IO.Path]::GetExtension($artifact.executable) -ine '.exe' -or
+        -not (Test-Path -LiteralPath $artifact.executable -PathType Leaf)) { throw 'Cargo-reported Windows executable is missing or invalid.' }
+    return $artifact
+}
+
+function Copy-ReleaseExecutable {
+    param($Artifact, [string]$Destination)
+    # Verify the copied bytes against the reported artifact, never a guessed target path.
+    $hash = (Get-FileHash -LiteralPath $Artifact.executable -Algorithm SHA256).Hash
+    Copy-Item -LiteralPath $Artifact.executable -Destination $Destination -Force
+    if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -cne $hash) { throw 'Packaged executable differs from the Cargo artifact.' }
+    return $hash.ToLowerInvariant()
+}
+
+function ConvertTo-RustReleaseVersion {
+    param([string]$Version)
+    # Cargo permits both 1.92 and 1.92.0; .NET treats an omitted patch as -1.
+    if ($Version -match '^\d+\.\d+$') { $Version += '.0' }
+    return [version]$Version
+}
+
+function Get-LockedRustFloor {
+    param($Metadata)
+    $active = @{}
+    foreach ($node in $Metadata.resolve.nodes) { $active[$node.id] = $true }
+    $packages = @($Metadata.packages | Where-Object { $active.ContainsKey($_.id) -and $_.rust_version })
+    if (-not $packages.Count) { throw 'Resolved dependency compiler requirements are missing.' }
+    $highest = $packages | Sort-Object { ConvertTo-RustReleaseVersion $_.rust_version } -Descending | Select-Object -First 1
+    return [ordered]@{
+        minimum = $highest.rust_version
+        packages = @($packages | Where-Object { (ConvertTo-RustReleaseVersion $_.rust_version) -eq (ConvertTo-RustReleaseVersion $highest.rust_version) } | ForEach-Object { "$($_.name)@$($_.version)" } | Sort-Object)
+    }
+}
+
+function Get-ReleaseSourceIdentity {
+    param([string]$ProjectRoot)
+    $revision = & git -C $ProjectRoot rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or $revision -notmatch '^[a-f0-9]{40}$') { throw 'Release provenance requires a Git checkout with a revision.' }
+    $paths = & git -C $ProjectRoot -c core.quotepath=false ls-files --cached --others --exclude-standard
+    if ($LASTEXITCODE -ne 0) { throw 'Source inventory failed.' }
+    $files = @($paths | Sort-Object -Unique | ForEach-Object {
+        if ($_ -match '[\r\n]' -or $_.StartsWith('"')) { throw 'Source inventory contains an unsupported filename.' }
+        $file = Join-Path $ProjectRoot $_
+        $hash = if (Test-Path -LiteralPath $file -PathType Leaf) { (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+        [ordered]@{ path = $_; sha256 = $hash }
+    })
+    $status = @(& git -C $ProjectRoot status --porcelain=v1 --untracked-files=normal)
+    if ($LASTEXITCODE -ne 0) { throw 'Source status inspection failed.' }
+    $identity = [ordered]@{ revision = $revision; dirty = ($status.Count -gt 0); files = $files }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($identity | ConvertTo-Json -Depth 10 -Compress))
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { $identity.fingerprint = [BitConverter]::ToString($algorithm.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+    return $identity
+}
+
+function Write-ReleaseProvenance {
+    param([string]$Destination, $Source, $Artifact, $Build, [string]$Executable)
+    $path = Join-Path $Destination 'BUILD_PROVENANCE.json'
+    $record = [ordered]@{
+        schema_version = 1; built_at_utc = [DateTime]::UtcNow.ToString('o')
+        source = $Source; build = $Build
+        artifact = [ordered]@{ package_id = $Artifact.package_id; target = $Artifact.target; profile = $Artifact.profile; features = @($Artifact.features); fresh = $Artifact.fresh }
+        executable = [ordered]@{ name = [IO.Path]::GetFileName($Executable); sha256 = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant() }
+    }
+    [IO.File]::WriteAllText($path, ($record | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    return $path
+}
+
 function Assert-NoReleaseReparsePath {
     param([string]$Path)
     $candidate = [IO.Path]::GetFullPath($Path)

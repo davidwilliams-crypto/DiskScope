@@ -41,7 +41,7 @@ pub struct Node {
     pub modified: Option<u64>,
     pub identity: Option<FileIdentity>,
     pub hard_link: bool,
-    /// False while a directory is pending or after its enumeration failed.
+    /// False while a directory's subtree is pending or any enumeration in it failed.
     pub allocation_complete: bool,
     pub children: Vec<NodeId>,
 }
