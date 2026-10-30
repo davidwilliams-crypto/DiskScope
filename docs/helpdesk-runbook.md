@@ -1,7 +1,7 @@
 # DiskScope diagnostic pilot runbook
 
 Candidate workflow, 30 October 2026. This runbook describes the hardened checkout;
-the published 0.3.1 packages do not gain these switches or policies retroactively.
+the published 0.3.2 packages do not gain the new 0.3.3 assurance changes retroactively.
 Only promote a separately versioned candidate after the [qualification checklist](helpdesk-qualification.md)
 and green gates for its exact source and package hash. No release or fleet rollout
 is performed by these scripts.

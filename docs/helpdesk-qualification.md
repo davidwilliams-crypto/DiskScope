@@ -3,7 +3,9 @@
 Status: **pending fleet/VM/device qualification**, 30 October 2026. Automated unit
 tests, fixture counts and documentation do not earn an A grade or establish a
 supported platform. Use the [runbook](helpdesk-runbook.md) with a separately
-versioned candidate; published 0.3.1 remains unchanged.
+versioned candidate. The current engineering candidate is 0.3.3; published
+0.3.2 remains unchanged. See the [post-fix rescore](helpdesk-rescore-0.3.3.md)
+for exact tested artifacts and outstanding gates.
 
 For every row record owner, ticket/run ID, UTC start/end, source commit, complete
 package/executable SHA-256, OS edition/build, CPU/RAM, disk/filesystem/free space,
