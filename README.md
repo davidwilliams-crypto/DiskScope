@@ -1,14 +1,14 @@
 # DiskScope
 
-A native Windows disk usage analyzer written in Rust with egui/eframe. The **0.3.0 preview** adds explicit administrator relaunch and confirmed single-file actions to the responsive interface and scanner. The original implementation was informed by a focused REA investigation of WinDirStat 2.9.3.
+A native Windows disk usage analyzer written in Rust with egui/eframe. The **0.3.1 preview** adds reliability fixes, a compact investigation workspace, compatible scan-history comparisons, and verified file-action outcomes. The original implementation was informed by a focused REA investigation of WinDirStat 2.9.3.
 
 ## Run
 
-Download the [Windows x64 installer](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.0/DiskScope-0.3.0-windows-x64-setup.exe) or [portable ZIP](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.0/DiskScope-0.3.0-windows-x64-portable.zip) from the [0.3.0 preview release](https://github.com/davidwilliams-crypto/DiskScope/releases/tag/v0.3.0). Install the setup executable, or extract the entire ZIP and open `DiskScope.exe`. Both contain the same application. Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable graphics driver are required; a separate Visual C++ runtime installation is not needed. The builds are unsigned; Windows may display a publisher or SmartScreen prompt.
+Download the [Windows x64 installer](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.1/DiskScope-0.3.1-windows-x64-setup.exe) or [portable ZIP](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.1/DiskScope-0.3.1-windows-x64-portable.zip) from the [0.3.1 preview release](https://github.com/davidwilliams-crypto/DiskScope/releases/tag/v0.3.1). Install the setup executable, or extract the entire ZIP and open `DiskScope.exe`. Both contain the same application. Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable graphics driver are required; a separate Visual C++ runtime installation is not needed. The builds are unsigned; Windows may display a publisher or SmartScreen prompt.
 
 Setup installs for the current Windows account, offers Start menu and desktop shortcuts, and registers an uninstaller. Uninstall preserves scan history, preferences, and unrelated files. The portable version requires no installation; it still saves history and preferences in your Windows profile. See [packaging and verification](docs/packaging.md) for build commands and package details.
 
-Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.0/DiskScope.exe`.
+Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.1/DiskScope.exe`.
 
 - Overview with factual folder/type insights and real volume capacity when available.
 - Connected investigation workspace with explicit scanned location, coverage, draft-path distinction, compact navigation and a keyboard-operable file list at larger text sizes.
@@ -53,14 +53,14 @@ The optional `scripts/dev.ps1` helper uses the project-local toolchain under the
 .\scripts\dev.ps1 -CargoArgs @('build','--release','--locked')
 ```
 
-`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.0`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
+`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.1`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
 
 `scripts/package-release.ps1 -Offline` builds the application, installer, and portable ZIP; NSIS 3.12 is additionally required. Use `-SkipBuild` only to package an already built, checksum-verified portable directory. The Windows x64 target uses static CRT linking through `.cargo/config.toml`.
 
 ## Repeatable command-line scans
 
 ```powershell
-$p = Start-Process .\dist\0.3.0\DiskScope.exe -ArgumentList '--scan "C:\some folder" --json "D:\scan.json" --backend normal' -PassThru -Wait
+$p = Start-Process .\dist\0.3.1\DiskScope.exe -ArgumentList '--scan "C:\some folder" --json "D:\scan.json" --backend normal' -PassThru -Wait
 $p.ExitCode
 ```
 

@@ -1,8 +1,7 @@
 # DiskScope 0.3.1 deployment test build
 
 This build packages the reliability and investigation UX changes described in
-[validation](validation-investigation-ux-2026-10-30.md). It is a local Windows
-x64 preview, not a published GitHub release. Packages are unsigned.
+[validation](validation-investigation-ux-2026-10-30.md). It is a Windows x64 preview. Packages are unsigned.
 
 ## Installer
 
