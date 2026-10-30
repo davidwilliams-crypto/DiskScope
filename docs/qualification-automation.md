@@ -69,8 +69,19 @@ PowerShell hosts must pass the helper suite with junction capability required;
 an unavailable junction test fails this hosted gate. It downloads
 the [official portable NSIS 3.12 ZIP](https://sourceforge.net/projects/nsis/files/NSIS%203/3.12/),
 verifies SHA-256 `56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f`,
-then verifies `makensis /VERSION`. The pin is independently recorded in the
+requires its 2,362,938-byte ZIP and binary HTTP content type, then verifies
+`makensis /VERSION`. The pin and size are independently recorded for the binary
+`nsis-3.12.zip` (separately from the source tarball) in the
 [MacPorts NSIS package manifest](https://github.com/macports/macports-ports/blob/master/devel/nsis/Portfile).
+The official URL returned HTTP 200 HTML to `Invoke-WebRequest` in the first
+hosted run. Independent local reproduction returned 143,732 bytes of HTML,
+while `curl.exe` followed the official SourceForge mirror redirect to a ZIP
+matching the original trusted hash and size; its extracted compiler reported
+`v3.12`. The workflow uses curl with HTTPS-only redirects, bounded size/time,
+and records whitelisted response headers, byte count, magic and hash before
+trust or extraction. Cookies and redirect tokens are excluded from retained
+diagnostics. A bad response still fails closed; the expected hash was not
+changed and no failed installer/safety case is retried automatically.
 No tool setup executable runs. Pinned action commits retain environment,
 provenance, package hashes, raw CLI evidence and per-case lifecycle results as
 14-day workflow artifacts. Preserve needed evidence before expiry.

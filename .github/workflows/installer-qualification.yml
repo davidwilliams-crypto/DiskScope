@@ -44,11 +44,41 @@ jobs:
           # signing certificate or machine trust changes. Pin independently
           # recorded in MacPorts' devel/nsis/Portfile; see automation documentation.
           $zip = Join-Path $env:RUNNER_TEMP 'nsis-3.12.zip'
+          $headerPath = Join-Path $env:RUNNER_TEMP 'nsis-3.12-http-headers.txt'
           $toolRoot = Join-Path $env:RUNNER_TEMP 'diskscope-nsis-3.12'
-          if ((Test-Path -LiteralPath $zip) -or (Test-Path -LiteralPath $toolRoot)) { throw 'NSIS destination already exists.' }
-          Invoke-WebRequest 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip' -OutFile $zip
+          if ((Test-Path -LiteralPath $zip) -or (Test-Path -LiteralPath $headerPath) -or (Test-Path -LiteralPath $toolRoot)) { throw 'NSIS destination already exists.' }
+          # SourceForge can return HTTP 200 HTML to Invoke-WebRequest. The
+          # independently reproduced curl download follows the official mirror
+          # redirect to the pinned ZIP. Never accept a new digest from a response.
+          $metadata = @(& curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 3000000 --dump-header $headerPath --output $zip --write-out "%{http_code}`n%{content_type}`n%{size_download}" 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip')
+          $downloadExit = $LASTEXITCODE
+          if ($downloadExit -ne 0) { throw "NSIS download failed with curl exit $downloadExit; archive not trusted/extracted." }
+          if ($metadata.Count -ne 3) { throw 'Unexpected curl response metadata; archive not trusted/extracted.' }
+          $length = (Get-Item -LiteralPath $zip).Length
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -cne '56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f') { throw 'NSIS 3.12 archive hash mismatch.' }
+          $stream = [IO.File]::OpenRead($zip)
+          try {
+            $prefix = New-Object byte[] 4
+            $read = $stream.Read($prefix, 0, $prefix.Length)
+            $magic = [BitConverter]::ToString($prefix, 0, $read)
+          } finally { $stream.Dispose() }
+          # Whitelist diagnostic headers. Do not retain cookies, redirect tokens,
+          # or arbitrary server text in uploaded workflow evidence or logs.
+          $safeHeaders = @(Get-Content -LiteralPath $headerPath | Where-Object { $_ -match '^HTTP/|^(Content-Type|Content-Length|Last-Modified|ETag):' } | ForEach-Object {
+            $line = [regex]::Replace($_, '[^\x20-\x7e]', '?')
+            $line.Substring(0, [Math]::Min($line.Length, 512))
+          })
+          $contentType = [regex]::Replace([string]$metadata[1], '[^\x20-\x7e]', '?')
+          $downloadEvidence = [ordered]@{
+            observed_at_utc = [DateTime]::UtcNow.ToString('o'); http_status = [string]$metadata[0]
+            content_type = $contentType; downloaded_bytes = $length; curl_downloaded_bytes = [string]$metadata[2]
+            first_four_bytes_hex = $magic; sha256 = $hash; response_headers = $safeHeaders
+            expected_bytes = 2362938; expected_sha256 = '56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f'
+          }
+          $downloadEvidence | ConvertTo-Json | Tee-Object -FilePath target/hosted-qualification/nsis-download.json
+          if ($metadata[0] -cne '200' -or $contentType -notmatch '^(application/(octet-stream|zip|x-zip-compressed))(;|$)' -or $length -ne 2362938 -or $magic -cne '50-4B-03-04' -or $hash -cne $downloadEvidence.expected_sha256) {
+            throw 'NSIS 3.12 HTTP metadata, ZIP magic, size or hash mismatch; archive not trusted/extracted.'
+          }
           Expand-Archive -LiteralPath $zip -DestinationPath $toolRoot
           $compiler = Join-Path $toolRoot 'nsis-3.12/makensis.exe'
           $version = & $compiler /VERSION
