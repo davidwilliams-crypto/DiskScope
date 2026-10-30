@@ -41,7 +41,10 @@ try {
     $validationNotes = if ([IO.Path]::IsPathRooted($ValidationFile)) { $ValidationFile } else { Join-Path $projectRoot $ValidationFile }
     $performanceNotes = if ([IO.Path]::IsPathRooted($PerformanceFile)) { $PerformanceFile } else { Join-Path $projectRoot $PerformanceFile }
     $packagingNotes = Join-Path $projectRoot 'docs\packaging.md'
-    foreach ($requiredFile in @($portableReadme, $validationNotes, $performanceNotes, $packagingNotes)) {
+    $projectLicense = Join-Path $projectRoot 'LICENSE'
+    $helpdeskRunbook = Join-Path $projectRoot 'docs\helpdesk-runbook.md'
+    $helpdeskQualification = Join-Path $projectRoot 'docs\helpdesk-qualification.md'
+    foreach ($requiredFile in @($portableReadme, $validationNotes, $performanceNotes, $packagingNotes, $projectLicense, $helpdeskRunbook, $helpdeskQualification)) {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) { throw "Required package file is missing: $requiredFile" }
     }
     # Packages are Windows x64. An explicit target overrides build.target while
@@ -105,6 +108,17 @@ try {
     Copy-Item -LiteralPath $validationNotes -Destination (Join-Path $packageRoot 'VALIDATION.md') -Force
     Copy-Item -LiteralPath $performanceNotes -Destination (Join-Path $packageRoot 'PERFORMANCE.md') -Force
     Copy-Item -LiteralPath $packagingNotes -Destination (Join-Path $packageRoot 'packaging.md') -Force
+    Copy-Item -LiteralPath $projectLicense -Destination (Join-Path $packageRoot 'LICENSE') -Force
+    [IO.File]::WriteAllText((Join-Path $packageRoot 'HELP_DESK_RUNBOOK.md'), [IO.File]::ReadAllText($helpdeskRunbook).Replace('(helpdesk-qualification.md)', '(HELP_DESK_QUALIFICATION.md)'), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $packageRoot 'HELP_DESK_QUALIFICATION.md'), [IO.File]::ReadAllText($helpdeskQualification).Replace('(helpdesk-runbook.md)', '(HELP_DESK_RUNBOOK.md)'), [Text.UTF8Encoding]::new($false))
+    # Ship the complete helper dependency set; helpers are not a policy file and
+    # ordinary application launches keep their ordinary behavior.
+    $helpdeskScripts = Join-Path $packageRoot 'helpdesk-tools'
+    Assert-NoReleaseReparsePath $helpdeskScripts
+    New-Item -ItemType Directory -Path $helpdeskScripts -Force | Out-Null
+    foreach ($scriptName in @('invoke-helpdesk.ps1', 'helpdesk-tools.ps1', 'release-tools.ps1', 'verify-release-signatures.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) -Destination (Join-Path $helpdeskScripts $scriptName) -Force
+    }
     $metadataPath = [IO.Path]::GetTempFileName()
     [IO.File]::WriteAllText($metadataPath, ($metadataJson -join "`n"), [Text.UTF8Encoding]::new($false))
     & python (Join-Path $PSScriptRoot 'package-notices.py') $metadataPath $packageRoot $rustRelease $rustCommit

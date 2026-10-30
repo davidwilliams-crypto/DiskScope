@@ -284,6 +284,8 @@ mod tests {
         snapshot.progress.files = 3;
         let scan = ScanRun {
             generation: 1,
+            started_utc_epoch_ms: None,
+            finished_utc_epoch_ms: None,
             snapshot: Arc::new(snapshot),
             timed_out: false,
             first_result_ms: None,

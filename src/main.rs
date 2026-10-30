@@ -24,17 +24,52 @@ fn attach_parent_console() {
 #[cfg(not(windows))]
 fn attach_parent_console() {}
 
+fn startup_error(message: &str, gui: bool, code: i32) -> ! {
+    eprintln!("{message}");
+    #[cfg(all(windows, feature = "gui"))]
+    if gui {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        let message: Vec<u16> = format!("{message}\n\nFor background diagnostics, use --scan PATH --json NEW_REPORT.json. No profile log was written.").encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "DiskScope could not start"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: Both buffers are NUL-terminated and live through the call.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    let _ = gui;
+    std::process::exit(code)
+}
+
 fn main() {
     attach_parent_console();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let command = match cli::parse_args(&arguments) {
         Ok(command) => command,
+        Err(error) => startup_error(
+            &format!("{error}\nUse --help for usage."),
+            false,
+            cli::EXIT_ARGUMENT_ERROR,
+        ),
+    };
+    let gui_command = matches!(&command, Command::Gui(_) | Command::GuiSession { .. });
+    let managed_policy = std::env::current_exe()
+        .map_err(|e| format!("Cannot locate executable for session policy: {e}"))
+        .and_then(|exe| diskscope::session::SessionPolicy::beside_executable(&exe));
+    let managed_policy = match managed_policy {
+        Ok(policy) => policy,
         Err(error) => {
-            eprintln!("{error}\nUse --help for usage.");
-            std::process::exit(cli::EXIT_ARGUMENT_ERROR)
+            startup_error(&error, gui_command, cli::EXIT_ARGUMENT_ERROR);
         }
     };
-    let initial_path = match command {
+    let (initial_path, policy) = match command {
         Command::Help => {
             println!("{}", cli::help_text());
             return;
@@ -43,14 +78,22 @@ fn main() {
             println!("DiskScope {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        Command::Scan(options) => match cli::run_scan_command(&options) {
-            Ok(code) => std::process::exit(code),
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(cli::EXIT_FAILURE)
+        Command::Scan(options) => {
+            if managed_policy.helpdesk && options.backend != diskscope::model::BackendChoice::Normal
+            {
+                eprintln!("Helpdesk policy requires --backend normal");
+                std::process::exit(cli::EXIT_ARGUMENT_ERROR);
             }
-        },
-        Command::Gui(path) => path,
+            match cli::run_scan_command_with_policy(&options, managed_policy) {
+                Ok(code) => std::process::exit(code),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(cli::EXIT_FAILURE)
+                }
+            }
+        }
+        Command::Gui(path) => (path, managed_policy),
+        Command::GuiSession { root, policy } => (root, managed_policy.merge(policy)),
     };
     #[cfg(feature = "gui")]
     {
@@ -65,17 +108,29 @@ fn main() {
             ..Default::default()
         };
         access_mode.configure_native_options(&mut options);
+        app::configure_session_options(policy, &mut options);
         if let Err(error) = eframe::run_native(
             "DiskScope",
             options,
-            Box::new(move |cc| Ok(Box::new(app::DiskScopeApp::new(cc, root, access_mode)))),
+            Box::new(move |cc| {
+                Ok(Box::new(app::DiskScopeApp::new_session(
+                    cc,
+                    root,
+                    access_mode,
+                    policy,
+                )))
+            }),
         ) {
-            eprintln!("DiskScope could not start: {error}");
+            startup_error(
+                &format!("DiskScope could not start: {error}"),
+                true,
+                cli::EXIT_FAILURE,
+            );
         }
     }
     #[cfg(not(feature = "gui"))]
     {
-        let _ = initial_path;
+        let _ = (initial_path, policy);
         eprintln!("Build with the gui feature to launch DiskScope.");
         std::process::exit(cli::EXIT_ARGUMENT_ERROR)
     }

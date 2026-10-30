@@ -11,6 +11,7 @@
 
 use crate::{
     engine::Controller,
+    evidence::{EvidenceContext, Redaction},
     model::{BackendChoice, ScanState, UiSnapshot, ViewMode, ViewRequest},
 };
 use serde_json::{Map, Value, json};
@@ -53,6 +54,11 @@ const ACCOUNTING_NOTE: &str = "Logical bytes count file entries. Unique allocati
 pub enum Command {
     /// Open the window, optionally on a folder.
     Gui(Option<PathBuf>),
+    /// Restricted GUI session; restrictions also merge with the companion policy.
+    GuiSession {
+        root: Option<PathBuf>,
+        policy: crate::session::SessionPolicy,
+    },
     /// Scan without a window and print a JSON report.
     Scan(ScanOptions),
     Help,
@@ -99,6 +105,27 @@ impl ScanOptions {
 
 /// Interprets the executable's arguments (without the program name).
 pub fn parse_args(args: &[OsString]) -> Result<Command, String> {
+    if args
+        .iter()
+        .any(|arg| arg == "--helpdesk" || arg == "--no-history")
+    {
+        let mut policy = crate::session::SessionPolicy::default();
+        let mut root = None;
+        for arg in args {
+            if arg == "--helpdesk" {
+                policy.helpdesk = true;
+            } else if arg == "--no-history" {
+                policy.no_history = true;
+            } else if arg.to_string_lossy().starts_with('-') || root.is_some() {
+                return Err("Use --helpdesk [FOLDER] or --no-history [FOLDER] for a GUI session; --scan is already diagnostic and does not save GUI history".into());
+            } else if arg.is_empty() {
+                return Err("Folder must not be empty".into());
+            } else {
+                root = Some(PathBuf::from(arg));
+            }
+        }
+        return Ok(Command::GuiSession { root, policy });
+    }
     match args {
         [] => return Ok(Command::Gui(None)),
         [only] if only == "--help" => return Ok(Command::Help),
@@ -185,8 +212,14 @@ pub fn help_text() -> String {
     format!(
         "DiskScope {}\n\n\
          DiskScope.exe [FOLDER]\n\
+         DiskScope.exe --helpdesk [FOLDER]\n\
+         DiskScope.exe --no-history [FOLDER]\n\
          DiskScope.exe --scan PATH [--json OUTPUT.json] [--backend normal|ntfs] [--timeout SECONDS]\n\
          DiskScope.exe --help | --version\n\n\
+         Helpdesk mode disables file actions, NTFS preview and profile persistence. \
+         No-history mode disables history, preferences and window-state persistence. \
+         An adjacent diskscope-policy.json can enforce these restrictions. \
+         Explicit report exports still write their chosen destination. \
          Scans are read-only. Directory junctions and links are listed but not followed. \
          NTFS mode requests no elevation and falls back when unavailable. \
          Exit codes: {EXIT_COMPLETE} complete, {EXIT_FAILURE} failure, \
@@ -230,6 +263,8 @@ pub fn exit_code(timed_out: bool, state: ScanState) -> i32 {
 #[derive(Debug)]
 pub struct ScanRun {
     pub generation: u64,
+    pub started_utc_epoch_ms: Option<u64>,
+    pub finished_utc_epoch_ms: Option<u64>,
     /// The newest snapshot of this scan, or an empty one when the timeout fired
     /// before the first publication.
     pub snapshot: Arc<UiSnapshot>,
@@ -279,12 +314,21 @@ impl ScanSource for Controller {
 /// The timing clock starts after the controller is created, started and given
 /// its view request, so setup cost is excluded from the reported wall time.
 pub fn execute_scan(controller: &mut Controller, options: &ScanOptions) -> ScanRun {
-    let generation = controller.start(options.root.clone(), options.backend);
+    execute_scan_limited(controller, options, crate::engine::ScanLimits::default())
+}
+
+pub fn execute_scan_limited(
+    controller: &mut Controller,
+    options: &ScanOptions,
+    limits: crate::engine::ScanLimits,
+) -> ScanRun {
+    let generation = controller.start_limited(options.root.clone(), options.backend, limits);
     controller.request_view(options.view_request());
     wait_for_scan(&*controller, generation, options.timeout)
 }
 
 fn wait_for_scan(source: &impl ScanSource, generation: u64, timeout: Duration) -> ScanRun {
+    let started_utc_epoch_ms = crate::evidence::utc_now_epoch_ms();
     let started = Instant::now();
     let mut latest: Option<Arc<UiSnapshot>> = None;
     let mut first_result_ms = None;
@@ -312,8 +356,21 @@ fn wait_for_scan(source: &impl ScanSource, generation: u64, timeout: Duration) -
         }
         std::thread::sleep(POLL_INTERVAL);
     };
+    let finished_utc_epoch_ms = if !timed_out
+        && latest.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.progress.state,
+                ScanState::Complete | ScanState::Partial | ScanState::Cancelled | ScanState::Failed
+            )
+        }) {
+        crate::evidence::utc_now_epoch_ms()
+    } else {
+        None
+    };
     ScanRun {
         generation,
+        started_utc_epoch_ms,
+        finished_utc_epoch_ms,
         snapshot: latest.unwrap_or_default(),
         timed_out,
         first_result_ms,
@@ -357,44 +414,43 @@ pub fn summary_fields(run: &ScanRun) -> Map<String, Value> {
 
 /// The JSON report written by `--scan`.
 pub fn build_report(root: &Path, run: &ScanRun) -> Value {
+    let mut context = crate::evidence::EvidenceContext::new(root.to_path_buf());
+    context.redaction = crate::evidence::Redaction::Full;
+    context.access_context = match crate::admin::elevation_kind() {
+        Ok(crate::admin::ElevationKind::Standard) => "standard",
+        Ok(crate::admin::ElevationKind::Elevated) => "elevated_split_token",
+        Ok(crate::admin::ElevationKind::AlwaysElevated) => "always_elevated",
+        Err(_) => "unknown",
+    }
+    .into();
+    context.session_context = "cli_read_only_no_gui_history".into();
+    build_report_with_context(root, run, &context)
+}
+
+/// CLI-compatible fields plus the shared bounded evidence envelope. Redaction
+/// applies to both legacy fields and the envelope, including opaque messages.
+pub fn build_report_with_context(
+    root: &Path,
+    run: &ScanRun,
+    context: &crate::evidence::EvidenceContext,
+) -> Value {
+    let mut context = context.clone();
+    context.root = root.to_path_buf();
+    context.timed_out = run.timed_out;
+    context.started_utc_epoch_ms = run.started_utc_epoch_ms;
+    context.finished_utc_epoch_ms = run.finished_utc_epoch_ms;
+    let evidence = crate::evidence::build_report(&run.snapshot, &context);
     let mut report = summary_fields(run);
     report.insert("application".into(), json!("DiskScope"));
     report.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
-    report.insert("root_display".into(), json!(root.to_string_lossy()));
+    report.insert("root_display".into(), evidence["root_display"].clone());
+    report.insert("message".into(), evidence["scan"]["message"].clone());
+    report.insert("backend".into(), evidence["scan"]["backend"].clone());
     report.insert("accounting".into(), json!(ACCOUNTING_NOTE));
-    report.insert("errors".into(), Value::Array(error_entries(run)));
-    report.insert("largest_files".into(), Value::Array(largest_files(run)));
+    report.insert("errors".into(), evidence["errors"].clone());
+    report.insert("largest_files".into(), evidence["rows"].clone());
+    report.insert("evidence".into(), evidence);
     Value::Object(report)
-}
-
-fn error_entries(run: &ScanRun) -> Vec<Value> {
-    run.snapshot
-        .progress
-        .errors
-        .iter()
-        .map(|error| {
-            json!({
-                "path_display": error.path.to_string_lossy(),
-                "message": error.message,
-            })
-        })
-        .collect()
-}
-
-fn largest_files(run: &ScanRun) -> Vec<Value> {
-    run.snapshot
-        .view
-        .rows
-        .iter()
-        .map(|row| {
-            json!({
-                "path_display": row.path.to_string_lossy(),
-                "logical_bytes": row.logical,
-                "allocated_bytes": row.allocated,
-                "hardlink": row.hard_link,
-            })
-        })
-        .collect()
 }
 
 /// Writes `report` as pretty JSON to `destination`, or to stdout (followed by a
@@ -403,10 +459,10 @@ pub fn write_report(
     report: &Value,
     destination: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let encoded = serde_json::to_vec_pretty(report)?;
     match destination {
-        Some(path) => std::fs::write(path, encoded)?,
+        Some(path) => crate::evidence::write_report_new(report, path)?,
         None => {
+            let encoded = serde_json::to_vec_pretty(report)?;
             let mut stdout = std::io::stdout().lock();
             stdout.write_all(&encoded)?;
             stdout.write_all(b"\n")?;
@@ -417,9 +473,42 @@ pub fn write_report(
 
 /// Runs a `--scan` command to completion and returns the process exit code.
 pub fn run_scan_command(options: &ScanOptions) -> Result<i32, Box<dyn std::error::Error>> {
+    run_scan_command_with_policy(options, crate::session::SessionPolicy::default())
+}
+
+pub fn run_scan_command_with_policy(
+    options: &ScanOptions,
+    policy: crate::session::SessionPolicy,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    if policy.helpdesk && options.backend != BackendChoice::Normal {
+        return Err("Helpdesk policy requires the normal backend".into());
+    }
     let mut controller = Controller::new();
-    let run = execute_scan(&mut controller, options);
-    let report = build_report(&options.root, &run);
+    let run = execute_scan_limited(
+        &mut controller,
+        options,
+        if policy.helpdesk {
+            crate::engine::ScanLimits::helpdesk()
+        } else {
+            crate::engine::ScanLimits::default()
+        },
+    );
+    let mut context = EvidenceContext::new(options.root.clone());
+    context.redaction = Redaction::Full;
+    context.access_context = match crate::admin::elevation_kind() {
+        Ok(crate::admin::ElevationKind::Standard) => "standard",
+        Ok(crate::admin::ElevationKind::Elevated) => "administrator",
+        Ok(crate::admin::ElevationKind::AlwaysElevated) => "always-administrator",
+        Err(_) => "unknown",
+    }
+    .into();
+    context.session_context = if policy.helpdesk {
+        "CLI helpdesk diagnostics; normal backend; bounded helpdesk inventory; no automatic profile persistence"
+    } else {
+        "CLI diagnostic scan; no automatic profile persistence"
+    }.into();
+    context.view_request = Some(options.view_request());
+    let report = build_report_with_context(&options.root, &run, &context);
     write_report(&report, options.json.as_deref())?;
     Ok(run.exit_code())
 }
@@ -451,6 +540,18 @@ mod tests {
     ];
 
     // ---- argument parsing -------------------------------------------------
+
+    #[test]
+    fn helpdesk_and_session_only_launches_are_accepted_without_a_scan() {
+        for values in [
+            vec!["--helpdesk"],
+            vec!["--no-history", "C:\\customer data"],
+            vec!["--helpdesk", "--no-history", "D:\\"],
+        ] {
+            assert!(parse_args(&args(&values)).is_ok(), "{values:?}");
+        }
+        assert!(parse_args(&args(&["--helpdesk", "--scan", "C:\\"])).is_err());
+    }
 
     #[test]
     fn scan_and_output_paths_remain_os_paths() {
@@ -616,17 +717,22 @@ mod tests {
 
     #[test]
     fn help_text_is_stable_and_lists_every_exit_code() {
-        let expected = format!(
-            "DiskScope {}\n\n\
-             DiskScope.exe [FOLDER]\n\
-             DiskScope.exe --scan PATH [--json OUTPUT.json] [--backend normal|ntfs] [--timeout SECONDS]\n\
-             DiskScope.exe --help | --version\n\n\
-             Scans are read-only. Directory junctions and links are listed but not followed. \
-             NTFS mode requests no elevation and falls back when unavailable. \
-             Exit codes: 0 complete, 1 failure, 2 argument error, 3 timeout, 4 partial results.",
-            env!("CARGO_PKG_VERSION")
-        );
-        assert_eq!(help_text(), expected);
+        let text = help_text();
+        for required in [
+            "--helpdesk [FOLDER]",
+            "--no-history [FOLDER]",
+            "--scan PATH",
+            "--json OUTPUT.json",
+            "--backend normal|ntfs",
+            "--timeout SECONDS",
+            "--help | --version",
+            "diskscope-policy.json",
+            "profile persistence",
+            "Explicit report exports still write",
+            "Exit codes: 0 complete, 1 failure, 2 argument error, 3 timeout, 4 partial results.",
+        ] {
+            assert!(text.contains(required), "Help omitted {required}");
+        }
     }
 
     #[test]
@@ -775,6 +881,8 @@ mod tests {
         snapshot.progress.errors_total = errors_total;
         ScanRun {
             generation: 1,
+            started_utc_epoch_ms: None,
+            finished_utc_epoch_ms: None,
             snapshot: Arc::new(snapshot),
             timed_out,
             first_result_ms: Some(1.5),
@@ -808,6 +916,7 @@ mod tests {
                 "complete",
                 "errors",
                 "errors_total",
+                "evidence",
                 "files",
                 "first_result_ms",
                 "folders",
@@ -853,6 +962,8 @@ mod tests {
         }];
         let run = ScanRun {
             generation: 1,
+            started_utc_epoch_ms: None,
+            finished_utc_epoch_ms: None,
             snapshot: Arc::new(snapshot),
             timed_out: false,
             first_result_ms: None,
@@ -864,6 +975,68 @@ mod tests {
         assert_eq!(report["largest_files"], json!([]));
         assert_eq!(report["first_result_ms"], Value::Null);
         assert_eq!(report["complete"], false);
+    }
+
+    #[test]
+    fn cli_report_adds_evidence_without_claiming_an_inventory_export() {
+        let report = build_report(Path::new("r"), &finished(ScanState::Complete, 0, false));
+        assert_eq!(report["evidence"]["schema_version"], 1);
+        assert_eq!(report["evidence"]["coverage"]["scan_complete"], true);
+        assert_eq!(
+            report["evidence"]["coverage"]["full_inventory_export"],
+            false
+        );
+        assert_eq!(report["evidence"]["privacy"]["path_mode"], "full");
+        assert!(
+            report["evidence"]["timestamps"]["generated_utc_epoch_ms"]
+                .as_u64()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cli_observes_start_and_terminal_utc_without_inventing_timeout_completion() {
+        let source = ScriptedSource::new(vec![snapshot(1, ScanState::Complete, 1, 1)]);
+        let run = wait_for_scan(&source, 1, Duration::from_secs(30));
+        assert!(run.started_utc_epoch_ms.is_some());
+        assert!(run.finished_utc_epoch_ms.is_some());
+        let report = build_report(Path::new("r"), &run);
+        assert_eq!(
+            report["evidence"]["timestamps"]["started_utc_epoch_ms"],
+            json!(run.started_utc_epoch_ms)
+        );
+        assert_eq!(
+            report["evidence"]["timestamps"]["finished_utc_epoch_ms"],
+            json!(run.finished_utc_epoch_ms)
+        );
+        let timed_out = wait_for_scan(&ScriptedSource::new(vec![]), 1, TEST_TIMEOUT);
+        assert!(timed_out.started_utc_epoch_ms.is_some());
+        assert_eq!(timed_out.finished_utc_epoch_ms, None);
+    }
+
+    #[test]
+    fn redacted_cli_report_cannot_leak_through_legacy_fields() {
+        let mut run = finished(ScanState::Partial, 1, false);
+        let snapshot = Arc::make_mut(&mut run.snapshot);
+        snapshot.progress.message = "private-customer cannot be read".into();
+        snapshot.progress.errors = vec![ScanError {
+            path: "private-customer/denied".into(),
+            message: "private-customer was denied".into(),
+        }];
+        let context = crate::evidence::EvidenceContext::new("private-customer/root".into());
+        let report = build_report_with_context(Path::new("private-customer/root"), &run, &context);
+        assert!(!report.to_string().contains("private-customer"));
+        assert_eq!(report["root_display"], "[redacted]");
+        assert_eq!(report["errors"][0]["message"], "[redacted]");
+    }
+
+    #[test]
+    fn writing_a_report_never_clobbers_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("report.json");
+        fs::write(&path, b"existing incident evidence").unwrap();
+        assert!(write_report(&json!({"replacement":true}), Some(&path)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing incident evidence");
     }
 
     #[test]

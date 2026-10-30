@@ -160,6 +160,18 @@ impl DiskScopeApp {
                     ui.label(self.access_mode.history_message());
                 }
             });
+            ui.menu_button(
+                if self.session_policy.helpdesk {
+                    "Helpdesk & evidence"
+                } else {
+                    "Session & evidence"
+                },
+                |ui| {
+                    ui.label(self.session_policy.label());
+                    ui.label(self.persistence_message());
+                    self.evidence_controls(ui);
+                },
+            );
         });
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 240.0).max(80.0);

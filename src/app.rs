@@ -5,12 +5,14 @@ mod management;
 mod native;
 mod outcome;
 mod state;
+mod support;
 #[cfg(test)]
 mod test_support;
 mod ux;
 
 use crate::theme::{Palette, TextScale, Theme, load_system_font};
 use controls::{date_label, date_time_label};
+use diskscope::session::SessionPolicy;
 use diskscope::{
     engine::Controller,
     history::{self as scan_history, HistoryService, HistorySnapshot},
@@ -36,6 +38,16 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+pub(crate) fn configure_session_options(
+    policy: SessionPolicy,
+    options: &mut eframe::NativeOptions,
+) {
+    if !policy.persistence_allowed() {
+        options.persistence_path = Some(PathBuf::from(r"\\.\NUL"));
+        options.persist_window = false;
+    }
+}
 
 const PAGE_SIZE: usize = 256;
 const PREFERENCES_KEY: &str = "diskscope.preferences.v1";
@@ -153,6 +165,8 @@ struct Preferences {
     reduced_motion: bool,
 }
 enum NativeResult {
+    ExportDestination(Option<PathBuf>),
+    Export(Result<PathBuf, String>),
     Locations(Vec<native::Location>),
     Folder(Option<PathBuf>),
     Reveal(Result<(), String>),
@@ -179,6 +193,14 @@ enum Action {
 }
 
 pub struct DiskScopeApp {
+    session_policy: SessionPolicy,
+    scan_started_utc: Option<u64>,
+    scan_finished_utc: Option<u64>,
+    export_open: bool,
+    export_redacted: bool,
+    export_path: String,
+    export_busy: bool,
+    export_native_path: Option<PathBuf>,
     access_mode: AccessMode,
     management: management::Management,
     controller: Controller,
@@ -234,25 +256,45 @@ pub struct DiskScopeApp {
     notice: Option<String>,
 }
 impl DiskScopeApp {
-    pub fn new(
+    pub fn new_session(
         cc: &eframe::CreationContext<'_>,
         initial_path: Option<PathBuf>,
         access_mode: AccessMode,
+        policy: SessionPolicy,
     ) -> Self {
-        Self::with_history_directory(
+        Self::with_session_directory(
             cc,
             initial_path,
             scan_history::default_directory(),
             access_mode,
+            policy,
         )
     }
+    #[cfg(test)]
     fn with_history_directory(
         cc: &eframe::CreationContext<'_>,
         initial_path: Option<PathBuf>,
         history_directory: PathBuf,
         access_mode: AccessMode,
     ) -> Self {
-        let preferences = if access_mode.persistence_allowed() {
+        Self::with_session_directory(
+            cc,
+            initial_path,
+            history_directory,
+            access_mode,
+            SessionPolicy::default(),
+        )
+    }
+    fn with_session_directory(
+        cc: &eframe::CreationContext<'_>,
+        initial_path: Option<PathBuf>,
+        history_directory: PathBuf,
+        access_mode: AccessMode,
+        session_policy: SessionPolicy,
+    ) -> Self {
+        let persistence_allowed =
+            access_mode.persistence_allowed() && session_policy.persistence_allowed();
+        let preferences = if persistence_allowed {
             cc.storage
                 .and_then(|s| s.get_string(PREFERENCES_KEY))
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -264,17 +306,29 @@ impl DiskScopeApp {
         native::discover_locations(native_tx.clone());
         let snapshot = Arc::new(UiSnapshot::default());
         let volume_tx = native::volume_worker(native_tx.clone());
-        let history_service = if access_mode.persistence_allowed() {
+        let history_service = if persistence_allowed {
             HistoryService::new(history_directory.clone())
         } else {
-            HistoryService::unavailable(access_mode.history_message())
+            HistoryService::unavailable(if !session_policy.persistence_allowed() {
+                session_policy.label()
+            } else {
+                access_mode.history_message()
+            })
         };
-        let controller = if access_mode.persistence_allowed() {
+        let controller = if persistence_allowed {
             Controller::with_history(history_service.capture())
         } else {
             Controller::new()
         };
         let mut app = Self {
+            session_policy,
+            scan_started_utc: None,
+            scan_finished_utc: None,
+            export_open: false,
+            export_redacted: true,
+            export_path: String::new(),
+            export_busy: false,
+            export_native_path: None,
             access_mode,
             management: management::Management::default(),
             controller,
@@ -336,6 +390,16 @@ impl DiskScopeApp {
         }
         app
     }
+    fn persistence_allowed(&self) -> bool {
+        self.access_mode.persistence_allowed() && self.session_policy.persistence_allowed()
+    }
+    fn persistence_message(&self) -> &'static str {
+        if !self.session_policy.persistence_allowed() {
+            self.session_policy.label()
+        } else {
+            self.access_mode.history_message()
+        }
+    }
     /// Starts a new scan from the top: Overview at the scan root, no history.
     fn begin_scan(&mut self, path: PathBuf) {
         self.start_scan(path, None);
@@ -369,7 +433,7 @@ impl DiskScopeApp {
             self.action_review = None;
         }
         self.root_path = path;
-        if self.access_mode.persistence_allowed() {
+        if self.persistence_allowed() {
             self.preferences
                 .recent_locations
                 .retain(|p| p != &self.root_path);
@@ -407,14 +471,21 @@ impl DiskScopeApp {
         self.pending = None;
         self.changes = false;
         self.notice = None;
-        self.generation = self.controller.start(
+        self.generation = self.controller.start_limited(
             self.root_path.clone(),
-            if self.preferences.ntfs_preview {
+            if self.preferences.ntfs_preview && !self.session_policy.helpdesk {
                 BackendChoice::Ntfs
             } else {
                 BackendChoice::Normal
             },
+            if self.session_policy.helpdesk {
+                diskscope::engine::ScanLimits::helpdesk()
+            } else {
+                diskscope::engine::ScanLimits::default()
+            },
         );
+        self.scan_started_utc = diskscope::evidence::utc_now_epoch_ms();
+        self.scan_finished_utc = None;
         self.volume = None;
         self.volume_observed_at = None;
         let _ = self
@@ -470,6 +541,23 @@ impl DiskScopeApp {
                 break;
             };
             match result {
+                NativeResult::ExportDestination(path) => {
+                    self.export_busy = false;
+                    if let Some(path) = path {
+                        self.export_path = path.to_string_lossy().into_owned();
+                        self.export_native_path = Some(path);
+                    }
+                }
+                NativeResult::Export(result) => {
+                    self.export_busy = false;
+                    self.notice = Some(match result {
+                        Ok(path) => format!(
+                            "Evidence exported to {}. Attach it to the correct ticket using your approved process.",
+                            path.display()
+                        ),
+                        Err(error) => format!("Evidence export failed: {error}"),
+                    });
+                }
                 NativeResult::Locations(locations) => self.locations = locations,
                 NativeResult::Folder(path) => {
                     self.picker_open = false;
@@ -516,6 +604,12 @@ impl DiskScopeApp {
             self.history_snapshot = history;
         }
         self.poll_action_review(ctx);
+        if self.generation != 0
+            && !self.snapshot.progress.state.is_active()
+            && self.scan_finished_utc.is_none()
+        {
+            self.scan_finished_utc = diskscope::evidence::utc_now_epoch_ms();
+        }
         ctx.request_repaint_after(Duration::from_millis(
             if self.snapshot.progress.state.is_active()
                 || self.picker_open
@@ -722,7 +816,13 @@ impl DiskScopeApp {
         });
         ui.horizontal_wrapped(|ui| {
             ui.menu_button("Access and permissions", |ui| self.access_controls(ui, p));
+            self.evidence_controls(ui);
         });
+        ui.label(
+            RichText::new(self.session_policy.label())
+                .small()
+                .color(p.muted),
+        );
         if !self.access_mode.persistence_allowed() {
             ui.label(
                 RichText::new(self.access_mode.history_message())
@@ -1876,12 +1976,13 @@ impl eframe::App for DiskScopeApp {
             self.settings_window(&ctx, p);
             self.help_window(&ctx, p);
             self.comparison_window(&ctx, p);
+            self.export_window(&ctx);
         }
         self.management_dialog(&ctx, p);
         self.submit_view();
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if !self.access_mode.persistence_allowed() {
+        if !self.persistence_allowed() {
             return;
         }
         if let Ok(json) = serde_json::to_string(&self.preferences) {
@@ -1889,7 +1990,7 @@ impl eframe::App for DiskScopeApp {
         }
     }
     fn persist_egui_memory(&self) -> bool {
-        self.access_mode.persistence_allowed()
+        self.persistence_allowed()
     }
 }
 fn overline(ui: &mut egui::Ui, text: &str, p: Palette) {

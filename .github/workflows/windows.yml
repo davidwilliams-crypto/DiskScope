@@ -12,18 +12,22 @@ jobs:
       matrix:
         features: [default, diagnostics, no-gui]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set 1.92.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate
         shell: pwsh
         run: |
-          $featureArgs = switch ('${{ matrix.features }}') {
+          $featureArgs = @(switch ('${{ matrix.features }}') {
             'diagnostics' { @('--features', 'diagnostics') }
             'no-gui' { @('--no-default-features') }
             default { @() }
-          }
+          })
           cargo test --locked @featureArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --locked --all-targets @featureArgs -- -D warnings
@@ -37,14 +41,55 @@ jobs:
           ./scripts/check-rust-floor.ps1
           ./scripts/test-tooling.ps1
           ./scripts/test-release.ps1
+          ./scripts/test-helpdesk-tooling.ps1 -RequireJunction
+          powershell.exe -NoProfile -File ./scripts/test-helpdesk-tooling.ps1 -RequireJunction
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/test-build-artifacts.ps1 -Integration
+      - name: Disposable native action fixtures
+        if: matrix.features == 'default'
+        shell: pwsh
+        run: ./scripts/test-native-fixtures.ps1
+      - name: Actual candidate deployment smoke
+        if: matrix.features == 'default'
+        shell: pwsh
+        run: |
+          . ./scripts/release-tools.ps1
+          $manifest = Join-Path $PWD 'Cargo.toml'
+          $metadataJson = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $rootPackage = @($metadata.packages | Where-Object { $_.manifest_path -ieq $manifest })
+          if ($rootPackage.Count -ne 1) { throw 'Expected one candidate root package.' }
+          $messages = @(cargo build --locked --message-format=json-render-diagnostics)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $artifact = Get-ReleaseCargoArtifact -Messages $messages -PackageId $rootPackage[0].id -ManifestPath $manifest
+          ./scripts/test-helpdesk-tooling.ps1 -RequireJunction -Executable $artifact.executable
+  supply-chain:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned advisory/license checker
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set 1.92.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo install cargo-deny --version 0.20.2 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Locked dependency, advisory, license and source gates
+        shell: pwsh
+        run: ./scripts/check-supply-chain.ps1
   compiler-floor:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.92.0
-          targets: x86_64-pc-windows-msvc
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install declared minimum compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set 1.92.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build locked default GUI on declared minimum
         run: cargo build --release --locked --target x86_64-pc-windows-msvc

@@ -153,7 +153,8 @@ function Assert-ReleasePayload {
         $relative = $file.FullName.Substring($prefix.Length).Replace('\', '/')
         $actual.Add($relative, $file)
     }
-    foreach ($required in @('DiskScope.exe', 'README.txt', 'VALIDATION.md', 'PERFORMANCE.md', 'THIRD_PARTY_NOTICES.md', 'SHA256SUMS.txt')) {
+    foreach ($required in @('DiskScope.exe', 'README.txt', 'LICENSE', 'VALIDATION.md', 'PERFORMANCE.md', 'THIRD_PARTY_NOTICES.md', 'SHA256SUMS.txt', 'HELP_DESK_RUNBOOK.md', 'HELP_DESK_QUALIFICATION.md',
+            'helpdesk-tools/invoke-helpdesk.ps1', 'helpdesk-tools/helpdesk-tools.ps1', 'helpdesk-tools/release-tools.ps1', 'helpdesk-tools/verify-release-signatures.ps1')) {
         if (-not $actual.ContainsKey($required)) { throw "Required payload file missing: $required" }
     }
     if (-not @($actual.Keys | Where-Object { $_ -like 'licenses/*' }).Count) { throw 'Dependency license files are missing.' }

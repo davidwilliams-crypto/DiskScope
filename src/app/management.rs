@@ -232,8 +232,8 @@ enum Operation {
 }
 
 const RESCAN_LINE: &str = "\n\nDiskScope is rescanning so the list matches the drive.";
-const RECYCLE_CONFIRMATION_CHECKED: &str = "Windows will move this file to the Recycle Bin. DiskScope checked this drive's Recycle Bin settings and the file size first, but Windows makes the final decision. If Windows asks whether to delete the file permanently instead, choose No.";
-const RECYCLE_CONFIRMATION_UNVERIFIED: &str = "Windows will move this file to the Recycle Bin. DiskScope could not fully check this drive's Recycle Bin settings, so Windows alone decides. If Windows asks whether to delete the file permanently instead, choose No.";
+const RECYCLE_CONFIRMATION_CHECKED: &str = "DiskScope will request that Windows move this file to the Recycle Bin. DiskScope checked this drive's Recycle Bin settings and the file size first, but Windows makes the final decision. Recycling is not guaranteed. If Windows asks whether to delete the file permanently instead, choose No.";
+const RECYCLE_CONFIRMATION_UNVERIFIED: &str = "DiskScope will request that Windows move this file to the Recycle Bin. DiskScope could not fully check this drive's Recycle Bin settings, so Windows alone decides. Recycling is not guaranteed. If Windows asks whether to delete the file permanently instead, choose No.";
 
 fn recycle_confirmation(verdict: RecycleVerdict) -> &'static str {
     if verdict == RecycleVerdict::Unverified {
@@ -402,6 +402,11 @@ impl Management {
 
 impl DiskScopeApp {
     fn action_unavailable(&self, row: &Row, action: FileAction) -> Option<&'static str> {
+        if !self.session_policy.file_actions_allowed() {
+            return Some(
+                "Helpdesk diagnostic policy disables all file removal. Use your approved cleanup procedure.",
+            );
+        }
         unavailable(
             &self.access_mode,
             action,
@@ -433,7 +438,9 @@ impl DiskScopeApp {
         if !self.access_mode.is_administrator()
             && ui
                 .add_enabled(
-                    !self.management.busy() && !self.picker_open,
+                    !self.management.busy()
+                        && !self.picker_open
+                        && self.session_policy == SessionPolicy::default(),
                     egui::Button::new("Restart as administrator…").small(),
                 )
                 .clicked()
@@ -443,7 +450,14 @@ impl DiskScopeApp {
     }
 
     fn restart_as_administrator(&mut self, ctx: &egui::Context) {
-        if self.management.busy() || self.picker_open || self.access_mode.is_administrator() {
+        if self.management.busy()
+            || self.picker_open
+            || self.access_mode.is_administrator()
+            || self.session_policy != SessionPolicy::default()
+        {
+            if self.session_policy != SessionPolicy::default() {
+                self.notice = Some("To retain this session's restrictions, launch DiskScope as administrator with the same --helpdesk or --no-history switch. Elevated windows never save profile data.".into());
+            }
             return;
         }
         self.management.elevating = true;
@@ -692,6 +706,10 @@ impl DiskScopeApp {
     }
 
     fn execute_confirmed(&mut self, confirmation: Confirmation, ctx: &egui::Context) {
+        if !self.session_policy.file_actions_allowed() {
+            self.notice = Some("Helpdesk diagnostic policy refused file removal.".into());
+            return;
+        }
         let Confirmation {
             binding,
             plan,
@@ -1042,6 +1060,82 @@ mod tests {
         };
         let _ = ctx.run_ui(input, |ui| app.file_action_keyboard(ui.ctx()));
         assert!(!app.management.busy());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helpdesk_refuses_a_previously_prepared_permanent_confirmation_at_commit() {
+        let (_fixture, mut app, row) = browsing_in_a_nested_folder();
+        let before = std::fs::read(&row.path).unwrap();
+        let plan = file_actions::prepare(
+            &row.path,
+            row.identity.as_ref().unwrap(),
+            row.logical,
+            row.modified,
+        )
+        .unwrap();
+        let binding = Binding {
+            sequence: 1,
+            generation: app.generation,
+            node: row.id,
+            root: app.root_path.clone(),
+            path: row.path.clone(),
+            action: FileAction::Permanent,
+        };
+        app.request.selected = Some(row.id);
+        app.session_policy = SessionPolicy {
+            helpdesk: true,
+            no_history: true,
+        };
+        app.execute_confirmed(
+            Confirmation {
+                binding,
+                plan,
+                acknowledged: true,
+                typed: "DELETE".into(),
+                focus_cancel: false,
+            },
+            &egui::Context::default(),
+        );
+        assert!(!app.management.busy());
+        assert_eq!(std::fs::read(&row.path).unwrap(), before);
+        assert!(app.notice.as_deref().unwrap().contains("refused"));
+    }
+
+    #[test]
+    fn helpdesk_policy_refuses_buttons_keyboard_preparation_and_elevation() {
+        let mut app = keyboard_app();
+        app.session_policy = SessionPolicy {
+            helpdesk: true,
+            no_history: true,
+        };
+        let row = app.visible.view.selected.as_ref().unwrap().clone();
+        let ctx = egui::Context::default();
+        for action in [FileAction::Recycle, FileAction::Permanent] {
+            assert!(
+                app.action_unavailable(&row, action)
+                    .unwrap()
+                    .contains("Helpdesk")
+            );
+            app.prepare_file_action(row.clone(), action, &ctx);
+            assert!(!app.management.busy());
+        }
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                modifiers: egui::Modifiers::SHIFT,
+                events: vec![egui::Event::Cut],
+                ..Default::default()
+            },
+            |ui| app.file_action_keyboard(ui.ctx()),
+        );
+        assert!(!app.management.busy());
+        app.restart_as_administrator(&ctx);
+        assert!(!app.management.elevating);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("restrictions"))
+        );
     }
 
     #[test]
@@ -1752,7 +1846,9 @@ mod tests {
     #[test]
     fn actual_token_probe_fails_closed_and_privileged_sessions_do_not_persist() {
         assert_eq!(AccessMode::from_probe(Ok(false)), AccessMode::Standard);
-        assert_eq!(AccessMode::from_probe(Ok(true)), AccessMode::Admin);
+        let elevated = AccessMode::from_probe(Ok(true));
+        assert!(elevated.is_administrator());
+        assert!(!elevated.persistence_allowed());
         assert_eq!(
             AccessMode::from_probe(Err("probe failed".into())),
             AccessMode::Unknown("probe failed".into())

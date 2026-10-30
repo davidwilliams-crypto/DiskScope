@@ -253,7 +253,7 @@ impl DiskScopeApp {
             has_selection: selected.is_some(),
             selection_pinned: selected.is_some_and(|id| self.request.pinned.contains(&id)),
             pins_full: self.request.pinned.len() >= MAX_PINS,
-            history_saved: self.access_mode.persistence_allowed(),
+            history_saved: self.persistence_allowed(),
             on_changes_page: self.changes,
         }
     }
@@ -315,6 +315,7 @@ impl DiskScopeApp {
             ("Appearance & settings", self.settings_open),
             ("Keyboard help", self.help_open),
             ("Pinned comparison", self.comparison_open),
+            ("Export investigation evidence", self.export_open),
         ];
         // Let egui dismiss an open menu/ComboBox before its owning window.
         if !egui::Popup::is_any_open(ctx)
@@ -348,6 +349,7 @@ impl DiskScopeApp {
                     3 => self.settings_open = false,
                     4 => self.help_open = false,
                     5 => self.comparison_open = false,
+                    6 => self.export_open = false,
                     _ => unreachable!(),
                 }
                 restore_dialog_focus(ctx, dialogs[index].0);
@@ -471,7 +473,7 @@ impl DiskScopeApp {
                 ui.checkbox(&mut self.preferences.map_focus, "Give the map more room");
                 ui.add_space(12.0);
                 overline(ui, "SCANNING", p);
-                ui.checkbox(&mut self.preferences.ntfs_preview, "NTFS preview acceleration")
+                ui.add_enabled(!self.session_policy.helpdesk, egui::Checkbox::new(&mut self.preferences.ntfs_preview, "NTFS preview acceleration"))
                     .on_hover_text(
                         "Experimental. Unsupported cases fall back to the normal folder scan.",
                     );
@@ -479,12 +481,20 @@ impl DiskScopeApp {
                 overline(ui, "WINDOWS ACCESS", p);
                 self.access_controls(ui, p);
                 ui.label(
-                    RichText::new(self.access_mode.history_message())
+                    RichText::new(self.persistence_message())
                         .small()
                         .color(p.muted),
                 );
                 if let Some(note) = self.access_mode.settings_note() {
                     ui.label(RichText::new(note).small().color(p.muted));
+                }
+                ui.label(self.session_policy.label());
+                if self.persistence_allowed() {
+                    ui.label(format!("History location: {}", self.history_directory.display()));
+                    ui.label("For a session without saved metadata, close this window and launch with --no-history. For helpdesk diagnostics, launch with --helpdesk.");
+                }
+                if self.session_policy != SessionPolicy::default() {
+                    ui.label("For elevated diagnostics, launch as administrator with the same session switch. In-app relaunch is disabled to preserve restrictions.");
                 }
                 ui.label(
                     RichText::new(

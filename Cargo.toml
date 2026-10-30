@@ -1,10 +1,11 @@
 [package]
 name = "diskscope"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 # Locked Windows GUI dependency floor (eframe/egui 0.34.3).
 rust-version = "1.92"
 description = "A responsive native Windows disk usage analyzer"
+license = "MIT"
 
 [features]
 default = ["gui"]
@@ -15,6 +16,7 @@ diagnostics = []
 crossbeam-channel = "0.5.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"], optional = true }
 egui_extras = { version = "0.34.3", optional = true }
 rfd = { version = "0.15.4", optional = true }

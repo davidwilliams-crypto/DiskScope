@@ -1,0 +1,29 @@
+{
+  "component": "Rust Standard Library",
+  "version": "1.92.0",
+  "license": "MIT OR Apache-2.0; exceptions and third-party notices are in COPYRIGHT-library.html",
+  "rustc_commit": "ded5c06cf21d2b93bffd5d884aa6e96934ee4234",
+  "target": "x86_64-pc-windows-msvc",
+  "installed_manifest_sha256": "d07838bdc65828621960baeb078220c8dd893929105efeb3614d8fdcb0aabebc",
+  "distribution_date": "2025-12-11",
+  "distribution_archives": {
+    "rustc": {
+      "source_url": "https://static.rust-lang.org/dist/2025-12-11/rustc-1.92.0-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "6aec5aba5384ce1041538e71ebebf671d82e29f4fe697bc7844626d94b0dbfe6"
+    },
+    "rust-std": {
+      "source_url": "https://static.rust-lang.org/dist/2025-12-11/rust-std-1.92.0-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "b4e53a9c9b96a1a0618364791b7728a1c8978101ec6d1ee78fe930e1ef061994"
+    }
+  },
+  "files": [
+    {
+      "file": "COPYRIGHT-library.html",
+      "source_url": "https://static.rust-lang.org/dist/2025-12-11/rustc-1.92.0-x86_64-pc-windows-msvc.tar.xz",
+      "installed_relative_path": "share/doc/rust/COPYRIGHT-library.html",
+      "source_type": "complete unmodified installed Rust standard-library copyright HTML from the pinned toolchain",
+      "sha256": "c90d52b09be83ce6e930d00f4b26559611eadcee806b2307184e04f2c78ad522",
+      "installer_manifest": "lib/rustlib/manifest-rustc-x86_64-pc-windows-msvc: file:share/doc/rust/COPYRIGHT-library.html"
+    }
+  ]
+}

@@ -170,7 +170,7 @@ impl DiskScopeApp {
                 }
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     ui.label(
-                        RichText::new(if self.access_mode.persistence_allowed() {
+                        RichText::new(if self.persistence_allowed() {
                             "Metadata-only history"
                         } else {
                             "History not saved"
@@ -200,7 +200,7 @@ impl DiskScopeApp {
                 overline(ui, "START A SCAN", p);
                 ui.add_space(8.0);
                 ui.label(RichText::new("See where your space goes.").size(30.0).strong());
-                ui.label(RichText::new("Choose a drive or folder. Find the largest items, explore the map, and compare scans over time.").color(p.muted));
+                ui.label(RichText::new(if self.persistence_allowed() {"Choose a drive or folder. Find the largest items, explore the map, and compare scans over time."} else {"Choose a folder, identify the largest items, and export evidence for your ticket. This session does not save comparison history."}).color(p.muted));
                 ui.add_space(18.0);
                 if ui.add_enabled(!self.picker_open, egui::Button::new(
                     RichText::new("Choose a folder…").strong().color(self.preferences.theme.on_accent())
@@ -225,14 +225,14 @@ impl DiskScopeApp {
                 for (title, description) in [
                     ("01  Scan", "Read file sizes and dates without opening file contents."),
                     ("02  Explore", "Open folders in the map or jump to Largest files."),
-                    ("03  Compare", "Use Changes to compare saved scans of the same folder."),
+                    if self.persistence_allowed() {("03  Compare", "Use Changes to compare saved scans of the same folder.")} else {("03  Evidence", "Export a redacted summary for your ticket. Saved comparisons are unavailable in this session.")},
                 ] {
                     ui.add_space(8.0);
                     ui.label(RichText::new(title).strong());
                     ui.label(RichText::new(description).color(p.muted));
                 }
                 ui.add_space(14.0);
-                ui.label(RichText::new("Scanning does not delete files. File actions always require confirmation.").small().color(p.muted));
+                ui.label(RichText::new(if self.session_policy.helpdesk {"Helpdesk diagnostic policy disables file removal. Use your approved cleanup procedure."} else {"Scanning does not delete files. File actions always require confirmation."}).small().color(p.muted));
             });
         });
     }
@@ -334,7 +334,7 @@ impl DiskScopeApp {
                     }
                 } else {
                     ui.label(
-                        RichText::new(if self.access_mode.persistence_allowed() {
+                        RichText::new(if self.persistence_allowed() {
                             "No earlier complete scan of this folder yet."
                         } else {
                             "Scan history is unavailable in this window."

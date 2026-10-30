@@ -10,14 +10,14 @@ impl DiskScopeApp {
         self.mark_query_changed();
     }
     pub(super) fn changes_page(&mut self, ui: &mut egui::Ui, p: Palette) {
-        if !self.access_mode.persistence_allowed() {
+        if !self.persistence_allowed() {
             ui.add_space(18.0);
             ui.label(
                 RichText::new("Scan history is unavailable in this window")
                     .size(22.0)
                     .strong(),
             );
-            ui.label(RichText::new(self.access_mode.history_message()).color(p.muted));
+            ui.label(RichText::new(self.persistence_message()).color(p.muted));
             return;
         }
         let history = self.history_snapshot.clone();
@@ -155,6 +155,16 @@ impl DiskScopeApp {
                 };
                 ui.label(format!("{role} · {} · {} · {}", date_time_label(scan.finished_unix), format_bytes(scan.logical), scan.backend));
             }
+            ui.horizontal_wrapped(|ui| {
+                if let Some(id) = history.protected_baseline {
+                    ui.label(format!("Protected incident baseline: {id}"));
+                    if ui.add_enabled(!history.busy, egui::Button::new("Release baseline protection")).clicked() {
+                        self.history_service.unprotect_baseline();
+                    }
+                } else if ui.add_enabled(!history.busy && self.older_scan.is_some(), egui::Button::new("Protect Before baseline from retention")).clicked()
+                    && let Some(id) = self.older_scan
+                { self.history_service.protect_baseline(id); }
+            });
             if let Ok((older, newer)) = state::comparison_pair(&history.scans, &root, self.older_scan, self.newer_scan) {
                 let a = history.scans.iter().find(|s| s.id == older).unwrap();
                 let b = history.scans.iter().find(|s| s.id == newer).unwrap();
@@ -302,12 +312,25 @@ impl DiskScopeApp {
         }
     }
     fn history_storage_section(&mut self, ui: &mut egui::Ui, p: Palette) {
+        // Catalog load can fail before a protected id is known. Recovery must
+        // stay reachable then, without making Clear the only available route.
+        if ui
+            .add_enabled(
+                !self.history_snapshot.busy,
+                egui::Button::new("Release or repair baseline protection"),
+            )
+            .clicked()
+        {
+            self.history_service.unprotect_baseline();
+        }
+        ui.label("Repair releases protection and reloads history without clearing saved scans. Use it when protection metadata cannot be read. Explicit Clear below removes saved history.");
         ui.collapsing("Local history & storage", |ui| {
             ui.label(format!(
                 "{} most recent complete scans across all roots · oldest saved scans are removed automatically · metadata only · stored at the location below",
                 scan_history::MAX_SNAPSHOTS
             ));
             ui.label(self.history_directory.to_string_lossy());
+            ui.label("History is for focused folder investigations: at most 1,000,000 nodes per snapshot. Whole-drive scans may be too large to save. Export evidence before closing; export is a bounded summary, not a restorable full inventory. One protected baseline survives automatic retention; explicit Clear removes it.");
             ui.label(
                 RichText::new(format!(
                     "Up to {} and {} items per snapshot; {} disk budget including staging. Oversized scans are skipped with an explanation.",

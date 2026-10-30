@@ -1,14 +1,24 @@
 # DiskScope
 
-A native Windows disk usage analyzer written in Rust with egui/eframe. The **0.3.1 preview** adds reliability fixes, a compact investigation workspace, compatible scan-history comparisons, and verified file-action outcomes. The original implementation was informed by a focused REA investigation of WinDirStat 2.9.3.
+A native Windows disk usage analyzer written in Rust with egui/eframe. The **0.3.2 preview** adds enforced helpdesk diagnostics, private sessions, redacted ticket evidence, protected history baselines, resource admission limits and verified deployment helpers. The original implementation was informed by a focused REA investigation of WinDirStat 2.9.3.
 
 ## Run
 
-Download the [Windows x64 installer](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.1/DiskScope-0.3.1-windows-x64-setup.exe) or [portable ZIP](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.1/DiskScope-0.3.1-windows-x64-portable.zip) from the [0.3.1 preview release](https://github.com/davidwilliams-crypto/DiskScope/releases/tag/v0.3.1). Install the setup executable, or extract the entire ZIP and open `DiskScope.exe`. Both contain the same application. Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable graphics driver are required; a separate Visual C++ runtime installation is not needed. The builds are unsigned; Windows may display a publisher or SmartScreen prompt.
+Download the [Windows x64 installer](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.2/DiskScope-0.3.2-windows-x64-setup.exe) or [portable ZIP](https://github.com/davidwilliams-crypto/DiskScope/releases/download/v0.3.2/DiskScope-0.3.2-windows-x64-portable.zip) from the [0.3.2 preview release](https://github.com/davidwilliams-crypto/DiskScope/releases/tag/v0.3.2). Install the setup executable, or extract the entire ZIP and open `DiskScope.exe`. Both contain the same application. Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable graphics driver are required; a separate Visual C++ runtime installation is not needed. The builds are unsigned; Windows may display a publisher or SmartScreen prompt.
 
 Setup installs for the current Windows account, offers Start menu and desktop shortcuts, and registers an uninstaller. Uninstall preserves scan history, preferences, and unrelated files. The portable version requires no installation; it still saves history and preferences in your Windows profile. See [packaging and verification](docs/packaging.md) for build commands and package details.
 
-Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.1/DiskScope.exe`.
+Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.2/DiskScope.exe`.
+
+## Helpdesk preview
+
+Start with `DiskScope.exe --helpdesk [FOLDER]`, or the supplied hash-checked deployment wrapper. Helpdesk mode enforces the normal backend, disables file removal and automatic history/preferences/window-state persistence, and uses bounded inventory admission. `--no-history [FOLDER]` disables persistence while retaining ordinary interactive capabilities. An adjacent `diskscope-policy.json` can enforce restrictions; invalid policies fail closed. Explicit report exports still write their destination.
+
+GUI ticket export defaults to redaction and refuses existing files. Reports contain bounded visible rows and explicit coverage; they are not a full inventory or a restorable baseline. Ordinary history retains the existing one-million-node/128 MiB snapshot limits, adds a 256 MiB free-space reserve, and supports one protected incident baseline within its five-snapshot cap.
+
+Use the [technician runbook](docs/helpdesk-runbook.md), [real-world testing checklist](docs/helpdesk-qualification.md), [deployment instructions](docs/deployment-0.3.2.md) and [0.3.2 validation](docs/validation-helpdesk-hardening-2026-10-30.md). This unsigned preview is for controlled qualification. Real ScreenConnect, Narrator, fleet/resource, native-policy and clean-VM installer qualification remain pending. A plain GUI launch retains ordinary file actions; confirm helpdesk mode before a pilot scan.
+
+## Investigation features
 
 - Overview with factual folder/type insights and real volume capacity when available.
 - Connected investigation workspace with explicit scanned location, coverage, draft-path distinction, compact navigation and a keyboard-operable file list at larger text sizes.
@@ -53,14 +63,14 @@ The optional `scripts/dev.ps1` helper uses the project-local toolchain under the
 .\scripts\dev.ps1 -CargoArgs @('build','--release','--locked')
 ```
 
-`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.1`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
+`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.2`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.92.0 or 1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
 
 `scripts/package-release.ps1 -Offline` builds the application, installer, and portable ZIP; NSIS 3.12 is additionally required. Use `-SkipBuild` only to package an already built, checksum-verified portable directory. The Windows x64 target uses static CRT linking through `.cargo/config.toml`.
 
 ## Repeatable command-line scans
 
 ```powershell
-$p = Start-Process .\dist\0.3.1\DiskScope.exe -ArgumentList '--scan "C:\some folder" --json "D:\scan.json" --backend normal' -PassThru -Wait
+$p = Start-Process .\dist\0.3.2\DiskScope.exe -ArgumentList '--scan "C:\some folder" --json "D:\scan.json" --backend normal' -PassThru -Wait
 $p.ExitCode
 ```
 
@@ -70,4 +80,4 @@ The executable uses the Windows GUI subsystem; use `Start-Process -Wait` when au
 
 See [reliability and investigation UX validation](docs/validation-investigation-ux-2026-10-30.md), the [27 October 2026 360 review](docs/review-360-2026-10-27.md), [Recycle Bin hardening](docs/validation-recycle-bin-hardening.md) (automated Windows fixtures now pass; the manual hardware/policy matrix remains pending), [360-review fixes and validation](docs/validation-360-fixes.md), [0.3.0 validation](docs/validation-0.3.0.md), [RAM analysis](docs/memory-2026-10-26.md), [0.2.1 validation](docs/validation-0.2.1.md), the [C-drive investigation](docs/performance-c-drive-2026-10-26.md), [0.2 UI validation](docs/validation-0.2.md) and the [earlier 0.1 measurements](docs/validation.md) for commands and coverage. Native keyboard/UI Automation/renderer checks do not establish a full Narrator qualification or measured novice/expert usability improvement. Timing a small cached folder or a UI callback does not establish full-drive scan speed or end-to-end input latency. No general claim that DiskScope is faster than WinDirStat is made.
 
-The application uses original Rust source and interface assets. Local research captures, raw scan reports, toolchains, and build outputs are excluded from this repository. Third-party dependency notices accompany the packages. A distribution license for this project's own source has not been selected.
+The application uses original Rust source and interface assets. Local research captures, raw scan reports, toolchains, and build outputs are excluded from this repository. Third-party dependency notices accompany the packages. The project is licensed under [MIT](LICENSE); third-party licenses and notices remain applicable.

@@ -26,6 +26,30 @@ const IDLE_WAIT: Duration = Duration::from_millis(1000);
 /// a publication that cannot proceed never turns the loop into a spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+/// Admission limits for the normal in-memory inventory. Estimated bytes are
+/// deliberately conservative accounting, not a guarantee of process peak RAM.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanLimits {
+    pub max_nodes: usize,
+    pub max_estimated_bytes: usize,
+}
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 5_000_000,
+            max_estimated_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+impl ScanLimits {
+    pub fn helpdesk() -> Self {
+        Self {
+            max_nodes: 1_000_000,
+            max_estimated_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 struct Latest<T> {
     tx: Sender<T>,
     rx: Receiver<T>,
@@ -62,6 +86,7 @@ impl<T> Latest<T> {
 #[derive(Default)]
 struct Signals {
     generation: AtomicU64,
+    resource_limited_generation: AtomicU64,
     cancel: AtomicBool,
     stop: AtomicBool,
     /// Test instrumentation: how many times the coordinator blocked waiting for work, so a test
@@ -70,9 +95,14 @@ struct Signals {
     coordinator_waits: AtomicU64,
 }
 impl Signals {
+    fn limit_generation(&self, generation: u64) {
+        self.resource_limited_generation
+            .store(generation, Ordering::Release);
+    }
     fn obsolete(&self, generation: u64) -> bool {
         self.stop.load(Ordering::Acquire)
             || self.cancel.load(Ordering::Acquire)
+            || self.resource_limited_generation.load(Ordering::Acquire) == generation
             || self.generation.load(Ordering::Acquire) != generation
     }
 }
@@ -80,6 +110,7 @@ struct Start {
     generation: u64,
     root: PathBuf,
     backend: BackendChoice,
+    limits: ScanLimits,
 }
 struct Task {
     generation: u64,
@@ -165,12 +196,21 @@ impl Controller {
         Self { signals, mailboxes }
     }
     pub fn start(&mut self, root: PathBuf, backend: BackendChoice) -> u64 {
+        self.start_limited(root, backend, ScanLimits::default())
+    }
+    pub fn start_limited(
+        &mut self,
+        root: PathBuf,
+        backend: BackendChoice,
+        limits: ScanLimits,
+    ) -> u64 {
         let generation = self.signals.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.signals.cancel.store(false, Ordering::Release);
         self.mailboxes.starts.set(Start {
             generation,
             root,
             backend,
+            limits,
         });
         self.mailboxes.doorbell.set(());
         generation
@@ -299,6 +339,9 @@ struct DirectoryCompletion {
 }
 
 struct Scan {
+    limits: ScanLimits,
+    estimated_bytes: usize,
+    resource_limited: bool,
     generation: u64,
     model: Arc<Model>,
     root_summary: Option<crate::view::RootSummary>,
@@ -354,6 +397,10 @@ impl Scan {
         let fallback_reason = (start.backend == BackendChoice::Ntfs && kind == TaskKind::Directory)
             .then(|| NTFS_NEEDS_DRIVE_ROOT.to_owned());
         Self {
+            limits: start.limits,
+            estimated_bytes: std::mem::size_of::<Node>()
+                .saturating_add(start.root.as_os_str().len()),
+            resource_limited: false,
             generation: start.generation,
             current_path: start.root.clone(),
             model: Arc::new(model),
@@ -398,8 +445,30 @@ impl Scan {
             "NTFS attempt failed: {reason}. Restarted with normal enumeration."
         ));
         self.raw_progress = None;
+        self.estimated_bytes =
+            std::mem::size_of::<Node>().saturating_add(self.model.root_path.as_os_str().len());
+        self.resource_limited = false;
     }
-    fn insert_entries(&mut self, parent: NodeId, entries: Vec<Entry>) {
+    fn insert_entries(&mut self, parent: NodeId, mut entries: Vec<Entry>) {
+        let mut accepted = 0;
+        for entry in &entries {
+            // Arena growth, child ids, identity index, directory completion,
+            // query summaries and native name allocation all need headroom.
+            let cost = std::mem::size_of::<Node>()
+                .saturating_mul(2)
+                .saturating_add(192)
+                .saturating_add(entry.name.len().saturating_mul(2));
+            let next = self.estimated_bytes.checked_add(cost);
+            if self.model.nodes.len().saturating_add(accepted) >= self.limits.max_nodes
+                || next.is_none_or(|n| n > self.limits.max_estimated_bytes)
+            {
+                self.resource_limited = true;
+                break;
+            }
+            self.estimated_bytes = next.unwrap();
+            accepted += 1;
+        }
+        entries.truncate(accepted);
         let model = model_mut(&mut self.model);
         let ids = model.insert_batch(parent, entries);
         if let Some(summary) = self.root_summary.as_mut() {
@@ -422,6 +491,10 @@ impl Scan {
                     }
                 }
             }
+        }
+        if self.resource_limited {
+            self.record_error(0, self.model.root_path.clone(), "Scan resource limit reached; results are partial. Scan a smaller folder. Estimated inventory bytes are not measured peak process memory.".into());
+            self.finish(ScanState::Partial);
         }
     }
     fn directory_failed(&mut self, parent: NodeId) {
@@ -506,7 +579,9 @@ impl Scan {
     }
     fn snapshot(&self, request: &ViewRequest) -> UiSnapshot {
         let root = &self.model.nodes[0];
-        let message: String = if self.state == ScanState::Preparing {
+        let message: String = if self.resource_limited {
+            "Scan resource limit reached; partial inventory retained. Choose a smaller folder. No complete baseline was saved.".into()
+        } else if self.state == ScanState::Preparing {
             "Waiting for an available worker; previous I/O may still be finishing.".into()
         } else if self.state == ScanState::Partial {
             "Scan finished with partial results: some directories could not be read or totals overflowed.".into()
@@ -704,6 +779,9 @@ fn coordinate(
                         let _ingest = Span::new(Metric::Ingest);
                         diagnostics::add(Metric::IngestEntries, entries.len() as u64);
                         active.insert_entries(parent, entries);
+                        if active.resource_limited {
+                            signals.limit_generation(active.generation);
+                        }
                         dirty = true;
                     }
                     Event::Error(generation, parent, path, error)
@@ -852,6 +930,88 @@ fn coordinate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_limit_cancellation_is_bound_to_the_scan_that_hit_the_limit() {
+        let signals = Signals::default();
+        signals.generation.store(1, Ordering::Release);
+        // Replacement may be published between old event ingestion and the
+        // coordinator notifying workers of that old scan's resource limit.
+        signals.generation.store(2, Ordering::Release);
+        signals.cancel.store(false, Ordering::Release);
+        signals.limit_generation(1);
+        assert!(signals.obsolete(1));
+        assert!(!signals.obsolete(2));
+        assert!(!signals.cancel.load(Ordering::Acquire));
+        signals.limit_generation(2);
+        assert!(signals.obsolete(2));
+    }
+    #[test]
+    fn node_budget_stops_with_partial_results_and_keeps_existing_entries() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start_limited(
+            "fixture".into(),
+            BackendChoice::Normal,
+            ScanLimits {
+                max_nodes: 3,
+                max_estimated_bytes: usize::MAX,
+            },
+        );
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                task.parent,
+                vec![
+                    fixture_entry("one", false, 10),
+                    fixture_entry("two", false, 20),
+                    fixture_entry("three", false, 30),
+                ],
+            ))
+            .unwrap();
+        let snapshot = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 2);
+        assert_eq!(snapshot.progress.logical, 30);
+        assert_eq!(snapshot.progress.unique_allocated, None);
+        assert!(
+            snapshot
+                .progress
+                .errors
+                .iter()
+                .any(|e| e.message.contains("resource limit"))
+        );
+        assert!(snapshot.progress.message.contains("resource limit"));
+        let replacement = controller.start("fresh".into(), BackendChoice::Normal);
+        let fresh = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(fresh.generation, replacement);
+        events.send(Event::Done(replacement, fresh.parent)).unwrap();
+        wait_snapshot(&controller, |s| {
+            s.progress.generation == replacement && s.progress.state == ScanState::Complete
+        });
+    }
+
+    #[test]
+    fn estimated_byte_budget_refuses_an_oversized_entry_without_claiming_completion() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start_limited(
+            "fixture".into(),
+            BackendChoice::Normal,
+            ScanLimits {
+                max_nodes: 100,
+                max_estimated_bytes: 1,
+            },
+        );
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                task.parent,
+                vec![fixture_entry("large name", false, 10)],
+            ))
+            .unwrap();
+        let snapshot = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 0);
+        assert_ne!(snapshot.progress.state, ScanState::Complete);
+    }
     use super::*;
 
     fn controlled_io() -> (Controller, Receiver<Task>, Sender<Event>) {
@@ -1169,6 +1329,7 @@ mod tests {
                 generation: 1,
                 root: "fixture".into(),
                 backend: BackendChoice::Normal,
+                limits: ScanLimits::default(),
             });
             scan.insert_entries(
                 0,
@@ -1487,6 +1648,7 @@ mod tests {
             generation: 1,
             root: "summary-old".into(),
             backend: BackendChoice::Normal,
+            limits: ScanLimits::default(),
         });
         assert!(scan.root_summary.is_some());
         scan.insert_entries(
@@ -1529,6 +1691,7 @@ mod tests {
             generation: 2,
             root: "summary-replacement".into(),
             backend: BackendChoice::Normal,
+            limits: ScanLimits::default(),
         });
         assert_queries(&replacement);
         assert_eq!(
@@ -1545,6 +1708,7 @@ mod tests {
             generation: 3,
             root: "C:\\".into(),
             backend: BackendChoice::Ntfs,
+            limits: ScanLimits::default(),
         });
         assert!(raw.root_summary.is_none());
     }
@@ -1891,6 +2055,7 @@ mod tests {
             let request = |backend| Start {
                 generation: 1,
                 root: root.into(),
+                limits: ScanLimits::default(),
                 backend,
             };
             assert_eq!(

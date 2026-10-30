@@ -1,10 +1,26 @@
-DiskScope 0.3.1 preview - Windows x64
+DiskScope 0.3.2 preview - Windows x64
 
 Requires Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable
 graphics driver. The Visual C++ runtime is linked into the executable.
 Extract the entire ZIP before running; no installation is required. Preferences
 and scan history are still stored in your Windows user profile, not beside the EXE.
 A separate setup installer is also available for this release.
+
+For helpdesk use, launch DiskScope.exe --helpdesk [FOLDER]. This enforces normal
+scanning, disables all file-removal actions, and never saves history, preferences
+or window state. DiskScope.exe --no-history [FOLDER] disables profile persistence
+while retaining ordinary interactive capabilities. Explicit evidence exports
+still write the chosen destination. A companion diskscope-policy.json beside
+the executable can enforce these restrictions; invalid policy aborts startup.
+Use HELP_DESK_RUNBOOK.md and HELP_DESK_QUALIFICATION.md before a fleet rollout.
+The release is MIT-licensed; see LICENSE and the separate third-party notices.
+
+Normal scans stop with explicit partial results when inventory admission limits
+are reached: 5 million nodes / 1 GiB estimated storage in ordinary mode,
+1 million nodes / 256 MiB estimated storage in helpdesk mode. These estimates
+are not measured process RAM limits. Investigate smaller folders when limited.
+Use Export ticket evidence for a bounded JSON summary. Redaction is on by
+default in the GUI; CLI JSON includes paths. Exports refuse existing files.
 
 Run DiskScope.exe, choose a folder or drive, then select Scan.
 Opening the application does not start a scan. Stop scanning keeps partial results.
@@ -37,6 +53,10 @@ redirected locations can store metadata off this PC. Changes shows the location.
 At most five complete scans are retained: up to one million nodes and 128 MiB
 per snapshot, with a 768 MiB total storage budget including staging. Oversized
 or incomplete scans are not saved as baselines. CLI scans do not save history.
+History requires 256 MiB available space after incoming metadata. One incident
+baseline can be protected from automatic retention within the five-file cap.
+Explicit Clear removes protection. Older DiskScope versions do not honor the
+new protection marker: do not share a live history folder across versions.
 Administrator and unknown-access sessions do not save history or preferences.
 The Changes workspace includes a history-clear control. File contents are not
 stored or uploaded. Old modification times do not imply unwanted files.

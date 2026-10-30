@@ -21,12 +21,18 @@ function Write-FixtureChecksums {
 try {
     [IO.File]::WriteAllText((Join-Path $fixture 'Cargo.toml'), "[package]`nname = `"fixture`"`nversion = `"1.2.3`"`n[dependencies]`nother = `"9.9.9`"")
     Assert-True ((Get-ReleaseVersion $fixture) -ceq '1.2.3') 'Version must come from package section.'
-    foreach ($name in @('DiskScope.exe', 'VALIDATION.md', 'PERFORMANCE.md', 'THIRD_PARTY_NOTICES.md', 'licenses\example-1.0\NOTICE $quote.txt')) {
+    New-Item -ItemType Directory -Path (Join-Path $payload 'helpdesk-tools') | Out-Null
+    foreach ($name in @('DiskScope.exe', 'LICENSE', 'VALIDATION.md', 'PERFORMANCE.md', 'THIRD_PARTY_NOTICES.md', 'HELP_DESK_RUNBOOK.md', 'HELP_DESK_QUALIFICATION.md',
+            'helpdesk-tools\invoke-helpdesk.ps1', 'helpdesk-tools\helpdesk-tools.ps1', 'helpdesk-tools\release-tools.ps1', 'helpdesk-tools\verify-release-signatures.ps1', 'licenses\example-1.0\NOTICE $quote.txt')) {
         [IO.File]::WriteAllText((Join-Path $payload $name), $name)
     }
     [IO.File]::WriteAllText((Join-Path $payload 'README.txt'), 'DiskScope 1.2.3 preview - Windows x64')
     Write-FixtureChecksums
-    Assert-True (@(Assert-ReleasePayload $payload '1.2.3').Count -eq 7) 'Valid payload rejected.'
+    Assert-True (@(Assert-ReleasePayload $payload '1.2.3').Count -eq 14) 'Valid payload rejected.'
+    $licenseFile = Join-Path $payload 'LICENSE'
+    Remove-Item -LiteralPath $licenseFile
+    Assert-Rejected { Assert-ReleasePayload $payload '1.2.3' } 'Missing project license accepted.'
+    [IO.File]::WriteAllText($licenseFile, 'LICENSE')
     Assert-Rejected { Assert-ReleasePayload $payload '9.9.9' } 'Version mismatch accepted.'
     # build.ps1 runs this same check on the source README before compiling.
     $payloadReadme = Join-Path $payload 'README.txt'
@@ -89,7 +95,7 @@ try {
     $source = [IO.File]::ReadAllText($include)
     Assert-True ($source.Contains('NOTICE $$quote.txt')) 'Payload filenames must not interpolate NSIS variables.'
     Assert-True (-not $source.Contains('RMDir /r')) 'Uninstall must not recursively delete user files.'
-    Assert-True (($source -split 'IfFileExists').Count -eq 8) 'Every installed file requires checked removal.'
+    Assert-True (($source -split 'IfFileExists').Count -eq 15) 'Every installed file requires checked removal.'
     $archiveA = Join-Path $fixture 'portable-a.zip'
     $archiveB = Join-Path $fixture 'portable-b.zip'
     New-PortableArchive $payload $archiveA '1.2.3'
@@ -97,7 +103,7 @@ try {
     Assert-True ((Get-FileHash $archiveA).Hash -ceq (Get-FileHash $archiveB).Hash) 'Identical payload ZIPs should be reproducible.'
     $extracted = Join-Path $fixture 'extracted'
     [IO.Compression.ZipFile]::ExtractToDirectory($archiveA, $extracted)
-    Assert-True (@(Assert-ReleasePayload (Join-Path $extracted 'DiskScope-1.2.3-portable') '1.2.3').Count -eq 7) 'Extracted payload differs.'
+    Assert-True (@(Assert-ReleasePayload (Join-Path $extracted 'DiskScope-1.2.3-portable') '1.2.3').Count -eq 14) 'Extracted payload differs.'
     Write-Output "Release tooling: $script:checks checks passed."
 } finally {
     $resolved = [IO.Path]::GetFullPath($fixture)

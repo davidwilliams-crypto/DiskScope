@@ -1,0 +1,24 @@
+# All enabled features for the shipped Windows target, including build/dev dependencies.
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+db-path = "target/helpdesk-advisory-dbs"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+maximum-db-staleness = "P7D"
+ignore = []
+
+[licenses]
+include-dev = true
+confidence-threshold = 0.95
+# Font/Unicode terms are required by bundled egui/ICU dependencies; packaging
+# still requires their full notices. This is a technical allowlist, not legal sign-off.
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "BSL-1.0", "ISC", "Zlib", "Unicode-3.0", "OFL-1.1", "Ubuntu-font-1.0"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -36,7 +36,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -47,6 +47,9 @@ pub const MAX_SNAPSHOTS: usize = 5;
 pub const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_DISK_BYTES: u64 = 768 * 1024 * 1024;
 pub const MAX_NODES: usize = 1_000_000;
+/// Keep this much available to the current Windows user after each history write.
+/// This is admission control, not a reservation against unrelated concurrent writers.
+pub const MIN_FREE_SPACE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NAME: usize = 32_768;
 const MAX_DEPTH: usize = 256;
 // Expanded paths are bounded too: a tiny deep hierarchy must not inflate to gigabytes.
@@ -89,6 +92,8 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 const SNAPSHOT_SUFFIX: &str = ".dsh";
 const STAGING_SUFFIX: &str = ".tmp";
+const BASELINE_MAGIC: &[u8; 8] = b"DSHPIN01";
+const BASELINE_BYTES: usize = 24;
 
 /// One load streams at most this many snapshot bodies in full. Normal operation
 /// keeps five (six while a retention delete is pending); the rest is headroom for
@@ -103,21 +108,18 @@ const OWNED_ELSEWHERE: &str = concat!(
     "History is unavailable because another window owns this directory. ",
     "Close that window and reopen history."
 );
-const REQUEST_SKIPPED: &str = concat!(
-    "History request skipped: scan incomplete/oversized, ",
-    "or background queue busy. Retry when idle."
-);
-const REQUESTS_WERE_SKIPPED: &str = concat!(
-    " Some history requests were skipped because the scan was ",
-    "incomplete/oversized or the background queue was busy."
-);
+const REJECT_BUSY: u8 = 1;
+const REJECT_INCOMPLETE: u8 = 2;
+const REJECT_OVERSIZED: u8 = 3;
+const REJECT_OVERFLOW: u8 = 4;
 const COMPARISON_NOTE: &str = concat!(
     "Comparison uses logical bytes per entry. Moves require unique known identity; ",
     "hardlink aliases and unknown identities remain additions/removals."
 );
 const SAVED_NOTE: &str = concat!(
     "Saved complete metadata locally; five snapshots maximum, 128 MiB each, ",
-    "768 MiB including staging. No file contents stored."
+    "1,000,000 nodes; 768 MiB including staging and a 256 MiB free-space reserve. ",
+    "Use scoped folder investigations for larger inventories. No file contents stored."
 );
 const INCOMPATIBLE_SCANS: &str = concat!(
     "Choose two compatible scans of the identical native root and backend family ",
@@ -135,6 +137,8 @@ pub struct HistorySnapshot {
     pub busy: bool,
     pub scans: Vec<ScanSummary>,
     pub comparison: Option<Arc<Comparison>>,
+    /// One incident baseline shares the existing five-snapshot budget.
+    pub protected_baseline: Option<u64>,
     pub message: String,
 }
 #[derive(Clone, Debug)]
@@ -197,7 +201,7 @@ pub struct HistoryService {
 #[derive(Clone)]
 pub struct HistoryCapture {
     captures: Sender<Capture>,
-    rejected: Arc<AtomicBool>,
+    rejected: Arc<AtomicU8>,
 }
 struct Capture {
     model: Arc<Model>,
@@ -207,6 +211,8 @@ struct Capture {
 enum Command {
     Compare(u64, u64),
     Forget,
+    ProtectBaseline(u64),
+    UnprotectBaseline,
 }
 impl HistoryService {
     /// Publishes the reason once, performs no disk I/O and starts no worker.
@@ -227,7 +233,7 @@ impl HistoryService {
         Self {
             capture: HistoryCapture {
                 captures,
-                rejected: Arc::new(AtomicBool::new(false)),
+                rejected: Arc::new(AtomicU8::new(0)),
             },
             commands,
             updates,
@@ -241,7 +247,7 @@ impl HistoryService {
         let (updates_tx, updates) = bounded(1);
         let output = updates.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let rejected = Arc::new(AtomicBool::new(false));
+        let rejected = Arc::new(AtomicU8::new(0));
         let capture = HistoryCapture {
             captures: captures_tx,
             rejected: rejected.clone(),
@@ -274,10 +280,18 @@ impl HistoryService {
     pub fn forget_all(&self) -> bool {
         self.command(Command::Forget)
     }
+    /// Protect one incident baseline until explicit unprotection or Clear.
+    /// Protecting another baseline requires explicit unprotection first.
+    pub fn protect_baseline(&self, id: u64) -> bool {
+        self.command(Command::ProtectBaseline(id))
+    }
+    pub fn unprotect_baseline(&self) -> bool {
+        self.command(Command::UnprotectBaseline)
+    }
     fn command(&self, command: Command) -> bool {
         let accepted = self.commands.try_send(command).is_ok();
         if !accepted {
-            self.capture.rejected.store(true, Ordering::Release);
+            self.capture.rejected.store(REJECT_BUSY, Ordering::Release);
         }
         accepted
     }
@@ -296,12 +310,14 @@ impl HistoryCapture {
         state: ScanState,
         backend: String,
     ) -> bool {
-        if state != ScanState::Complete
-            || model.errors_total != 0
-            || model.overflowed
-            || model.nodes.len() > MAX_NODES
-        {
-            self.rejected.store(true, Ordering::Release);
+        let reason = capture_rejection(
+            state,
+            model.errors_total,
+            model.overflowed,
+            model.nodes.len(),
+        );
+        if reason != 0 {
+            self.rejected.store(reason, Ordering::Release);
             return false;
         }
         let accepted = self
@@ -313,9 +329,36 @@ impl HistoryCapture {
             })
             .is_ok();
         if !accepted {
-            self.rejected.store(true, Ordering::Release);
+            self.rejected.store(REJECT_BUSY, Ordering::Release);
         }
         accepted
+    }
+}
+fn capture_rejection(state: ScanState, errors: u64, overflowed: bool, nodes: usize) -> u8 {
+    if state != ScanState::Complete || errors != 0 {
+        REJECT_INCOMPLETE
+    } else if overflowed {
+        REJECT_OVERFLOW
+    } else if nodes > MAX_NODES {
+        REJECT_OVERSIZED
+    } else {
+        0
+    }
+}
+fn rejection_message(reason: u8) -> &'static str {
+    match reason {
+        REJECT_INCOMPLETE => {
+            "History skipped: scan incomplete or contains scan errors. Complete an error-free folder scan before saving a baseline."
+        }
+        REJECT_OVERSIZED => {
+            "History skipped: inventory exceeds 1,000,000 nodes. Scan a smaller folder for comparisons; full-drive history is not supported above this limit."
+        }
+        REJECT_OVERFLOW => {
+            "History skipped: scan accounting overflow prevents a complete baseline. Scan a smaller folder."
+        }
+        _ => {
+            "History request skipped: background queue busy or history unavailable. Retry when idle."
+        }
     }
 }
 pub fn default_directory() -> PathBuf {
@@ -363,7 +406,7 @@ fn history_worker(
     tx: Sender<Arc<HistorySnapshot>>,
     rx: Receiver<Arc<HistorySnapshot>>,
     stop: Arc<AtomicBool>,
-    rejected: Arc<AtomicBool>,
+    rejected: Arc<AtomicU8>,
 ) {
     let mut snapshot = HistorySnapshot {
         busy: true,
@@ -396,6 +439,7 @@ fn history_worker(
     match directory.load() {
         Ok((scans, message)) => {
             snapshot.scans = scans;
+            snapshot.protected_baseline = directory.protected_baseline().ok().flatten();
             snapshot.message = match retain_snapshots(&directory, &mut snapshot) {
                 Ok(()) => message,
                 Err(error) => format!("History retention could not finish: {error}"),
@@ -405,11 +449,12 @@ fn history_worker(
     }
     snapshot.busy = false;
     publish(&mut snapshot, &tx, &rx);
-    let mut skipped = false;
+    let mut skipped = None;
     while !stop.load(Ordering::Acquire) {
-        if rejected.swap(false, Ordering::AcqRel) {
-            skipped = true;
-            snapshot.message = REQUEST_SKIPPED.into();
+        let reason = rejected.swap(0, Ordering::AcqRel);
+        if reason != 0 {
+            skipped = Some(rejection_message(reason));
+            snapshot.message = rejection_message(reason).into();
             publish(&mut snapshot, &tx, &rx);
         }
         let work = if let Ok(c) = commands.try_recv() {
@@ -433,9 +478,25 @@ fn history_worker(
                 cleared.map(|()| {
                     // A queued completion belongs to the state the user just cleared.
                     let _ = captures.try_recv();
+                    snapshot.protected_baseline = None;
                     snapshot.message = "Local metadata history cleared.".into();
                 })
             }
+            Ok(Command::ProtectBaseline(id)) => directory.protect_baseline(id).map(|()| {
+                snapshot.protected_baseline = Some(id);
+                snapshot.message = "Incident baseline protected within the five-snapshot limit. Explicit Unprotect or Clear removes protection.".into();
+            }),
+            Ok(Command::UnprotectBaseline) => directory.unprotect_baseline().and_then(|()| {
+                snapshot.protected_baseline = None;
+                // Explicit recovery from a failed startup load must restore
+                // the catalog in this window, without waiting for a restart.
+                let (scans, _) = directory.load()?;
+                snapshot.scans = scans;
+                snapshot.comparison = None;
+                retain_snapshots(&directory, &mut snapshot)?;
+                snapshot.message = "Incident baseline unprotected; normal retention applies.".into();
+                Ok(())
+            }),
             Ok(Command::Compare(older, newer)) => {
                 snapshot.comparison = None;
                 compare_saved(&directory, &snapshot.scans, older, newer).map(|comparison| {
@@ -447,8 +508,9 @@ fn history_worker(
         if let Err(error) = result {
             snapshot.message = error;
         }
-        if std::mem::take(&mut skipped) {
-            snapshot.message.push_str(REQUESTS_WERE_SKIPPED);
+        if let Some(reason) = skipped.take() {
+            snapshot.message.push_str(" Earlier request: ");
+            snapshot.message.push_str(reason);
         }
         snapshot.busy = false;
         publish(&mut snapshot, &tx, &rx);
@@ -461,12 +523,18 @@ fn save_capture(
     snapshot: &mut HistorySnapshot,
 ) -> Result<(), String> {
     let m = &capture.model;
-    if m.nodes.is_empty() || m.nodes.len() > MAX_NODES || m.errors_total != 0 || m.overflowed {
-        return Err("History skipped: incomplete or oversized metadata.".into());
+    let reason = capture_rejection(
+        ScanState::Complete,
+        m.errors_total,
+        m.overflowed,
+        m.nodes.len(),
+    );
+    if reason != 0 {
+        return Err(rejection_message(reason).into());
     }
-    // A previous write may have committed before Windows temporarily refused
-    // retention. Recover that excess before another write reserves disk space.
-    retain_snapshots(directory, snapshot)?;
+    if m.nodes.is_empty() {
+        return Err("History skipped: empty inventory cannot form a complete baseline.".into());
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -508,6 +576,10 @@ fn save_capture(
     let saved = Saved { summary, nodes };
     validate(&saved)?;
     let bytes = encode(&saved)?;
+    // Refusal must preserve existing baselines, including a pending retention
+    // retry. Probe before any capture-triggered deletion, then again at staging.
+    check_free_space(available_space(&directory.resolved), bytes.len() as u64)?;
+    retain_snapshots(directory, snapshot)?;
     directory.write(id, &bytes)?;
     snapshot.scans.push(saved.summary);
     snapshot.scans.sort_by_key(|s| std::cmp::Reverse(s.id));
@@ -542,8 +614,14 @@ fn forget_vanished_scans(directory: &Directory, snapshot: &mut HistorySnapshot) 
 }
 
 fn retain_snapshots(directory: &Directory, snapshot: &mut HistorySnapshot) -> Result<(), String> {
+    let protected = directory.protected_baseline()?;
     while snapshot.scans.len() > MAX_SNAPSHOTS {
-        let old = snapshot.scans.last().unwrap();
+        let index = snapshot
+            .scans
+            .iter()
+            .rposition(|scan| Some(scan.id) != protected)
+            .ok_or("History retention cannot remove a protected baseline")?;
+        let old = &snapshot.scans[index];
         directory.remove(old.id)?;
         if snapshot
             .comparison
@@ -552,9 +630,61 @@ fn retain_snapshots(directory: &Directory, snapshot: &mut HistorySnapshot) -> Re
         {
             snapshot.comparison = None;
         }
-        snapshot.scans.pop();
+        snapshot.scans.remove(index);
     }
     Ok(())
+}
+
+fn check_free_space(available: io::Result<u64>, incoming: u64) -> Result<(), String> {
+    let available = available.map_err(|error| format!(
+        "History skipped: could not determine available free space ({error}); no snapshot written."
+    ))?;
+    let required = MIN_FREE_SPACE_BYTES
+        .checked_add(incoming)
+        .ok_or("History skipped: free space requirement overflow; no snapshot written.")?;
+    if available < required {
+        return Err(format!(
+            "History skipped: insufficient free space ({} available; {} required including a 256 MiB reserve). No snapshot written; use a smaller folder or disable history.",
+            format_mebibytes(available),
+            format_mebibytes(required)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn available_space(path: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NUL in history path",
+        ));
+    }
+    wide.push(0);
+    let mut available = 0;
+    // Use space available to this caller (including quotas), not total free bytes.
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
+}
+#[cfg(not(windows))]
+fn available_space(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "history free-space probing requires Windows",
+    ))
 }
 
 /// A regular file in the history directory whose name follows this app's pattern.
@@ -679,7 +809,7 @@ impl LoadReport {
     }
     fn message(&self) -> String {
         let mut parts = vec![String::from(
-            "Local metadata history ready. Five snapshots maximum; no file contents stored.",
+            "Local metadata history ready. Five snapshots maximum; 1,000,000 nodes / 128 MiB each. Use scoped folders for larger inventories; no file contents stored.",
         )];
         if self.unusable.removed > 0 {
             parts.push(format!(
@@ -753,9 +883,22 @@ struct Directory {
 }
 impl Directory {
     fn open(requested: PathBuf) -> Result<Self, String> {
+        Self::open_with_probe(requested, available_space)
+    }
+    fn open_with_probe(
+        requested: PathBuf,
+        probe: impl FnOnce(&Path) -> io::Result<u64>,
+    ) -> Result<Self, String> {
         if !requested.is_absolute() {
             return Err("History directory must be absolute".into());
         }
+        // Query an existing ancestor before creating either the history folder
+        // or ownership file. Unknown space is a refusal, never assumed ample.
+        let ancestor = requested
+            .ancestors()
+            .find(|path| path.exists())
+            .ok_or("History directory has no accessible existing ancestor")?;
+        check_free_space(probe(ancestor), 0)?;
         fs::create_dir_all(&requested).map_err(|e| e.to_string())?;
         let resolved = fs::canonicalize(&requested).map_err(|e| e.to_string())?;
         if resolved.parent().is_none() {
@@ -785,6 +928,77 @@ impl Directory {
     }
     fn staging_file(&self, id: u64) -> PathBuf {
         self.resolved.join(format!("diskscope-{id:016x}.tmp"))
+    }
+    fn baseline_file(&self) -> PathBuf {
+        self.resolved.join("incident-baseline.dspin")
+    }
+    /// Fixed-size sidecar; DSHIST02 itself stays byte-for-byte compatible.
+    /// Any unreadable, malformed or stale marker blocks automatic mutation.
+    fn protected_baseline(&self) -> Result<Option<u64>, String> {
+        self.check()?;
+        let path = self.baseline_file();
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "Cannot read incident baseline protection: {error}. Explicitly Unprotect or Clear to recover."
+                ));
+            }
+        };
+        if !meta.file_type().is_file()
+            || meta.file_type().is_symlink()
+            || meta.len() != BASELINE_BYTES as u64
+        {
+            return Err("Invalid incident baseline protection; automatic history changes refused. Explicitly Unprotect or Clear to recover.".into());
+        }
+        let mut bytes = [0u8; BASELINE_BYTES];
+        File::open(path)
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(|error| format!("Cannot read incident baseline protection: {error}"))?;
+        if &bytes[..8] != BASELINE_MAGIC
+            || checksum(&bytes[..16]) != u64::from_le_bytes(bytes[16..].try_into().unwrap())
+        {
+            return Err("Damaged incident baseline protection; automatic history changes refused. Explicitly Unprotect or Clear to recover.".into());
+        }
+        let id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let snapshot = fs::symlink_metadata(self.file(id))
+            .map_err(|error| format!("Protected incident baseline is missing or inaccessible: {error}. Explicitly Unprotect or Clear to recover."))?;
+        if !snapshot.file_type().is_file() || snapshot.file_type().is_symlink() {
+            return Err("Protected incident baseline is not a regular file; automatic history changes refused.".into());
+        }
+        Ok(Some(id))
+    }
+    fn protect_baseline(&self, id: u64) -> Result<(), String> {
+        match self.protected_baseline()? {
+            Some(current) if current == id => return Ok(()),
+            Some(_) => return Err("One incident baseline is already protected. Explicitly Unprotect it before selecting another.".into()),
+            None => (),
+        }
+        self.read(id)?;
+        check_free_space(available_space(&self.resolved), BASELINE_BYTES as u64)?;
+        let mut bytes = Vec::with_capacity(BASELINE_BYTES);
+        bytes.extend(BASELINE_MAGIC);
+        bytes.extend(id.to_le_bytes());
+        bytes.extend(checksum(&bytes).to_le_bytes());
+        self.check()?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.baseline_file())
+            .map_err(|error| error.to_string())?;
+        // A failed/partial sidecar stays fail-closed until explicit recovery.
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())
+    }
+    fn unprotect_baseline(&self) -> Result<(), String> {
+        self.check()?;
+        match fs::symlink_metadata(self.baseline_file()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+            Ok(_) => remove_regular_file(&self.baseline_file()),
+        }
     }
     /// Streams the regular files named `diskscope-<16 hex digits><suffix>`.
     /// Nothing is collected here, so any number of files costs constant memory;
@@ -841,18 +1055,31 @@ impl Directory {
     /// checksum, in constant memory. Nodes are never materialized here; full
     /// structural validation is deferred to Compare, which fails loudly.
     fn load_catalog(&self) -> Result<(Vec<ScanSummary>, LoadReport), String> {
+        // Validate protection before even pruning staging or damaged snapshots.
+        let protected = self.protected_baseline()?;
+        let mut scans = Vec::new();
+        if let Some(id) = protected {
+            match verify_snapshot(&self.file(id), id) {
+                Verdict::Usable(summary) => scans.push(summary),
+                _ => return Err("Protected incident baseline is damaged or unreadable; kept unchanged. Explicitly Unprotect or Clear to recover.".into()),
+            }
+        }
         let mut report = LoadReport {
             staging: self.prune_staging()?,
+            examined: scans.len(),
             ..Default::default()
         };
         // Pass 1: classify every snapshot by header. Unusable ones are deleted
         // as they are met; only the newest candidates are remembered.
-        let mut newest = NewestFiles::new(MAX_EXAMINED_FILES);
-        self.triage(&mut report, |file| newest.offer(file))?;
+        let mut newest = NewestFiles::new(MAX_EXAMINED_FILES - scans.len());
+        self.triage(&mut report, |file| {
+            if Some(file.id) != protected {
+                newest.offer(file);
+            }
+        })?;
         let candidates = newest.offered;
         let window = newest.into_newest_first();
         // Pass 2: verify the newest candidates by streaming.
-        let mut scans = Vec::with_capacity(window.len());
         for file in &window {
             self.check()?;
             report.examined += 1;
@@ -862,6 +1089,7 @@ impl Directory {
                 Verdict::Unreadable(reason) => report.note_unreadable(&reason),
             }
         }
+        scans.sort_by_key(|scan| Reverse(scan.id));
         // Pass 3: intact-looking files older than the window. Once five newer
         // snapshots are verified they are retention surplus. Otherwise they may
         // be the only usable ones, so they are left for a later load.
@@ -924,6 +1152,9 @@ impl Directory {
     /// directory check is an error; a file that cannot be deleted right now is
     /// recorded and kept.
     fn reclaim(&self, id: u64, removals: &mut Removals) -> Result<(), String> {
+        if self.protected_baseline()? == Some(id) {
+            return Ok(());
+        }
         removals.record(self.try_remove(&self.file(id))?);
         Ok(())
     }
@@ -968,20 +1199,33 @@ impl Directory {
         Ok(saved)
     }
     fn write(&self, id: u64, bytes: &[u8]) -> Result<(), String> {
+        self.write_with_probe(id, bytes, available_space)
+    }
+    fn write_with_probe(
+        &self,
+        id: u64,
+        bytes: &[u8],
+        probe: impl FnOnce(&Path) -> io::Result<u64>,
+    ) -> Result<(), String> {
         self.check()?;
+        self.protected_baseline()?;
         check_write_budget(&self.usage()?, bytes.len())?;
+        check_free_space(probe(&self.resolved), bytes.len() as u64)?;
         let staging = self.staging_file(id);
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staging)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Could not create history staging file: {e}"))?;
         let result = (|| {
-            f.write_all(bytes).map_err(|e| e.to_string())?;
-            f.sync_all().map_err(|e| e.to_string())?;
+            f.write_all(bytes)
+                .map_err(|e| format!("Could not write history staging file: {e}"))?;
+            f.sync_all()
+                .map_err(|e| format!("Could not flush history staging file: {e}"))?;
             drop(f);
             self.check()?;
-            fs::rename(&staging, self.file(id)).map_err(|e| e.to_string())
+            fs::rename(&staging, self.file(id))
+                .map_err(|e| format!("Could not commit history staging file: {e}"))
         })();
         if result.is_err() && self.check().is_ok() {
             let _ = fs::remove_file(staging);
@@ -990,6 +1234,9 @@ impl Directory {
     }
     fn remove(&self, id: u64) -> Result<(), String> {
         self.check()?;
+        if self.protected_baseline()? == Some(id) {
+            return Err("History removal refused: incident baseline is protected.".into());
+        }
         remove_regular_file(&self.file(id))
     }
     /// `remove` for bulk reclamation: `Err` only when the directory guard
@@ -1005,7 +1252,8 @@ impl Directory {
     fn clear(&self) -> Result<(), String> {
         let mut snapshots = Removals::default();
         self.for_each_owned(SNAPSHOT_SUFFIX, |file| {
-            self.reclaim(file.id, &mut snapshots)
+            snapshots.record(self.try_remove(&self.file(file.id))?);
+            Ok(())
         })?;
         let staging = self.prune_staging()?;
         let stuck = snapshots.stuck + staging.stuck;
@@ -1016,6 +1264,7 @@ impl Directory {
                 count(stuck, "history file", "history files"),
             ));
         }
+        self.unprotect_baseline()?;
         Ok(())
     }
     /// Streams the directory once. Snapshot headers decide which files this
@@ -1343,7 +1592,7 @@ fn encode(saved: &Saved) -> Result<Vec<u8>, String> {
         }
         put_wide(&mut out, &node.name)?;
         if out.len() > MAX_SNAPSHOT_BYTES - CHECKSUM_LEN {
-            return Err("History skipped: metadata exceeds 128 MiB snapshot limit".into());
+            return Err("History skipped: metadata exceeds 128 MiB snapshot limit. Scan a smaller folder for comparisons.".into());
         }
     }
     let checksum = checksum(&out);
@@ -2051,6 +2300,203 @@ mod tests {
     fn open_directory(temp: &tempfile::TempDir) -> Directory {
         Directory::open(temp.path().join("history")).unwrap()
     }
+    #[test]
+    fn free_space_admission_is_exact_and_fails_closed() {
+        assert!(check_free_space(Ok(MIN_FREE_SPACE_BYTES + 11), 11).is_ok());
+        assert!(
+            check_free_space(Ok(MIN_FREE_SPACE_BYTES + 10), 11)
+                .unwrap_err()
+                .contains("free space")
+        );
+        assert!(
+            check_free_space(Err(io::Error::other("probe unavailable")), 11)
+                .unwrap_err()
+                .contains("could not determine")
+        );
+        assert!(check_free_space(Ok(u64::MAX), u64::MAX).is_err());
+    }
+    #[test]
+    fn capture_rejections_distinguish_incomplete_oversized_and_busy() {
+        assert_eq!(
+            capture_rejection(ScanState::Complete, 0, false, MAX_NODES),
+            0
+        );
+        assert!(
+            rejection_message(capture_rejection(ScanState::Complete, 1, false, 1))
+                .contains("incomplete")
+        );
+        assert!(
+            rejection_message(capture_rejection(ScanState::Complete, 0, true, 1))
+                .contains("overflow")
+        );
+        let oversize = rejection_message(capture_rejection(
+            ScanState::Complete,
+            0,
+            false,
+            MAX_NODES + 1,
+        ));
+        assert!(oversize.contains("1,000,000"));
+        assert!(oversize.contains("folder"));
+        assert!(rejection_message(REJECT_BUSY).contains("queue busy"));
+    }
+    #[test]
+    #[cfg(windows)]
+    fn native_available_space_probe_reports_actual_volume_and_fails_for_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(available_space(temp.path()).unwrap() > 0);
+        assert!(available_space(&temp.path().join("missing")).is_err());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn unreadable_protection_metadata_keeps_snapshot_and_staging_until_explicit_recovery() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let directory = open_directory(&temp);
+        directory.write(1, &valid_bytes(1)).unwrap();
+        directory.protect_baseline(1).unwrap();
+        fs::write(directory.staging_file(2), b"orphan").unwrap();
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(directory.baseline_file())
+            .unwrap();
+        assert!(directory.load_catalog().is_err());
+        assert!(directory.write(3, &valid_bytes(3)).is_err());
+        assert!(directory.file(1).exists());
+        assert!(directory.staging_file(2).exists());
+        assert!(!directory.staging_file(3).exists());
+        drop(locked);
+        directory.unprotect_baseline().unwrap();
+        assert!(directory.load_catalog().is_ok());
+    }
+    #[test]
+    fn low_or_unknown_space_never_creates_history_or_staging_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let requested = temp.path().join("new-history");
+        assert!(Directory::open_with_probe(requested.clone(), |_| Ok(0)).is_err());
+        assert!(!requested.exists());
+        assert!(
+            Directory::open_with_probe(requested.clone(), |_| Err(io::Error::other("unavailable")))
+                .is_err()
+        );
+        assert!(!requested.exists());
+        let directory = open_directory(&temp);
+        directory.write(1, &valid_bytes(1)).unwrap();
+        let before = fs::read(directory.file(1)).unwrap();
+        for available in [Some(0), None] {
+            assert!(
+                directory
+                    .write_with_probe(2, &valid_bytes(2), |_| available
+                        .ok_or_else(|| io::Error::other("unavailable")))
+                    .is_err()
+            );
+            assert!(!directory.file(2).exists());
+            assert!(!directory.staging_file(2).exists());
+            assert_eq!(fs::read(directory.file(1)).unwrap(), before);
+        }
+    }
+    #[test]
+    fn protected_baseline_survives_unrelated_scans_and_reload_with_five_file_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = open_directory(&temp);
+        directory.write(1, &valid_bytes(1)).unwrap();
+        directory.protect_baseline(1).unwrap();
+        assert!(directory.protect_baseline(2).is_err());
+        // Protection must be considered even when older than the bounded catalog window.
+        for id in 2..=25 {
+            directory.write(id, &valid_bytes(id)).unwrap();
+        }
+        let (scans, _) = directory.load_catalog().unwrap();
+        assert!(scans.iter().any(|scan| scan.id == 1));
+        let mut snapshot = HistorySnapshot {
+            scans,
+            ..Default::default()
+        };
+        retain_snapshots(&directory, &mut snapshot).unwrap();
+        assert_eq!(snapshot_ids(&directory), [1, 22, 23, 24, 25]);
+        let path = directory.requested.clone();
+        drop(directory);
+        let directory = Directory::open(path).unwrap();
+        assert_eq!(directory.protected_baseline().unwrap(), Some(1));
+        directory.unprotect_baseline().unwrap();
+        directory.write(26, &valid_bytes(26)).unwrap();
+        let (scans, _) = directory.load_catalog().unwrap();
+        snapshot.scans = scans;
+        retain_snapshots(&directory, &mut snapshot).unwrap();
+        assert_eq!(snapshot_ids(&directory), [22, 23, 24, 25, 26]);
+    }
+    #[test]
+    fn invalid_or_stale_protection_metadata_prevents_automatic_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = open_directory(&temp);
+        directory.write(1, &valid_bytes(1)).unwrap();
+        directory.protect_baseline(1).unwrap();
+        let marker = directory.baseline_file();
+        let valid_marker = fs::read(&marker).unwrap();
+        fs::write(&marker, b"damaged protection metadata").unwrap();
+        fs::write(directory.staging_file(3), b"orphan").unwrap();
+        assert!(directory.load_catalog().is_err());
+        assert!(directory.write(2, &valid_bytes(2)).is_err());
+        assert!(directory.file(1).exists());
+        assert!(directory.staging_file(3).exists());
+        fs::write(&marker, valid_marker).unwrap();
+        fs::remove_file(directory.file(1)).unwrap();
+        assert!(
+            directory.load_catalog().is_err(),
+            "a stale marker must not silently lose protection"
+        );
+        directory.clear().unwrap();
+        assert!(!marker.exists());
+        directory.write(2, &valid_bytes(2)).unwrap();
+    }
+    #[test]
+    fn damaged_protected_snapshot_is_kept_until_explicit_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = open_directory(&temp);
+        directory.write(1, &valid_bytes(1)).unwrap();
+        directory.protect_baseline(1).unwrap();
+        fs::write(directory.file(1), damaged_bytes(1)).unwrap();
+        assert!(directory.load_catalog().is_err());
+        assert!(directory.file(1).exists());
+        directory.clear().unwrap();
+        assert!(!directory.file(1).exists());
+        assert_eq!(directory.protected_baseline().unwrap(), None);
+    }
+    #[test]
+    fn explicit_unprotect_recovers_catalog_after_invalid_marker_without_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = open_directory(&temp);
+        directory.write(1, &valid_bytes(1)).unwrap();
+        directory.protect_baseline(1).unwrap();
+        fs::write(directory.baseline_file(), b"damaged").unwrap();
+        let path = directory.requested.clone();
+        drop(directory);
+        let service = HistoryService::new(path);
+        let idle = || {
+            let started = Instant::now();
+            loop {
+                if let Some(snapshot) = service.poll()
+                    && !snapshot.busy
+                {
+                    break snapshot;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(idle().scans.is_empty());
+        assert!(service.unprotect_baseline());
+        let recovered = idle();
+        assert_eq!(
+            recovered
+                .scans
+                .iter()
+                .map(|scan| scan.id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(recovered.protected_baseline, None);
+    }
     /// A valid snapshot file for `id`, written the way the app writes it.
     fn valid_bytes(id: u64) -> Vec<u8> {
         let mut saved = fixture();
@@ -2151,7 +2597,7 @@ mod tests {
     #[test]
     fn saturated_capture_admission_does_not_wait_or_silently_accept() {
         let (captures, _held_receiver) = bounded(1);
-        let rejected = Arc::new(AtomicBool::new(false));
+        let rejected = Arc::new(AtomicU8::new(0));
         let capture = HistoryCapture {
             captures,
             rejected: rejected.clone(),
@@ -2159,7 +2605,7 @@ mod tests {
         let model = Arc::new(Model::new(std::env::current_dir().unwrap()));
         assert!(capture.submit(model.clone(), 1, ScanState::Complete, "Normal".into()));
         assert!(!capture.submit(model, 2, ScanState::Complete, "Normal".into()));
-        assert!(rejected.load(Ordering::Acquire));
+        assert_eq!(rejected.load(Ordering::Acquire), REJECT_BUSY);
     }
     #[test]
     fn comparison_revalidates_disk_metadata_after_catalog_load() {
@@ -2642,7 +3088,7 @@ mod tests {
     fn load_report_messages_say_what_was_removed_kept_and_skipped() {
         assert_eq!(
             LoadReport::default().message(),
-            "Local metadata history ready. Five snapshots maximum; no file contents stored."
+            "Local metadata history ready. Five snapshots maximum; 1,000,000 nodes / 128 MiB each. Use scoped folders for larger inventories; no file contents stored."
         );
         let mut report = LoadReport::default();
         report.unusable.removed = 5;
