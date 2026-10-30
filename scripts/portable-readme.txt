@@ -1,4 +1,4 @@
-DiskScope 0.3.0 preview - Windows x64
+DiskScope 0.3.1 preview - Windows x64
 
 Requires Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable
 graphics driver. The Visual C++ runtime is linked into the executable.
@@ -67,4 +67,8 @@ Package contents:
   SHA256SUMS.txt            SHA-256 hashes of the other package files
 
 Keep the notices and licenses directory with the executable when redistributing.
+For ScreenConnect transfer the portable ZIP, extract the entire folder and run
+DiskScope.exe in the user's interactive desktop session. No installation or
+separate Visual C++ runtime is required. A background service command alone
+does not display the GUI on the user's desktop.
 A distribution license for DiskScope's own source has not been selected.

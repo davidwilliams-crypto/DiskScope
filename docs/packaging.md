@@ -1,13 +1,13 @@
 # Windows installer and portable release
 
-DiskScope 0.3.0 has two distribution formats under `dist/releases/0.3.0`:
+DiskScope 0.3.1 has two distribution formats under `dist/releases/0.3.1`:
 
-- `DiskScope-0.3.0-windows-x64-setup.exe`: installer for the current Windows account.
-- `DiskScope-0.3.0-windows-x64-portable.zip`: extract the whole archive, then open `DiskScope.exe` inside `DiskScope-0.3.0-portable`.
+- `DiskScope-0.3.1-windows-x64-setup.exe`: installer for the current Windows account.
+- `DiskScope-0.3.1-windows-x64-portable.zip`: extract the whole archive, then open `DiskScope.exe` inside `DiskScope-0.3.1-portable`.
 
 Both contain the same application and dependency notices. `SHA256SUMS.txt` beside the downloads verifies the release files; a second manifest inside the portable folder covers its application files and notices. The installer adds `Uninstall.exe` and `INSTALLER_NOTICES.txt`. Keep notices with redistributed packages. A distribution license for DiskScope's own source has not been selected.
 
-The unpacked portable build remains available at `dist/0.3.0/DiskScope.exe`. Earlier versions are retained.
+The unpacked portable build remains available at `dist/0.3.1/DiskScope.exe`. Earlier versions are retained.
 
 ## Requirements and behavior
 
