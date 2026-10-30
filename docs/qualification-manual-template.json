@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "purpose": "Unexecuted evidence template. Copy for a new exact candidate; never count this file as a passing gate.",
+  "candidate": {
+    "version": null,
+    "executable_sha256": null,
+    "installer_sha256": null,
+    "portable_sha256": null,
+    "provenance_sha256": null,
+    "source_revision": null,
+    "source_fingerprint": null,
+    "dirty_source": null
+  },
+  "run": {
+    "owner": null,
+    "reviewer": null,
+    "ticket_or_run_id": null,
+    "started_at_utc": null,
+    "finished_at_utc": null,
+    "approved_supported_scope": null,
+    "automated_qualification_sha256": null
+  },
+  "case_fields_required_for_each_supported_scenario": {
+    "status": "pending",
+    "scenario": null,
+    "owner": null,
+    "reviewer": null,
+    "started_at_utc": null,
+    "finished_at_utc": null,
+    "os_edition_build": null,
+    "cpu_ram": null,
+    "disk_filesystem_free_bytes": null,
+    "driver_provider": null,
+    "identity_token_session": null,
+    "local_or_remote_method": null,
+    "exact_command_and_options": null,
+    "predeclared_expected_outcome_and_resource_budget": null,
+    "actual_outcome": null,
+    "coverage_errors": null,
+    "resource_samples_and_latency": null,
+    "evidence_location_and_sha256": null,
+    "failure_or_pending_reason": "Not exercised; no result assumed.",
+    "supported_scope_exclusions_with_approval": null
+  },
+  "gates": [
+    { "id": "release-validation", "status": "pending", "cases": [], "next_action": "Retain all exact-candidate build/test/Clippy/fmt/floor/tooling/advisory/license/provenance/payload evidence and named release review." },
+    { "id": "token-uac", "status": "pending", "cases": [], "next_action": "Execute standard, split-token unelevated/elevated, alternate credentials, UAC-off, SYSTEM/session-zero and consent/cancel cells in an approved lab." },
+    { "id": "persistence-privacy", "status": "pending", "cases": [], "next_action": "Compare pre/post profile metadata on local/redirected/locked profiles, malformed policy, relaunch restrictions, full/redacted export and no-clobber cases." },
+    { "id": "native-actions", "status": "pending", "cases": [], "next_action": "Verify diagnostic-mode refusal. Any proposed action-enabled scope requires explicit disposable native matrix cases and sibling canaries." },
+    { "id": "devices-accounting", "status": "pending", "cases": [], "next_action": "Execute approved physical/provider cells, sparse/compressed/hardlink/long-name/denied/live/reparse/cloud/BitLocker/USB-reuse scenarios with reconciled accounting." },
+    { "id": "resource-classes", "status": "pending", "cases": [], "next_action": "Predeclare RAM/inventory budgets; measure representative 4/8/16GB classes, million-node inventories, memory/disk pressure, unknown probes, cancellation and tail latency." },
+    { "id": "history-evidence", "status": "pending", "cases": [], "next_action": "Exercise eligible and oversized snapshots, partial scans, protected baselines, corruption/locks/space failures, cross-version import/rollback and incident exports." },
+    { "id": "screenconnect", "status": "pending", "cases": [], "next_action": "No tenant/lab is assumed. Record actual roles, launch identities/desktops, reconnect/UAC/disconnect/DPI/graphics/headless/rollback cells when available." },
+    { "id": "keyboard-narrator", "status": "pending", "cases": [], "next_action": "Use actual Narrator and keyboard-only essential workflows with progress/outcome announcements, compact layout, DPI and remote-session cases." },
+    { "id": "publisher-edr", "status": "pending", "cases": [], "next_action": "No approved certificate exists. Obtain independently approved signing/timestamp and online/offline trust/revocation evidence; separately measure SmartScreen/Defender/fleet EDR without protection bypass." },
+    { "id": "installer-rollback", "status": "pending", "cases": [], "next_action": "Retain hosted Server lifecycle evidence; separately qualify intended client profiles, standard/SYSTEM, upgrade/downgrade data compatibility and approved rollback." },
+    { "id": "technician-pilot", "status": "pending", "cases": [], "next_action": "Predeclare 3-5 technician / 10-20 owned-endpoint pilot tasks, retain attempt denominators, correctness, interpretation, assistance, latency, failures and zero safety-critical misconceptions." }
+  ],
+  "decision": {
+    "status": "pending",
+    "eligible_for_90_or_A": false,
+    "numerical_readiness": null,
+    "measured_population_reliability": null,
+    "reason": "Every supported critical scenario needs actual evidence and named review. Missing evidence cannot pass by averaging. This template grants no grade."
+  }
+}

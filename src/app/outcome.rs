@@ -10,6 +10,7 @@ pub(super) enum Presence {
 }
 
 pub(super) struct ActionReview {
+    pub sequence: u64,
     pub path: PathBuf,
     pub root: PathBuf,
     pub generation: u64,
@@ -117,6 +118,9 @@ impl DiskScopeApp {
     }
 
     pub(super) fn action_review_card(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if self.action_review_hidden {
+            return;
+        }
         let Some(review) = self.action_review.as_ref() else {
             return;
         };
@@ -184,7 +188,7 @@ impl DiskScopeApp {
                 .show(ui, &mut content);
         }
         if dismiss {
-            self.action_review = None;
+            self.action_review_hidden = true;
         }
     }
 }
@@ -194,6 +198,7 @@ mod tests {
     use super::*;
     fn review() -> ActionReview {
         ActionReview {
+            sequence: 1,
             path: "fixture".into(),
             root: "root".into(),
             generation: 1,

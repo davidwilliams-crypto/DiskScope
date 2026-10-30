@@ -363,8 +363,14 @@ pub(super) fn native_window_id(_frame: &eframe::Frame) -> Option<NonZeroIsize> {
 
 enum ManagementResult {
     Prepared(Binding, Result<RecyclePlan, ActionError>),
-    Completed(Binding, Result<ActionOutcome, ActionError>),
+    Completed(Binding, Result<ActionOutcome, ActionError>, ActionTiming),
     Elevation(Result<ElevationOutcome, String>),
+}
+
+#[derive(Clone, Copy, Default)]
+struct ActionTiming {
+    started: Option<u64>,
+    finished: Option<u64>,
 }
 
 pub(super) struct Management {
@@ -578,8 +584,21 @@ impl DiskScopeApp {
             path: row.path.clone(),
             action,
         };
+        self.action_journal.request(
+            binding.sequence,
+            binding.generation,
+            if action == FileAction::Recycle {
+                "recycle"
+            } else {
+                "permanent"
+            },
+            binding.root.clone(),
+            binding.path.clone(),
+            diskscope::evidence::utc_now_epoch_ms(),
+        );
         self.management.operation = Some(Operation::Preparing(binding.clone()));
         self.palette_open = false;
+        let sequence = binding.sequence;
         let tx = self.management.tx.clone();
         let ctx = ctx.clone();
         let started = std::thread::Builder::new()
@@ -592,6 +611,13 @@ impl DiskScopeApp {
         if let Err(error) = started {
             self.management.operation = None;
             self.notice = Some(format!("Could not verify the selected file: {error}"));
+            self.action_journal.finish(
+                sequence,
+                None,
+                diskscope::evidence::utc_now_epoch_ms(),
+                "preparation_failed",
+                error.to_string(),
+            );
         }
     }
 
@@ -616,10 +642,28 @@ impl DiskScopeApp {
                         self.notice = Some(
                             "The selection changed. Select the current file and try again.".into(),
                         );
+                        self.action_journal.finish(
+                            binding.sequence,
+                            None,
+                            diskscope::evidence::utc_now_epoch_ms(),
+                            "selection_changed_before_execution",
+                            "Selection changed".into(),
+                        );
                         continue;
                     }
                     match result {
                         Ok(plan) => {
+                            self.action_journal
+                                .stage(binding.sequence, "awaiting_confirmation");
+                            if prepared_block(binding.action, plan.recycle_verdict()).is_some() {
+                                self.action_journal.finish(
+                                    binding.sequence,
+                                    None,
+                                    diskscope::evidence::utc_now_epoch_ms(),
+                                    "refused_before_execution",
+                                    "Recycle preflight refused".into(),
+                                );
+                            }
                             self.management.operation = Some(
                                 match prepared_block(binding.action, plan.recycle_verdict()) {
                                     Some(block) => {
@@ -635,10 +679,19 @@ impl DiskScopeApp {
                                 },
                             )
                         }
-                        Err(error) => self.notice = Some(error.to_string()),
+                        Err(error) => {
+                            self.action_journal.finish(
+                                binding.sequence,
+                                None,
+                                diskscope::evidence::utc_now_epoch_ms(),
+                                "preparation_failed",
+                                error.to_string(),
+                            );
+                            self.notice = Some(error.to_string());
+                        }
                     }
                 }
-                ManagementResult::Completed(binding, result) => {
+                ManagementResult::Completed(binding, result, timing) => {
                     if !matches!(&self.management.operation, Some(Operation::Running(current)) if current.sequence == binding.sequence)
                     {
                         continue;
@@ -646,6 +699,21 @@ impl DiskScopeApp {
                     self.management.operation = None;
                     self.management.running_since = None;
                     let effects = completion_effects(&binding.path, &result);
+                    let status = match &result {
+                        Ok(ActionOutcome::Recycled { .. }) => "recycled",
+                        Ok(ActionOutcome::DeletionRequested { .. }) => "deletion_requested",
+                        Err(ActionError::DeletedNotRecycled) => "deleted_not_recycled",
+                        Err(ActionError::RecycleOutcomeUnconfirmed) => "outcome_unconfirmed",
+                        Err(ActionError::Cancelled) => "cancelled_during_execution",
+                        Err(_) => "failed",
+                    };
+                    self.action_journal.finish(
+                        binding.sequence,
+                        timing.started,
+                        timing.finished,
+                        status,
+                        effects.notice.clone(),
+                    );
                     let before_logical = (self.snapshot.progress.state == ScanState::Complete)
                         .then_some(self.snapshot.progress.logical);
                     let before_volume = self.volume.zip(self.volume_observed_at);
@@ -659,6 +727,7 @@ impl DiskScopeApp {
                     if rescanned {
                         self.rescan_keeping_place(binding.root.clone(), binding.node);
                         self.action_review = Some(outcome::ActionReview {
+                            sequence: binding.sequence,
                             path: binding.path.clone(),
                             root: binding.root.clone(),
                             generation: self.generation,
@@ -674,6 +743,7 @@ impl DiskScopeApp {
                             probe_started: false,
                             volume_refresh_requested: false,
                         });
+                        self.action_review_hidden = false;
                     }
                     self.notice = Some(effects.notice);
                     if let Some(mut report) = effects.report {
@@ -707,6 +777,13 @@ impl DiskScopeApp {
 
     fn execute_confirmed(&mut self, confirmation: Confirmation, ctx: &egui::Context) {
         if !self.session_policy.file_actions_allowed() {
+            self.action_journal.finish(
+                confirmation.binding.sequence,
+                None,
+                diskscope::evidence::utc_now_epoch_ms(),
+                "refused_before_execution",
+                "Helpdesk policy refused removal".into(),
+            );
             self.notice = Some("Helpdesk diagnostic policy refused file removal.".into());
             return;
         }
@@ -725,29 +802,51 @@ impl DiskScopeApp {
         ) || (binding.action == FileAction::Permanent
             && !confirms_permanent(acknowledged, &typed))
         {
+            self.action_journal.finish(
+                binding.sequence,
+                None,
+                diskscope::evidence::utc_now_epoch_ms(),
+                "refused_before_execution",
+                "Confirmation no longer valid".into(),
+            );
             self.notice = Some(
                 "The file confirmation is no longer current. Select the file and try again.".into(),
             );
             return;
         }
         self.management.operation = Some(Operation::Running(binding.clone()));
+        self.action_journal.stage(binding.sequence, "running");
         self.management.running_since = Some(Instant::now());
         let owner = self.management.owner;
         let tx = self.management.tx.clone();
         let ctx = ctx.clone();
+        let sequence = binding.sequence;
         let started = std::thread::Builder::new()
             .name("confirmed-file-action".into())
             .spawn(move || {
+                let started = diskscope::evidence::utc_now_epoch_ms();
                 let result = match binding.action {
                     FileAction::Recycle => file_actions::recycle(plan, owner),
                     FileAction::Permanent => file_actions::delete_permanently(plan),
                 };
-                let _ = tx.send(ManagementResult::Completed(binding, result));
+                let finished = diskscope::evidence::utc_now_epoch_ms();
+                let _ = tx.send(ManagementResult::Completed(
+                    binding,
+                    result,
+                    ActionTiming { started, finished },
+                ));
                 ctx.request_repaint();
             });
         if let Err(error) = started {
             self.management.operation = None;
             self.management.running_since = None;
+            self.action_journal.finish(
+                sequence,
+                None,
+                diskscope::evidence::utc_now_epoch_ms(),
+                "launch_failed",
+                error.to_string(),
+            );
             self.notice = Some(format!(
                 "Could not start the confirmed file action: {error}"
             ));
@@ -772,6 +871,7 @@ impl DiskScopeApp {
         let cancellable = !matches!(operation, Operation::Running(_));
         if cancellable && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
+            self.record_action_cancellation(&operation);
             return;
         }
         let elapsed = self
@@ -820,8 +920,8 @@ impl DiskScopeApp {
                     if permanent {
                         ui.label("This bypasses Recycle Bin. The file cannot be restored from Recycle Bin.");
                         ui.checkbox(&mut confirmation.acknowledged, "I understand this is permanent");
-                        ui.label("Type DELETE to enable permanent deletion:");
-                        ui.add(egui::TextEdit::singleline(&mut confirmation.typed).char_limit(6).desired_width(240.0));
+                        let label = ui.label("Type DELETE to enable permanent deletion:");
+                        ui.add(egui::TextEdit::singleline(&mut confirmation.typed).char_limit(6).desired_width(240.0)).labelled_by(label.id);
                     } else {
                         ui.label(recycle_confirmation(confirmation.plan.recycle_verdict()));
                     }
@@ -844,6 +944,7 @@ impl DiskScopeApp {
             }
         });
         if cancellable && (cancel || modal.should_close()) {
+            self.record_action_cancellation(&operation);
             return;
         }
         if confirm {
@@ -853,6 +954,20 @@ impl DiskScopeApp {
         } else {
             self.management.operation = Some(operation);
         }
+    }
+    fn record_action_cancellation(&mut self, operation: &Operation) {
+        let sequence = match operation {
+            Operation::Preparing(b) => b.sequence,
+            Operation::Confirming(c) => c.binding.sequence,
+            _ => return,
+        };
+        self.action_journal.finish(
+            sequence,
+            None,
+            diskscope::evidence::utc_now_epoch_ms(),
+            "cancelled_before_execution",
+            "Cancelled before the native file action was called".into(),
+        );
     }
 }
 
@@ -961,7 +1076,11 @@ mod tests {
         app.management.operation = Some(Operation::Running(binding(1)));
         app.management
             .tx
-            .send(ManagementResult::Completed(binding(1), result))
+            .send(ManagementResult::Completed(
+                binding(1),
+                result,
+                ActionTiming::default(),
+            ))
             .unwrap();
         app.poll_management(&egui::Context::default());
     }
@@ -1210,6 +1329,7 @@ mod tests {
             .send(ManagementResult::Completed(
                 binding(1),
                 Err(ActionError::PermissionDenied),
+                ActionTiming::default(),
             ))
             .unwrap();
         app.poll_management(&egui::Context::default());
@@ -1475,6 +1595,62 @@ mod tests {
             .clone()
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Explicit disposable GUI native deletion fixture; run with authorization"]
+    fn native_action_journal_records_actual_call_timing_and_survives_dismissal() {
+        let (_fixture, mut app, row) = browsing_in_a_nested_folder();
+        app.request.selected = Some(row.id);
+        let plan = file_actions::prepare(
+            &row.path,
+            row.identity.as_ref().unwrap(),
+            row.logical,
+            row.modified,
+        )
+        .unwrap();
+        app.action_journal.request(
+            501,
+            app.generation,
+            "permanent",
+            app.root_path.clone(),
+            row.path.clone(),
+            diskscope::evidence::utc_now_epoch_ms(),
+        );
+        app.action_journal.stage(501, "awaiting_confirmation");
+        let binding = Binding {
+            sequence: 501,
+            generation: app.generation,
+            node: row.id,
+            root: app.root_path.clone(),
+            path: row.path.clone(),
+            action: FileAction::Permanent,
+        };
+        app.execute_confirmed(
+            Confirmation {
+                binding,
+                plan,
+                acknowledged: true,
+                typed: "DELETE".into(),
+                focus_cancel: false,
+            },
+            &egui::Context::default(),
+        );
+        app.action_review_hidden = true;
+        pump_until(&mut app, "native journal completion", |a| {
+            !a.management.busy()
+                && a.action_journal.export()["records"][0]["finished_utc_epoch_ms"].is_u64()
+        });
+        assert!(!row.path.exists());
+        let journal = app.action_journal.export();
+        let record = &journal["records"][0];
+        assert_eq!(record["status"], "deletion_requested");
+        assert!(record["started_utc_epoch_ms"].is_u64());
+        assert!(
+            record["finished_utc_epoch_ms"].as_u64() >= record["started_utc_epoch_ms"].as_u64()
+        );
+        assert_eq!(app.action_journal.len(), 1);
+    }
+
     fn visible_names(app: &DiskScopeApp) -> Vec<String> {
         app.visible
             .view
@@ -1539,7 +1715,11 @@ mod tests {
         app.management.operation = Some(Operation::Running(binding.clone()));
         app.management
             .tx
-            .send(ManagementResult::Completed(binding, result))
+            .send(ManagementResult::Completed(
+                binding,
+                result,
+                ActionTiming::default(),
+            ))
             .unwrap();
         app.poll_management(&egui::Context::default());
     }
@@ -1548,6 +1728,48 @@ mod tests {
         Ok(ActionOutcome::Recycled {
             original_path: row.path.clone(),
         })
+    }
+
+    #[test]
+    fn keep_place_rescan_marks_previous_pending_reconciliation_interrupted() {
+        let (_fixture, mut app, row) = browsing_in_a_nested_folder();
+        app.action_journal.request(
+            90,
+            app.generation,
+            "recycle",
+            app.root_path.clone(),
+            row.path.clone(),
+            Some(10),
+        );
+        app.action_journal
+            .finish(90, Some(11), Some(12), "recycled", "Recycled".into());
+        app.action_review = Some(outcome::ActionReview {
+            sequence: 90,
+            path: row.path.clone(),
+            root: app.root_path.clone(),
+            generation: app.generation,
+            message: "Recycled".into(),
+            recycled: true,
+            before_logical: Some(601),
+            before_backend: "Normal".into(),
+            after_logical: None,
+            before_volume: None,
+            after_volume: None,
+            state: Some(ScanState::Complete),
+            presence: None,
+            probe_started: true,
+            volume_refresh_requested: true,
+        });
+        app.rescan_keeping_place(app.root_path.clone(), row.id);
+        let record = &app.action_journal.export()["records"][0];
+        assert_eq!(record["reconciliation_interrupted"], true);
+        assert!(
+            record["verification"]
+                .as_str()
+                .unwrap()
+                .contains("interrupted")
+        );
+        assert!(record["reconciled_utc_epoch_ms"].is_u64());
     }
 
     #[test]

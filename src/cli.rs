@@ -311,8 +311,8 @@ impl ScanSource for Controller {
 
 /// Starts a scan on `controller` and waits for it to finish or time out.
 ///
-/// The timing clock starts after the controller is created, started and given
-/// its view request, so setup cost is excluded from the reported wall time.
+/// The timing clock starts before controller start/view setup. Controller
+/// construction, optional caller attribution and report writing are excluded.
 pub fn execute_scan(controller: &mut Controller, options: &ScanOptions) -> ScanRun {
     execute_scan_limited(controller, options, crate::engine::ScanLimits::default())
 }
@@ -322,14 +322,37 @@ pub fn execute_scan_limited(
     options: &ScanOptions,
     limits: crate::engine::ScanLimits,
 ) -> ScanRun {
-    let generation = controller.start_limited(options.root.clone(), options.backend, limits);
-    controller.request_view(options.view_request());
-    wait_for_scan(&*controller, generation, options.timeout)
-}
-
-fn wait_for_scan(source: &impl ScanSource, generation: u64, timeout: Duration) -> ScanRun {
     let started_utc_epoch_ms = crate::evidence::utc_now_epoch_ms();
     let started = Instant::now();
+    let generation = controller.start_limited(options.root.clone(), options.backend, limits);
+    controller.request_view(options.view_request());
+    wait_for_scan_started(
+        &*controller,
+        generation,
+        options.timeout,
+        started_utc_epoch_ms,
+        started,
+    )
+}
+
+#[cfg(test)]
+fn wait_for_scan(source: &impl ScanSource, generation: u64, timeout: Duration) -> ScanRun {
+    wait_for_scan_started(
+        source,
+        generation,
+        timeout,
+        crate::evidence::utc_now_epoch_ms(),
+        Instant::now(),
+    )
+}
+
+fn wait_for_scan_started(
+    source: &impl ScanSource,
+    generation: u64,
+    timeout: Duration,
+    started_utc_epoch_ms: Option<u64>,
+    started: Instant,
+) -> ScanRun {
     let mut latest: Option<Arc<UiSnapshot>> = None;
     let mut first_result_ms = None;
     let timed_out = loop {
@@ -483,17 +506,29 @@ pub fn run_scan_command_with_policy(
     if policy.helpdesk && options.backend != BackendChoice::Normal {
         return Err("Helpdesk policy requires the normal backend".into());
     }
+    // Optional providers can block indefinitely. Never wait for attribution;
+    // the CLI's scan deadline and report must still work without this metadata.
+    let (attribution_tx, attribution_rx) = std::sync::mpsc::sync_channel(1);
+    let attribution_root = options.root.clone();
+    let _ = std::thread::Builder::new()
+        .name("cli-attribution".into())
+        .spawn(move || {
+            let attribution = crate::identity::collect(&attribution_root);
+            let _ = attribution_tx.send(attribution);
+        });
     let mut controller = Controller::new();
-    let run = execute_scan_limited(
-        &mut controller,
-        options,
-        if policy.helpdesk {
-            crate::engine::ScanLimits::helpdesk()
-        } else {
-            crate::engine::ScanLimits::default()
-        },
-    );
+    let limits = if policy.helpdesk {
+        crate::engine::ScanLimits::helpdesk()
+    } else {
+        crate::engine::ScanLimits::default()
+    };
+    let run = execute_scan_limited(&mut controller, options, limits);
     let mut context = EvidenceContext::new(options.root.clone());
+    context.attribution = available_attribution(&attribution_rx);
+    context.resource_observation = controller.resource_observation();
+    context.admission_limits = Some(limits);
+    context.memory_budget = Some(limits.memory_budget());
+    context.resource_refusal_reason = controller.resource_refusal_reason();
     context.redaction = Redaction::Full;
     context.access_context = match crate::admin::elevation_kind() {
         Ok(crate::admin::ElevationKind::Standard) => "standard",
@@ -513,9 +548,29 @@ pub fn run_scan_command_with_policy(
     Ok(run.exit_code())
 }
 
+fn available_attribution(
+    receiver: &std::sync::mpsc::Receiver<crate::identity::Attribution>,
+) -> Option<crate::identity::Attribution> {
+    receiver.try_recv().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn report_does_not_wait_for_an_unfinished_attribution_provider() {
+        let (provider, receiver) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = result_tx.send(available_attribution(&receiver));
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        // Release a mistakenly blocking implementation too, so failure never
+        // leaves a hung test worker behind.
+        drop(provider);
+        worker.join().unwrap();
+        assert!(result.is_ok_and(|value| value.is_none()));
+    }
     use crate::model::{Progress, ScanError, ViewSnapshot};
     use std::{
         cell::{Cell, RefCell},
@@ -989,6 +1044,57 @@ mod tests {
         assert_eq!(report["evidence"]["privacy"]["path_mode"], "full");
         assert!(
             report["evidence"]["timestamps"]["generated_utc_epoch_ms"]
+                .as_u64()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn explicit_cli_export_has_observed_attribution_and_no_implicit_incident_label() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("one.txt"), b"known bytes").unwrap();
+        let destination = fixture.path().join("evidence.json");
+        let options = ScanOptions {
+            root,
+            json: Some(destination.clone()),
+            backend: BackendChoice::Normal,
+            view: ViewMode::Largest,
+            timeout: Duration::from_secs(30),
+        };
+        assert_eq!(
+            run_scan_command_with_policy(
+                &options,
+                crate::session::SessionPolicy {
+                    helpdesk: true,
+                    no_history: true
+                }
+            )
+            .unwrap(),
+            EXIT_COMPLETE
+        );
+        let report: Value = serde_json::from_slice(&fs::read(destination).unwrap()).unwrap();
+        let evidence = &report["evidence"];
+        let attribution = &evidence["context"]["attribution"];
+        if attribution["finished_utc_epoch_ms"].is_u64() {
+            assert!(attribution["elapsed_ms"].as_f64().is_some());
+        } else {
+            assert_eq!(attribution["elapsed_ms"], Value::Null);
+            assert_eq!(attribution["hostname"]["status"], "not_collected");
+        }
+        assert_eq!(
+            evidence["context"]["incident"]["ticket"]["status"],
+            "not_provided"
+        );
+        assert!(
+            evidence["context"]["session"]
+                .as_str()
+                .unwrap()
+                .contains("helpdesk")
+        );
+        assert!(
+            evidence["timestamps"]["started_utc_epoch_ms"]
                 .as_u64()
                 .is_some()
         );

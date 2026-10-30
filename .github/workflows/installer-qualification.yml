@@ -1,0 +1,131 @@
+name: Hosted Windows candidate installer qualification
+on:
+  # Bootstrap a new workflow without changing the default branch. After this
+  # first run it is also available for explicit workflow_dispatch on a ref.
+  push:
+    branches: ['codex/helpdesk-assurance-0.3.3']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installer-lifecycle:
+    # A disposable hosted Windows Server account. This is not client OS,
+    # ScreenConnect, UAC, Narrator, fleet EDR or publisher qualification.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Require disposable hosted runner and inspect environment
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'Installer lifecycle is restricted to disposable GitHub-hosted Windows runners.'
+          }
+          New-Item -ItemType Directory -Path target/hosted-qualification | Out-Null
+          [ordered]@{
+            schema_version = 1; observed_at_utc = [DateTime]::UtcNow.ToString('o')
+            commit = $env:GITHUB_SHA; workflow_ref = $env:GITHUB_WORKFLOW_REF
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+            image_os = $env:ImageOS; image_version = $env:ImageVersion
+            os_version = [Environment]::OSVersion.VersionString
+            scope = 'Disposable hosted Windows Server only; manual client/fleet qualification pending.'
+          } | ConvertTo-Json | Set-Content target/hosted-qualification/environment.json -Encoding utf8
+      - name: Install pinned compiler
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set 1.92.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Fetch hash-pinned official portable NSIS 3.12
+        run: |
+          # Versioned official distribution; no Chocolatey install, PATH mutation,
+          # signing certificate or machine trust changes. Pin independently
+          # recorded in MacPorts' devel/nsis/Portfile; see automation documentation.
+          $zip = Join-Path $env:RUNNER_TEMP 'nsis-3.12.zip'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'diskscope-nsis-3.12'
+          if ((Test-Path -LiteralPath $zip) -or (Test-Path -LiteralPath $toolRoot)) { throw 'NSIS destination already exists.' }
+          Invoke-WebRequest 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip' -OutFile $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -cne '56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f') { throw 'NSIS 3.12 archive hash mismatch.' }
+          Expand-Archive -LiteralPath $zip -DestinationPath $toolRoot
+          $compiler = Join-Path $toolRoot 'nsis-3.12/makensis.exe'
+          $version = & $compiler /VERSION
+          if ($LASTEXITCODE -ne 0 -or $version.Trim() -cne 'v3.12') { throw 'Unexpected NSIS compiler version.' }
+          "DISKSCOPE_NSIS=$compiler" >> $env:GITHUB_ENV
+          [ordered]@{ version = '3.12'; archive_sha256 = $hash; compiler_sha256 = (Get-FileHash -LiteralPath $compiler).Hash.ToLowerInvariant() } |
+            ConvertTo-Json | Set-Content target/hosted-qualification/nsis.json -Encoding utf8
+      - name: Build exact checked-out candidate payload and package
+        run: |
+          ./scripts/build.ps1 -PackageDirectory target/hosted-qualification/payload -ValidationFile docs/validation-helpdesk-assurance-2026-10-30.md
+          ./scripts/package-release.ps1 -SkipBuild -PackageDirectory target/hosted-qualification/payload -OutputDirectory target/hosted-qualification/packages -NsisCompiler $env:DISKSCOPE_NSIS
+      - name: Qualification harness on PowerShell 7 and Windows PowerShell 5.1
+        run: |
+          ./scripts/test-qualification.ps1
+          powershell.exe -NoProfile -File ./scripts/test-qualification.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Join-Path $PWD 'target/hosted-qualification/payload/DiskScope.exe'
+          ./scripts/test-helpdesk-tooling.ps1 -RequireJunction -Executable $exe
+          powershell.exe -NoProfile -File ./scripts/test-helpdesk-tooling.ps1 -RequireJunction -Executable $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exact candidate CLI evidence on both PowerShell hosts
+        run: |
+          $exe = Join-Path $PWD 'target/hosted-qualification/payload/DiskScope.exe'
+          $hash = (Get-FileHash -LiteralPath $exe).Hash
+          foreach ($hostName in @('pwsh', 'powershell.exe')) {
+            $directory = Join-Path $PWD ('target/hosted-qualification/cli-' + $hostName.Replace('.exe', ''))
+            & $hostName -NoProfile -File ./scripts/qualify-helpdesk.ps1 -Executable $exe -ExpectedSha256 $hash -OutputDirectory $directory
+            if ($LASTEXITCODE -ne 2) { throw "Expected pending manual qualification exit 2; got $LASTEXITCODE on $hostName." }
+            $report = Get-Content -LiteralPath (Join-Path $directory 'qualification.json') -Raw | ConvertFrom-Json
+            if ($report.automated_status -ne 'passed' -or $report.decision.status -ne 'pending' -or $report.decision.eligible_for_90_or_A) {
+              throw "Automated qualification failed or missing manual evidence was promoted on $hostName."
+            }
+          }
+          # Exit 2 above is retained as pending evidence, then explicitly accepted
+          # for this automated-only step. Do not leak it into the shell epilogue.
+          $global:LASTEXITCODE = 0
+      - name: Clean per-user installer lifecycle with production safety preflight
+        run: |
+          . ./scripts/release-tools.ps1
+          $version = Get-ReleaseVersion -ProjectRoot $PWD
+          $packages = Join-Path $PWD 'target/hosted-qualification/packages'
+          $installer = Join-Path $packages "DiskScope-$version-windows-x64-setup.exe"
+          $archive = Join-Path $packages "DiskScope-$version-windows-x64-portable.zip"
+          $cases = @(
+            @{ id = 'custom-default-shortcuts'; options = @{} },
+            @{ id = 'custom-no-shortcuts'; options = @{ NoShortcuts = $true } },
+            @{ id = 'default-directory'; options = @{ DefaultDirectory = $true } }
+          )
+          foreach ($case in $cases) {
+            $status = 'failed'
+            $started = [DateTime]::UtcNow.ToString('o')
+            $failure = $null
+            $log = Join-Path $packages ($case.id + '.log')
+            try {
+              $options = $case.options
+              # Existing script refuses registered/unregistered installs,
+              # shortcuts or unsafe destinations before installation. It removes
+              # only its own fixture and installer-owned files via the uninstaller.
+              ./scripts/test-installer.ps1 -Installer $installer -PortableArchive $archive @options *>&1 | Tee-Object -FilePath $log
+              $status = 'passed'
+            } catch { $failure = $_.Exception.Message; throw }
+            finally {
+              [ordered]@{
+                schema_version = 1; case = $case.id; status = $status; started_at_utc = $started; finished_at_utc = [DateTime]::UtcNow.ToString('o')
+                failure = $failure; commit = $env:GITHUB_SHA
+                candidate_sha256 = (Get-FileHash target/hosted-qualification/payload/DiskScope.exe).Hash.ToLowerInvariant()
+                installer_sha256 = (Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant()
+                portable_sha256 = (Get-FileHash -LiteralPath $archive).Hash.ToLowerInvariant()
+                scope = 'Hosted Windows Server: install, exact payload parity, scan, reinstall, move/locked-file refusal, uninstall, unrelated files and profile-data preservation. Upgrade/downgrade and manual client/fleet gates remain pending.'
+              } | ConvertTo-Json | Set-Content (Join-Path $packages ($case.id + '.json')) -Encoding utf8
+            }
+          }
+      - name: Retain candidate hashes, raw evidence and lifecycle logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosted-installer-qualification-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/hosted-qualification/
+          if-no-files-found: error
+          retention-days: 14

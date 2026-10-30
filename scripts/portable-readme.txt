@@ -1,4 +1,4 @@
-DiskScope 0.3.2 preview - Windows x64
+DiskScope 0.3.3 preview - Windows x64
 
 Requires Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable
 graphics driver. The Visual C++ runtime is linked into the executable.
@@ -21,6 +21,15 @@ are reached: 5 million nodes / 1 GiB estimated storage in ordinary mode,
 are not measured process RAM limits. Investigate smaller folders when limited.
 Use Export ticket evidence for a bounded JSON summary. Redaction is on by
 default in the GUI; CLI JSON includes paths. Exports refuse existing files.
+
+Incident & evidence supports session-only ticket/endpoint labels, observed
+native hostname/volume metadata, and a bounded timestamped action journal.
+Redacted reports omit these identifiers and journal details. Explicit export
+is required before closing; outcome dismissal does not erase the journal.
+Windows memory observations proactively stop scan admission on low/unknown
+headroom, retaining partial results. Sampling can miss peaks and is not a hard
+RAM cap. Native status feedback is exposed as a polite accessibility live
+region; complete Narrator and real-world qualification are still required.
 
 Run DiskScope.exe, choose a folder or drive, then select Scan.
 Opening the application does not start a scan. Stop scanning keeps partial results.

@@ -53,6 +53,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attribution_queue_bounds_pending_requests_and_drains_to_the_latest_root() {
+        let (sender, receiver) = attribution_requests();
+        sender.try_send((1, PathBuf::from("first"))).unwrap();
+        assert!(matches!(
+            sender.try_send((2, PathBuf::from("overflow"))),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        let first = receiver.recv().unwrap();
+        sender.try_send((3, PathBuf::from("latest"))).unwrap();
+        assert_eq!(
+            latest_attribution_request(first, &receiver),
+            (3, PathBuf::from("latest"))
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn attribution_worker_returns_the_requested_generation_and_native_root_context() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (results, receiver) = mpsc::sync_channel(1);
+        let requests = attribution_worker(results);
+        requests
+            .try_send((41, fixture.path().to_path_buf()))
+            .unwrap();
+        let NativeResult::Attribution {
+            generation,
+            root,
+            attribution,
+        } = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        else {
+            panic!("unexpected native result");
+        };
+        assert_eq!(generation, 41);
+        assert_eq!(root, fixture.path());
+        assert!(attribution.finished_utc_epoch_ms.is_some());
+        assert!(attribution.hostname.value.is_some());
+        assert!(attribution.volume_serial.value.is_some());
+    }
+
+    #[test]
     fn explorer_uses_an_existing_absolute_system_executable_and_native_arguments() {
         use std::os::windows::ffi::OsStringExt;
         let path = PathBuf::from(std::ffi::OsString::from_wide(&[
@@ -142,6 +187,53 @@ pub(super) fn volume_worker(results: SyncSender<NativeResult>) -> SyncSender<(u6
             }
         })
         .expect("volume worker");
+    sender
+}
+
+type AttributionRequest = (u64, PathBuf);
+
+fn attribution_requests() -> (
+    SyncSender<AttributionRequest>,
+    mpsc::Receiver<AttributionRequest>,
+) {
+    mpsc::sync_channel(1)
+}
+
+fn latest_attribution_request(
+    mut latest: AttributionRequest,
+    receiver: &mpsc::Receiver<AttributionRequest>,
+) -> AttributionRequest {
+    while let Ok(request) = receiver.try_recv() {
+        latest = request;
+    }
+    latest
+}
+
+/// One provider call in flight and at most one queued request. A stalled native
+/// provider cannot create more threads as the user navigates or rescans.
+pub(super) fn attribution_worker(
+    results: SyncSender<NativeResult>,
+) -> SyncSender<AttributionRequest> {
+    let (sender, receiver) = attribution_requests();
+    std::thread::Builder::new()
+        .name("endpoint-attribution".into())
+        .spawn(move || {
+            while let Ok(first) = receiver.recv() {
+                let (generation, root) = latest_attribution_request(first, &receiver);
+                let attribution = diskscope::identity::collect(&root);
+                if results
+                    .send(NativeResult::Attribution {
+                        generation,
+                        root,
+                        attribution: Box::new(attribution),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("attribution worker");
     sender
 }
 #[cfg(windows)]

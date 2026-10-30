@@ -12,8 +12,16 @@ function ConvertTo-HelpdeskNativeArgument {
 }
 
 function Invoke-HelpdeskProcess {
-    param([string]$Executable, [string[]]$Arguments, [switch]$Headless)
+    param([string]$Executable, [string[]]$Arguments, [switch]$Headless,
+        [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0, [switch]$ObserveResources)
     $process = [Diagnostics.Process]::new()
+    $startedAt = [DateTime]::UtcNow.ToString('o')
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $timedOut = $false
+    $samples = 0
+    $peakPrivate = $null
+    $peakWorking = $null
+    $observationError = $null
     try {
         $process.StartInfo.FileName = $Executable
         $process.StartInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-HelpdeskNativeArgument $_ }) -join ' ')
@@ -34,11 +42,48 @@ function Invoke-HelpdeskProcess {
         }
         # PowerShell's call operator need not wait for a GUI-subsystem executable.
         # Wait on the actual process and read its status, never a stale LASTEXITCODE.
+        if ($ObserveResources -or $TimeoutSeconds -gt 0) {
+            do {
+                if ($ObserveResources) {
+                    try {
+                        $process.Refresh()
+                        $private = $process.PrivateMemorySize64
+                        $working = $process.WorkingSet64
+                        if ($private -gt 0) {
+                            $samples++
+                            if ($null -eq $peakPrivate -or $private -gt $peakPrivate) { $peakPrivate = $private }
+                            if ($null -eq $peakWorking -or $working -gt $peakWorking) { $peakWorking = $working }
+                        }
+                    } catch { $observationError = $_.Exception.Message }
+                }
+                if ($process.WaitForExit(10)) { break }
+                if ($TimeoutSeconds -gt 0 -and $clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                    $timedOut = $true
+                    # Only the process this invocation started is terminated.
+                    $process.Kill()
+                    break
+                }
+            } while ($true)
+        }
         $process.WaitForExit()
+        $process.Refresh()
+        $clock.Stop()
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
             StandardOutput = if ($Headless) { $stdout.GetAwaiter().GetResult() } else { '' }
             StandardError = if ($Headless) { $stderr.GetAwaiter().GetResult() } else { '' }
+            TimedOut = $timedOut
+            ElapsedMilliseconds = $clock.ElapsedMilliseconds
+            StartedAtUtc = $startedAt
+            FinishedAtUtc = [DateTime]::UtcNow.ToString('o')
+            Resource = [pscustomobject]@{
+                sample_count = $samples
+                observed_peak_private_bytes = $peakPrivate
+                observed_peak_working_set_bytes = $peakWorking
+                sample_interval_ms = 10
+                observation_error = $observationError
+                semantics = 'Sampled direct-child memory; may miss short peaks; not a fleet or hard-RAM guarantee.'
+            }
         }
     } finally { $process.Dispose() }
 }

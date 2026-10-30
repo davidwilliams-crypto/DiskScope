@@ -1,6 +1,8 @@
+mod accessibility;
 mod changes;
 mod controls;
 mod investigation;
+mod journal;
 mod management;
 mod native;
 mod outcome;
@@ -165,6 +167,11 @@ struct Preferences {
     reduced_motion: bool,
 }
 enum NativeResult {
+    Attribution {
+        generation: u64,
+        root: PathBuf,
+        attribution: Box<diskscope::identity::Attribution>,
+    },
     ExportDestination(Option<PathBuf>),
     Export(Result<PathBuf, String>),
     Locations(Vec<native::Location>),
@@ -201,6 +208,11 @@ pub struct DiskScopeApp {
     export_path: String,
     export_busy: bool,
     export_native_path: Option<PathBuf>,
+    incident_ticket: String,
+    endpoint_label: String,
+    attribution: Option<diskscope::identity::Attribution>,
+    action_journal: journal::Journal,
+    scan_feedback: accessibility::ScanFeedback,
     access_mode: AccessMode,
     management: management::Management,
     controller: Controller,
@@ -215,7 +227,10 @@ pub struct DiskScopeApp {
     volume: Option<native::VolumeSpace>,
     volume_observed_at: Option<std::time::SystemTime>,
     action_review: Option<outcome::ActionReview>,
+    action_review_hidden: bool,
     volume_tx: SyncSender<(u64, PathBuf)>,
+    attribution_tx: SyncSender<(u64, PathBuf)>,
+    pending_attribution: Option<(u64, PathBuf)>,
     history: BrowseHistory,
     pending: Option<Arc<UiSnapshot>>,
     /// A browse position being looked up again in a rescan; see
@@ -306,6 +321,7 @@ impl DiskScopeApp {
         native::discover_locations(native_tx.clone());
         let snapshot = Arc::new(UiSnapshot::default());
         let volume_tx = native::volume_worker(native_tx.clone());
+        let attribution_tx = native::attribution_worker(native_tx.clone());
         let history_service = if persistence_allowed {
             HistoryService::new(history_directory.clone())
         } else {
@@ -329,6 +345,11 @@ impl DiskScopeApp {
             export_path: String::new(),
             export_busy: false,
             export_native_path: None,
+            incident_ticket: String::new(),
+            endpoint_label: String::new(),
+            attribution: None,
+            action_journal: journal::Journal::default(),
+            scan_feedback: accessibility::ScanFeedback::default(),
             access_mode,
             management: management::Management::default(),
             controller,
@@ -347,7 +368,10 @@ impl DiskScopeApp {
             volume: None,
             volume_observed_at: None,
             action_review: None,
+            action_review_hidden: false,
             volume_tx,
+            attribution_tx,
+            pending_attribution: None,
             history: BrowseHistory::default(),
             pending: None,
             restore: None,
@@ -429,8 +453,26 @@ impl DiskScopeApp {
         // Absolute is lexical: resolving a junction here would bypass the
         // scanner's deliberate refusal to follow a link used as the root.
         let preserve_draft = keep.is_some() && self.path_edited;
+        if let Some(review) = self.action_review.as_ref()
+            && (review.presence.is_none()
+                || review.state.is_none()
+                || review.after_volume.is_none())
+        {
+            self.action_journal.interrupt(
+                review.sequence,
+                diskscope::evidence::utc_now_epoch_ms(),
+                if review.presence.is_none() {
+                    "Path verification interrupted before a result"
+                } else {
+                    review.verification()
+                },
+                review.logical_change(),
+                review.volume_change(),
+            );
+        }
         if keep.is_none() {
             self.action_review = None;
+            self.action_review_hidden = false;
         }
         self.root_path = path;
         if self.persistence_allowed() {
@@ -486,6 +528,9 @@ impl DiskScopeApp {
         );
         self.scan_started_utc = diskscope::evidence::utc_now_epoch_ms();
         self.scan_finished_utc = None;
+        self.attribution = None;
+        self.pending_attribution = Some((self.generation, self.root_path.clone()));
+        self.submit_attribution();
         self.volume = None;
         self.volume_observed_at = None;
         let _ = self
@@ -503,6 +548,7 @@ impl DiskScopeApp {
         self.dirty = true;
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        self.submit_attribution();
         self.poll_management(ctx);
         // Both sources are bounded; never drain an unbounded queue in a frame.
         for _ in 0..4 {
@@ -541,6 +587,15 @@ impl DiskScopeApp {
                 break;
             };
             match result {
+                NativeResult::Attribution {
+                    generation,
+                    root,
+                    attribution,
+                } => {
+                    if generation == self.generation && root == self.root_path {
+                        self.attribution = Some(*attribution);
+                    }
+                }
                 NativeResult::ExportDestination(path) => {
                     self.export_busy = false;
                     if let Some(path) = path {
@@ -604,6 +659,19 @@ impl DiskScopeApp {
             self.history_snapshot = history;
         }
         self.poll_action_review(ctx);
+        if let Some(review) = self.action_review.as_ref() {
+            self.action_journal.reconcile(
+                review.sequence,
+                if review.presence.is_some() {
+                    diskscope::evidence::utc_now_epoch_ms()
+                } else {
+                    None
+                },
+                review.verification(),
+                review.logical_change(),
+                review.volume_change(),
+            );
+        }
         if self.generation != 0
             && !self.snapshot.progress.state.is_active()
             && self.scan_finished_utc.is_none()
@@ -623,6 +691,14 @@ impl DiskScopeApp {
                 250
             },
         ));
+    }
+    fn submit_attribution(&mut self) {
+        if let Some(request) = self.pending_attribution.take() {
+            match self.attribution_tx.try_send(request) {
+                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
+                Err(mpsc::TrySendError::Full(request)) => self.pending_attribution = Some(request),
+            }
+        }
     }
     fn submit_view(&mut self) {
         if !self.dirty || self.generation == 0 {
@@ -1941,11 +2017,7 @@ impl eframe::App for DiskScopeApp {
             )
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(self.scan_state().label())
-                            .small()
-                            .color(p.muted),
-                    );
+                    self.accessible_scan_status(ui, p);
                     ui.label(
                         RichText::new(if self.snapshot.progress.backend.is_empty() {
                             "Normal folder scan"
@@ -2299,6 +2371,7 @@ mod tests {
         use eframe::App as _;
         let (mut app, ctx) = table_fixture();
         app.action_review = Some(outcome::ActionReview {
+            sequence: 1,
             path: "removed.bin".into(),
             root: app.root_path.clone(),
             generation: app.generation,

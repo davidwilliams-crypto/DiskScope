@@ -3,12 +3,13 @@ use crate::{
     diagnostics::{self, Counter, Metric, Span},
     model::*,
     platform::{self, EnumerationEvent},
+    resources::{self, MemoryBudget, MemoryObservation, ProbeError, ResourceObservation},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -47,6 +48,66 @@ impl ScanLimits {
             max_nodes: 1_000_000,
             max_estimated_bytes: 256 * 1024 * 1024,
         }
+    }
+    /// Memory tripwires are independent of estimated inventory bytes. Smaller
+    /// inventory caps receive the conservative helpdesk policy by default.
+    pub fn memory_budget(self) -> MemoryBudget {
+        let helpdesk = Self::helpdesk();
+        if self.max_nodes <= helpdesk.max_nodes
+            && self.max_estimated_bytes <= helpdesk.max_estimated_bytes
+        {
+            MemoryBudget::helpdesk()
+        } else {
+            MemoryBudget::default()
+        }
+    }
+}
+
+/// Only the sampler performs OS calls. Coordinator/UI readers clone a tiny
+/// cached observation under a short lock; no process enumeration or I/O occurs.
+#[derive(Default)]
+struct MemoryMonitor {
+    latest: Mutex<Option<(Instant, Result<MemoryObservation, ProbeError>)>>,
+    /// Coordinator writes only on an actual refusal. Sampler recovery must not
+    /// rewrite why the retained partial inventory stopped.
+    refusal: Mutex<Option<(u64, String)>>,
+}
+impl MemoryMonitor {
+    fn spawn(
+        probe: impl Fn() -> Result<MemoryObservation, ProbeError> + Send + 'static,
+        signals: Arc<Signals>,
+        doorbell: Latest<()>,
+    ) -> Arc<Self> {
+        let monitor = Arc::new(Self::default());
+        let output = monitor.clone();
+        thread::Builder::new()
+            .name("memory-observer".into())
+            .spawn(move || {
+                while !signals.stop.load(Ordering::Acquire) {
+                    let measured = probe();
+                    *output
+                        .latest
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) =
+                        Some((Instant::now(), measured));
+                    doorbell.set(());
+                    // The controller never joins this thread. Drop sets stop;
+                    // it releases its last references within one probe interval.
+                    thread::sleep(resources::PROBE_INTERVAL);
+                }
+            })
+            .expect("memory observer");
+        monitor
+    }
+    fn observation(&self) -> Option<ResourceObservation> {
+        let latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        latest.as_ref().map(|(when, measured)| ResourceObservation {
+            measured: measured.clone(),
+            age_ms: when.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        })
     }
 }
 
@@ -111,6 +172,7 @@ struct Start {
     root: PathBuf,
     backend: BackendChoice,
     limits: ScanLimits,
+    memory_budget: MemoryBudget,
 }
 struct Task {
     generation: u64,
@@ -160,6 +222,7 @@ impl Mailboxes {
 pub struct Controller {
     signals: Arc<Signals>,
     mailboxes: Mailboxes,
+    resources: Arc<MemoryMonitor>,
 }
 impl Default for Controller {
     fn default() -> Self {
@@ -176,6 +239,11 @@ impl Controller {
     fn create(history: Option<crate::history::HistoryCapture>) -> Self {
         let signals = Arc::new(Signals::default());
         let mailboxes = Mailboxes::new();
+        let resources = MemoryMonitor::spawn(
+            resources::observe_native,
+            signals.clone(),
+            mailboxes.doorbell.clone(),
+        );
         let (tasks_tx, tasks_rx) = bounded::<Task>(QUEUE);
         let (events_tx, events_rx) = bounded::<Event>(QUEUE);
         let workers = thread::available_parallelism()
@@ -189,11 +257,16 @@ impl Controller {
                 .expect("directory worker");
         }
         let (inbox, control) = (mailboxes.clone(), signals.clone());
+        let observations = resources.clone();
         thread::Builder::new()
             .name("scan-coordinator".into())
-            .spawn(move || coordinate(inbox, control, tasks_tx, events_rx, history))
+            .spawn(move || coordinate(inbox, control, tasks_tx, events_rx, history, observations))
             .expect("scan coordinator");
-        Self { signals, mailboxes }
+        Self {
+            signals,
+            mailboxes,
+            resources,
+        }
     }
     pub fn start(&mut self, root: PathBuf, backend: BackendChoice) -> u64 {
         self.start_limited(root, backend, ScanLimits::default())
@@ -204,6 +277,17 @@ impl Controller {
         backend: BackendChoice,
         limits: ScanLimits,
     ) -> u64 {
+        self.start_with_resources(root, backend, limits, limits.memory_budget())
+    }
+    /// Configure sampled admission tripwires explicitly. This is not a hard
+    /// allocator cap: native workers and views can allocate between samples.
+    pub fn start_with_resources(
+        &mut self,
+        root: PathBuf,
+        backend: BackendChoice,
+        limits: ScanLimits,
+        memory_budget: MemoryBudget,
+    ) -> u64 {
         let generation = self.signals.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.signals.cancel.store(false, Ordering::Release);
         self.mailboxes.starts.set(Start {
@@ -211,9 +295,29 @@ impl Controller {
             root,
             backend,
             limits,
+            memory_budget,
         });
         self.mailboxes.doorbell.set(());
         generation
+    }
+    /// None means the first background probe has not completed. Failures and
+    /// monotonic sample age are preserved so evidence cannot imply fresh success.
+    pub fn resource_observation(&self) -> Option<ResourceObservation> {
+        self.resources.observation()
+    }
+    /// Historical admission refusal for this scan, distinct from the newest
+    /// sampler observation (which may have recovered since the stop).
+    pub fn resource_refusal_reason(&self) -> Option<String> {
+        let refusal = self
+            .resources
+            .refusal
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let generation = self.signals.generation.load(Ordering::Acquire);
+        refusal
+            .as_ref()
+            .filter(|(limited, _)| *limited == generation)
+            .map(|(_, reason)| reason.clone())
     }
     pub fn cancel(&self) {
         self.signals.cancel.store(true, Ordering::Release);
@@ -340,6 +444,8 @@ struct DirectoryCompletion {
 
 struct Scan {
     limits: ScanLimits,
+    memory_budget: MemoryBudget,
+    resource_reason: Option<String>,
     estimated_bytes: usize,
     resource_limited: bool,
     generation: u64,
@@ -398,6 +504,8 @@ impl Scan {
             .then(|| NTFS_NEEDS_DRIVE_ROOT.to_owned());
         Self {
             limits: start.limits,
+            memory_budget: start.memory_budget,
+            resource_reason: None,
             estimated_bytes: std::mem::size_of::<Node>()
                 .saturating_add(start.root.as_os_str().len()),
             resource_limited: false,
@@ -425,6 +533,29 @@ impl Scan {
             fallback_reason,
             raw_progress: None,
         }
+    }
+    /// Initial observation is awaited in Preparing. A failed/stale observation
+    /// stops admission explicitly rather than claiming an empty complete root.
+    fn admit_memory(&mut self, monitor: &MemoryMonitor, signals: &Signals) -> bool {
+        let Some(observation) = monitor.observation() else {
+            return false;
+        };
+        if let Some(reason) = self.memory_budget.refusal(&observation) {
+            *monitor
+                .refusal
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                Some((self.generation, reason.clone()));
+            self.resource_limited = true;
+            self.resource_reason = Some(reason.clone());
+            self.record_error(0, self.model.root_path.clone(), format!(
+                "{reason}; scan stopped with partial results. Sampled protection is not a hard RAM guarantee."
+            ));
+            self.finish(ScanState::Partial);
+            signals.limit_generation(self.generation);
+            return false;
+        }
+        true
     }
     fn normal_fallback(&mut self, reason: String) {
         // Raw attempts publish no partial model. Replace every accounting structure
@@ -580,9 +711,14 @@ impl Scan {
     fn snapshot(&self, request: &ViewRequest) -> UiSnapshot {
         let root = &self.model.nodes[0];
         let message: String = if self.resource_limited {
-            "Scan resource limit reached; partial inventory retained. Choose a smaller folder. No complete baseline was saved.".into()
+            format!(
+                "{} Scan resource limit reached; partial inventory retained. Choose a smaller folder. No complete baseline was saved.",
+                self.resource_reason
+                    .as_deref()
+                    .unwrap_or("Estimated inventory admission budget reached.")
+            )
         } else if self.state == ScanState::Preparing {
-            "Waiting for an available worker; previous I/O may still be finishing.".into()
+            "Waiting for a background memory observation and an available worker; previous I/O may still be finishing.".into()
         } else if self.state == ScanState::Partial {
             "Scan finished with partial results: some directories could not be read or totals overflowed.".into()
         } else if self.state == ScanState::Cancelled {
@@ -692,6 +828,7 @@ fn coordinate(
     tasks: Sender<Task>,
     events: Receiver<Event>,
     history: Option<crate::history::HistoryCapture>,
+    resources: Arc<MemoryMonitor>,
 ) {
     let Mailboxes {
         starts,
@@ -726,6 +863,12 @@ fn coordinate(
                 dirty = true;
                 made_progress = true;
             }
+            let previously_active = active.state.is_active();
+            let memory_ready = previously_active && active.admit_memory(&resources, &signals);
+            if previously_active && !active.state.is_active() {
+                dirty = true;
+                made_progress = true;
+            }
             // Bound event work per coordinator turn so commands cannot starve.
             for _ in 0..QUEUE {
                 let Some(event) = pending_event.take().or_else(|| events.try_recv().ok()) else {
@@ -745,6 +888,10 @@ fn coordinate(
                     Event::NtfsResult(generation, result)
                         if generation == active.generation && active.kind == TaskKind::Ntfs =>
                     {
+                        if !active.admit_memory(&resources, &signals) {
+                            dirty = true;
+                            continue;
+                        }
                         match result {
                             Ok(model) => {
                                 active.model = Arc::new(model);
@@ -776,6 +923,10 @@ fn coordinate(
                     Event::Entries(generation, parent, entries)
                         if generation == active.generation =>
                     {
+                        if !active.admit_memory(&resources, &signals) {
+                            dirty = true;
+                            continue;
+                        }
                         let _ingest = Span::new(Metric::Ingest);
                         diagnostics::add(Metric::IngestEntries, entries.len() as u64);
                         active.insert_entries(parent, entries);
@@ -803,7 +954,7 @@ fn coordinate(
                     _ => {}
                 }
             }
-            if active.state.is_active() && !signals.obsolete(active.generation) {
+            if memory_ready && active.state.is_active() && !signals.obsolete(active.generation) {
                 let _schedule = Span::new(Metric::Schedule);
                 let previous_cursor = active.next_node;
                 let previous_outstanding = active.outstanding;
@@ -930,6 +1081,198 @@ fn coordinate(
 
 #[cfg(test)]
 mod tests {
+    fn healthy_memory() -> Result<crate::resources::MemoryObservation, crate::resources::ProbeError>
+    {
+        Ok(crate::resources::MemoryObservation {
+            private_bytes: 32 * 1024 * 1024,
+            system_available_bytes: 8 * 1024 * 1024 * 1024,
+            observed_utc_epoch_ms: Some(1),
+            source: "deterministic native probe boundary",
+        })
+    }
+
+    #[test]
+    fn unknown_memory_refuses_root_scheduling_instead_of_completing_empty_inventory() {
+        let (mut controller, tasks, _events) = controlled_io_with_probe(None, || {
+            Err(crate::resources::ProbeError::Unavailable(
+                "fixture probe failure",
+            ))
+        });
+        controller.start("fixture".into(), BackendChoice::Normal);
+        let snapshot = wait_snapshot(&controller, |s| !s.progress.state.is_active());
+        assert_eq!(snapshot.progress.state, ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 0);
+        assert!(
+            snapshot
+                .progress
+                .message
+                .contains("measurement unavailable")
+        );
+        assert_eq!(snapshot.view.unique_allocated, None);
+        assert!(tasks.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_probe_keeps_preparing_and_never_blocks_cancel_or_admits_work() {
+        let (probe_started, started) = bounded(1);
+        let (release, released) = bounded(1);
+        let (mut controller, tasks, _events) = controlled_io_with_probe(None, move || {
+            let _ = probe_started.try_send(());
+            let _ = released.recv_timeout(Duration::from_secs(2));
+            healthy_memory()
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        controller.start("fixture".into(), BackendChoice::Normal);
+        let waiting = wait_snapshot(&controller, |s| s.progress.state == ScanState::Preparing);
+        assert!(waiting.progress.message.contains("memory observation"));
+        assert!(tasks.try_recv().is_err());
+        assert!(controller.resource_observation().is_none());
+        controller.cancel();
+        wait_snapshot(&controller, |s| s.progress.state == ScanState::Cancelled);
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn private_memory_pressure_refuses_admission_and_new_generation_can_recover() {
+        let private = Arc::new(AtomicU64::new(2 * 1024 * 1024 * 1024));
+        let next_private = private.clone();
+        let (mut controller, tasks, events) = controlled_io_with_probe(None, move || {
+            let mut sample = healthy_memory()?;
+            sample.private_bytes = next_private.load(Ordering::Acquire);
+            Ok(sample)
+        });
+        let old = controller.start("old".into(), BackendChoice::Normal);
+        let refused = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert!(refused.progress.message.contains("process private"));
+        assert!(
+            controller
+                .resource_refusal_reason()
+                .unwrap()
+                .contains("process private")
+        );
+        assert!(tasks.try_recv().is_err());
+        private.store(32 * 1024 * 1024, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.resource_observation().is_none_or(|sample| {
+            sample
+                .measured
+                .is_ok_and(|memory| memory.private_bytes > 1024 * 1024 * 1024)
+        }) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let new = controller.start("new".into(), BackendChoice::Normal);
+        assert!(controller.resource_refusal_reason().is_none());
+        // Late old-generation pressure notification must not touch global cancel.
+        controller.signals.limit_generation(old);
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(task.generation, new);
+        events.send(Event::Done(new, task.parent)).unwrap();
+        wait_snapshot(&controller, |s| s.progress.state == ScanState::Complete);
+        assert!(!controller.signals.obsolete(new));
+    }
+
+    #[test]
+    fn native_boundary_sampler_is_rate_limited_and_exits_after_controller_drop() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let (controller, _tasks, _events) = controlled_io_with_probe(None, move || {
+            counter.fetch_add(1, Ordering::AcqRel);
+            healthy_memory()
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while calls.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let first = calls.load(Ordering::Acquire);
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(calls.load(Ordering::Acquire), first);
+        let lifecycle = Arc::downgrade(&controller.resources);
+        drop(controller);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lifecycle.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "memory sampler leaked after controller drop"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn pressure_retains_partial_inventory_and_export_reason_without_saving_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = crate::history::HistoryService::new(temp.path().join("history"));
+        let available = Arc::new(AtomicU64::new(8 * 1024 * 1024 * 1024));
+        let next_available = available.clone();
+        let (mut controller, tasks, events) =
+            controlled_io_with_probe(Some(history.capture()), move || {
+                let mut sample = healthy_memory()?;
+                sample.system_available_bytes = next_available.load(Ordering::Acquire);
+                Ok(sample)
+            });
+        let generation = controller.start("fixture".into(), BackendChoice::Normal);
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                task.parent,
+                vec![fixture_entry("retained", false, 12)],
+            ))
+            .unwrap();
+        wait_snapshot(&controller, |s| s.progress.files == 1);
+        available.store(0, Ordering::Release);
+        let snapshot = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 1);
+        assert!(snapshot.progress.message.contains("system available"));
+        let refusal = controller.resource_refusal_reason().unwrap();
+        available.store(8 * 1024 * 1024 * 1024, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.resource_observation().is_none_or(|sample| {
+            sample
+                .measured
+                .is_ok_and(|memory| memory.system_available_bytes == 0)
+        }) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            controller.resource_refusal_reason().as_deref(),
+            Some(refusal.as_str())
+        );
+        assert!(controller.signals.obsolete(generation));
+        assert!(!controller.signals.cancel.load(Ordering::Acquire));
+        let mut context = crate::evidence::EvidenceContext::new("fixture".into());
+        context.redaction = crate::evidence::Redaction::Full;
+        let report = crate::evidence::build_report(&snapshot, &context);
+        assert!(report.to_string().contains("system available"));
+        assert_eq!(report["coverage"]["scan_complete"], false);
+        events.send(Event::Done(generation, task.parent)).unwrap();
+        controller.request_view(ViewRequest {
+            revision: 502,
+            ..Default::default()
+        });
+        wait_snapshot(&controller, |s| s.view.revision == 502);
+        assert!(
+            !controller
+                .poll()
+                .is_some_and(|s| s.progress.state == ScanState::Complete)
+        );
+        history.compare(1, 1);
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(snapshot) = history.poll()
+                && !snapshot.busy
+            {
+                assert!(snapshot.scans.is_empty());
+                break;
+            }
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn resource_limit_cancellation_is_bound_to_the_scan_that_hit_the_limit() {
         let signals = Signals::default();
@@ -1020,13 +1363,31 @@ mod tests {
     fn controlled_io_with_history(
         history: Option<crate::history::HistoryCapture>,
     ) -> (Controller, Receiver<Task>, Sender<Event>) {
+        controlled_io_with_probe(history, healthy_memory)
+    }
+    fn controlled_io_with_probe(
+        history: Option<crate::history::HistoryCapture>,
+        probe: impl Fn() -> Result<MemoryObservation, ProbeError> + Send + 'static,
+    ) -> (Controller, Receiver<Task>, Sender<Event>) {
         let signals = Arc::new(Signals::default());
         let mailboxes = Mailboxes::new();
+        let resources = MemoryMonitor::spawn(probe, signals.clone(), mailboxes.doorbell.clone());
         let (tasks_tx, tasks_rx) = bounded(QUEUE);
         let (events_tx, events_rx) = bounded(QUEUE);
         let (inbox, control) = (mailboxes.clone(), signals.clone());
-        thread::spawn(move || coordinate(inbox, control, tasks_tx, events_rx, history));
-        (Controller { signals, mailboxes }, tasks_rx, events_tx)
+        let observations = resources.clone();
+        thread::spawn(move || {
+            coordinate(inbox, control, tasks_tx, events_rx, history, observations)
+        });
+        (
+            Controller {
+                signals,
+                mailboxes,
+                resources,
+            },
+            tasks_rx,
+            events_tx,
+        )
     }
 
     #[test]
@@ -1055,17 +1416,19 @@ mod tests {
         wait_snapshot(&controller, |s| s.view.revision == 99);
         let end = Instant::now() + Duration::from_secs(3);
         let mut captured = None;
+        let mut last_history_message = String::new();
         while Instant::now() < end {
-            if let Some(snapshot) = history.poll()
-                && !snapshot.busy
-                && snapshot.scans.len() == 1
-            {
-                captured = Some(snapshot);
-                break;
+            if let Some(snapshot) = history.poll() {
+                last_history_message = snapshot.message.clone();
+                if !snapshot.busy && snapshot.scans.len() == 1 {
+                    captured = Some(snapshot);
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        let snapshot = captured.expect("complete model was not captured");
+        let snapshot = captured
+            .unwrap_or_else(|| panic!("complete model was not captured: {last_history_message}"));
         assert_eq!(snapshot.scans[0].live_generation, Some(generation));
         assert_eq!(snapshot.scans[0].logical, 12);
         let cancelled = controller.start(temp.path().join("cancelled"), BackendChoice::Normal);
@@ -1330,6 +1693,7 @@ mod tests {
                 root: "fixture".into(),
                 backend: BackendChoice::Normal,
                 limits: ScanLimits::default(),
+                memory_budget: MemoryBudget::default(),
             });
             scan.insert_entries(
                 0,
@@ -1649,6 +2013,7 @@ mod tests {
             root: "summary-old".into(),
             backend: BackendChoice::Normal,
             limits: ScanLimits::default(),
+            memory_budget: MemoryBudget::default(),
         });
         assert!(scan.root_summary.is_some());
         scan.insert_entries(
@@ -1692,6 +2057,7 @@ mod tests {
             root: "summary-replacement".into(),
             backend: BackendChoice::Normal,
             limits: ScanLimits::default(),
+            memory_budget: MemoryBudget::default(),
         });
         assert_queries(&replacement);
         assert_eq!(
@@ -1709,6 +2075,7 @@ mod tests {
             root: "C:\\".into(),
             backend: BackendChoice::Ntfs,
             limits: ScanLimits::default(),
+            memory_budget: MemoryBudget::default(),
         });
         assert!(raw.root_summary.is_none());
     }
@@ -2056,6 +2423,7 @@ mod tests {
                 generation: 1,
                 root: root.into(),
                 limits: ScanLimits::default(),
+                memory_budget: MemoryBudget::default(),
                 backend,
             };
             assert_eq!(
