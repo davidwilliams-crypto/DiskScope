@@ -141,13 +141,16 @@ function Assert-OwnedCanaries {
 function Assert-InstalledStage($Payload, [string]$StageName) {
     $registration = Get-UpgradeRegistration
     Assert-InstallerUpgradeOwnedLocation $installDirectory $registration
-    Assert-True ($registration.DisplayVersion -ceq $Payload.version) 'Registered version differs from expected stage.'
-    foreach ($hive in @('CurrentUser','LocalMachine')) {
-        foreach ($view in @('Registry64','Registry32')) {
-            if ($hive -eq 'CurrentUser' -and $view -eq 'Registry64') { continue }
-            Assert-True ($null -eq (Get-UpgradeRegistration $hive $view)) "Unexpected installation registration in $hive/$view."
-        }
-    }
+    # Establish cleanup ownership before outcome assertions. A diagnostic failure
+    # must not prevent uninstall of this exact newly-created fixture. Cleanup
+    # still rechecks the registered path and this byte-identical uninstaller.
+    Assert-NoReleaseReparsePath $installedUninstaller
+    Assert-True (Test-Path -LiteralPath $installedUninstaller -PathType Leaf) 'Owned uninstaller missing.'
+    $script:ownedUninstallerHash = (Get-FileHash -LiteralPath $installedUninstaller).Hash
+    $user32 = Get-UpgradeRegistration 'CurrentUser' 'Registry32'
+    $machine64 = Get-UpgradeRegistration 'LocalMachine' 'Registry64'
+    $machine32 = Get-UpgradeRegistration 'LocalMachine' 'Registry32'
+    Assert-InstallerUpgradeRegistrationViews $installDirectory $Payload.version $registration $user32 $machine64 $machine32
     foreach ($relative in @($Payload.hashes.Keys)) {
         $installed = Join-Path $installDirectory $relative
         Assert-NoReleaseReparsePath $installed
@@ -157,8 +160,6 @@ function Assert-InstalledStage($Payload, [string]$StageName) {
         $relative = $file.FullName.Substring($installDirectory.Length + 1)
         Assert-True ($Payload.hashes.ContainsKey($relative) -or $relative -in @('Uninstall.exe', 'INSTALLER_NOTICES.txt', 'unrelated user file.keep')) "Unexpected/stale installed file at $StageName`: $relative"
     }
-    Assert-True (Test-Path -LiteralPath $installedUninstaller -PathType Leaf) 'Owned uninstaller missing.'
-    $script:ownedUninstallerHash = (Get-FileHash -LiteralPath $installedUninstaller).Hash
     Assert-OwnedCanaries
     $reportPath = Join-Path $output ($StageName + '-cli.json')
     $process = Invoke-HelpdeskProcess $installedExe @('--scan', (Join-Path $fixture 'scan'), '--json', $reportPath, '--backend', 'normal', '--timeout', '30') -Headless -TimeoutSeconds 60 -ObserveResources
@@ -166,7 +167,7 @@ function Assert-InstalledStage($Payload, [string]$StageName) {
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
     Assert-True ((Get-DiskScopeReportVersion $report $Payload.version) -ceq $Payload.version -and $report.complete -and $report.files -eq 1 -and $report.logical_bytes -eq 11 -and $report.errors_total -eq 0) 'Installed stage version/known-answer report mismatch.'
     Assert-OwnedCanaries
-    $script:stages.Add([pscustomobject]@{ id = $StageName; status = 'passed'; observed_at_utc = [DateTime]::UtcNow.ToString('o'); version = $Payload.version; executable_sha256 = (Get-FileHash -LiteralPath $installedExe).Hash.ToLowerInvariant(); expected_executable_sha256 = $Payload.executable_sha256.ToLowerInvariant(); payload_files_verified = $Payload.hashes.Count; cli = $process })
+    $script:stages.Add([pscustomobject]@{ id = $StageName; status = 'passed'; observed_at_utc = [DateTime]::UtcNow.ToString('o'); version = $Payload.version; executable_sha256 = (Get-FileHash -LiteralPath $installedExe).Hash.ToLowerInvariant(); expected_executable_sha256 = $Payload.executable_sha256.ToLowerInvariant(); payload_files_verified = $Payload.hashes.Count; registration_views = @{ current_user64 = $registration; current_user32 = $user32; machine64 = $machine64; machine32 = $machine32 }; cli = $process })
 }
 function Invoke-StrictOwnedUninstall {
     Assert-NoReleaseReparsePath $installDirectory

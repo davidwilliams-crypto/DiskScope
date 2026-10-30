@@ -29,5 +29,25 @@ Assert-Rejected { Assert-InstallerUpgradeOwnedLocation 'C:\fixture\install' @{ I
 Assert-Rejected { Assert-InstallerUpgradeOwnedLocation 'C:\fixture\install' @{ InstallLocation = 'relative\install' } } 'Relative registration accepted for uninstall.'
 Assert-InstallerUpgradeOwnedLocation 'C:\fixture\install' @{ InstallLocation = 'C:\fixture\install' }
 $script:checks++
+$owned = @{ InstallLocation = 'C:\fixture\install'; DisplayVersion = '0.3.3'; UninstallString = '"C:\fixture\install\Uninstall.exe"'; EstimatedSize = 42 }
+# HKCU\SOFTWARE is shared on the actual Windows target. Two registry views of
+# the same owned record are expected, not a second unrelated installation.
+Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned ($owned.Clone()) $null $null
+$script:checks++
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.4' $owned $owned $null $null } 'Shared record for the wrong expected version accepted.'
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $null $owned $null $null } 'Missing primary user registration accepted.'
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $null $null $null } 'Missing shared user-view record accepted.'
+foreach ($field in @('InstallLocation','DisplayVersion','UninstallString','EstimatedSize')) {
+    $different = $owned.Clone(); $different[$field] = 'different'
+    Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $different $null $null } "Different shared-view value accepted: $field"
+}
+$differentType = $owned.Clone(); $differentType.EstimatedSize = '42'
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $differentType $null $null } 'Different shared-view value type accepted.'
+$differentNumericType = $owned.Clone(); $differentNumericType.EstimatedSize = [long]42
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $differentNumericType $null $null } 'Different shared-view numeric value type accepted.'
+$extra = $owned.Clone(); $extra.Unexpected = 'extra'
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $extra $null $null } 'Extra shared-view registration value accepted.'
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $owned $owned $null } 'Machine Registry64 registration accepted.'
+Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $owned $null $owned } 'Machine Registry32 registration accepted.'
 Write-Output "Installer upgrade preflight: $script:checks checks passed. Synthetic state tests only; no installer, registry write, profile write or trust mutation."
 exit 0

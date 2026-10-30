@@ -123,10 +123,17 @@ user/machine registry views, shortcuts, default/profile directories and running
 DiskScope processes. Cleanup uses only a byte-verified uninstaller belonging to
 the exact fixture registration, plus the unchanged owned profile canary and its
 proven-empty, initially absent parent. It retains its bounded workspace fixture.
-`test-installer-upgrade-preflight.ps1` passed 18 pure/synthetic checks on both
+`test-installer-upgrade-preflight.ps1` passed 31 pure/synthetic checks on both
 PowerShell 7 and Windows PowerShell 5.1: missing hosted context, self-hosted
 execution, existing registration/path/process, and missing/unrelated/relative
-uninstaller ownership are refused; positive assertion paths also run. These
+uninstaller ownership are refused; positive assertion paths also run. The shared
+HKCU uninstall record must appear identically in both logical registry views,
+including every returned value and its type; mismatched paths, versions,
+commands, values/types, extra fields and either machine registration fail.
+[Microsoft documents HKCU\\SOFTWARE as shared across these views](https://learn.microsoft.com/en-us/windows/win32/winprog64/shared-registry-keys).
+Cleanup ownership is captured after exact fixture-location and uninstaller-file
+validation, before diagnostic outcome assertions, then rechecked before cleanup.
+These
 checks never execute an installer or write registry/profile data, and they
 supply no evidence that actual upgrade/rollback passed. The workflow requires
 them on both hosts before its native hosted stage.

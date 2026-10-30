@@ -30,3 +30,28 @@ function Assert-InstallerUpgradeOwnedLocation {
         throw 'Refusing uninstaller execution: registration does not identify the exact owned fixture installation.'
     }
 }
+
+function Assert-InstallerUpgradeRegistrationViews {
+    param([string]$Expected, [string]$Version, [hashtable]$CurrentUser64, [hashtable]$CurrentUser32,
+        [hashtable]$LocalMachine64, [hashtable]$LocalMachine32)
+    Assert-InstallerUpgradeOwnedLocation $Expected $CurrentUser64
+    if ($CurrentUser64.DisplayVersion -cne $Version) { throw 'Registered version differs from the expected owned stage.' }
+    if ($null -ne $LocalMachine64 -or $null -ne $LocalMachine32) { throw 'Unexpected machine installation registration; this test installs per user only.' }
+    # HKCU\SOFTWARE and its Uninstall subkey are shared, so both logical views
+    # must describe the identical owned record. Never accept a different record.
+    # https://learn.microsoft.com/en-us/windows/win32/winprog64/shared-registry-keys
+    if ($null -eq $CurrentUser32) { throw 'Expected the shared current-user registration in both logical views.' }
+    $primary = [ordered]@{}
+    $shared = [ordered]@{}
+    foreach ($name in @($CurrentUser64.Keys | Sort-Object)) {
+        $value = $CurrentUser64[$name]
+        $primary[$name] = [ordered]@{ type = $(if ($null -eq $value) { 'null' } else { $value.GetType().FullName }); value = $value }
+    }
+    foreach ($name in @($CurrentUser32.Keys | Sort-Object)) {
+        $value = $CurrentUser32[$name]
+        $shared[$name] = [ordered]@{ type = $(if ($null -eq $value) { 'null' } else { $value.GetType().FullName }); value = $value }
+    }
+    if (($primary | ConvertTo-Json -Compress -Depth 8) -cne ($shared | ConvertTo-Json -Compress -Depth 8)) {
+        throw 'Current-user logical registry views differ; expected the identical complete owned registration record.'
+    }
+}
