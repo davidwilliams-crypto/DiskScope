@@ -1,5 +1,10 @@
 # DiskScope: local PC testing and revised assessment
 
+Later independent review, the modal correction and isolated client results are
+recorded in [the Ref VM follow-up](qualification-ref-vm-2026-10-31.md). That report
+uses verified/failed/pending scope gates instead of uncalibrated numerical grades.
+The historical scores and artifact identities below describe the earlier candidate.
+
 Evidence completed 30 October 2026 Halifax / 31 October UTC. **The all-90/A
 deployment target is not met.** Actual desktop testing found and reproduced
 defects, which were fixed and retested. The final unpublished candidate is
