@@ -130,6 +130,7 @@ pub fn build_report(snapshot: &UiSnapshot, context: &EvidenceContext) -> Value {
     let view_root = view_matches_scan
         .then(|| path_display(&snapshot.view.root_path, full, &mut text_truncated));
     let requested_view = context.view_request.as_ref().map(|request| {
+        let search_error = crate::search::SearchQuery::parse(&request.search).err();
         let extensions: Vec<_> = request
             .filters
             .extensions
@@ -147,6 +148,8 @@ pub fn build_report(snapshot: &UiSnapshot, context: &EvidenceContext) -> Value {
             "offset": request.offset,
             "limit": request.limit,
             "search": private_text(&request.search, full, &mut text_truncated),
+            "search_valid": search_error.is_none(),
+            "search_error": search_error,
             "search_all": request.search_all,
             "filters": {
                 "extensions": extensions,
@@ -727,6 +730,23 @@ mod tests {
         assert_eq!(report["requested_view"]["offset"], 17);
         assert_eq!(report["requested_view"]["limit"], 23);
         assert_eq!(report["requested_view"]["search"], "[redacted]");
+        assert!(!report.to_string().contains("secret-customer"));
+    }
+
+    #[test]
+    fn invalid_requested_search_is_disclosed_without_leaking_search_text() {
+        let mut context = EvidenceContext::new("root".into());
+        context.view_request = Some(ViewRequest {
+            search: "path:secret-customer size:invalid".into(),
+            ..Default::default()
+        });
+        let report = build_report(&fixture(), &context);
+        assert_eq!(report["requested_view"]["search_valid"], false);
+        assert!(
+            report["requested_view"]["search_error"]
+                .as_str()
+                .is_some_and(|s| s.contains("Use a size"))
+        );
         assert!(!report.to_string().contains("secret-customer"));
     }
 

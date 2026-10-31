@@ -49,11 +49,11 @@ impl Theme {
         let rgb = Color32::from_rgb;
         match self {
             Self::Dark => Palette {
-                page: rgb(17, 23, 30),
-                side: rgb(13, 18, 24),
-                surface: rgb(23, 30, 38),
-                raised: rgb(34, 43, 53),
-                line: rgb(63, 75, 87),
+                page: rgb(20, 25, 32),
+                side: rgb(14, 18, 24),
+                surface: rgb(22, 28, 36),
+                raised: rgb(31, 39, 49),
+                line: rgb(58, 70, 83),
                 text: rgb(236, 239, 242),
                 muted: rgb(171, 184, 196),
                 faint: rgb(155, 170, 183),
@@ -120,9 +120,9 @@ impl Theme {
         visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, p.accent);
         ctx.set_visuals(visuals);
         let mut style = (*ctx.global_style()).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        style.spacing.interact_size.y = 32.0;
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.interact_size.y = 30.0;
         style
             .text_styles
             .insert(TextStyle::Body, FontId::proportional(14.0));

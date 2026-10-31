@@ -1,6 +1,8 @@
 # DiskScope
 
-A native Windows disk usage analyzer written in Rust with egui/eframe. The **0.3.2 preview** adds enforced helpdesk diagnostics, private sessions, redacted ticket evidence, protected history baselines, resource admission limits and verified deployment helpers. The original implementation was informed by a focused REA investigation of WinDirStat 2.9.3.
+A native Windows disk usage analyzer written in Rust with egui/eframe. The **0.3.4 test preview** combines the revised investigation workspace, structured metadata search and faster bounded queries with the helpdesk safety, resource admission, privacy and accessibility fixes. The original implementation was informed by a focused REA investigation of WinDirStat 2.9.3.
+
+Build the new installer and portable ZIP from this checkout using the commands below; see [0.3.4 test-build notes](docs/validation-preview-0.3.4.md). Earlier 0.3.3 development builds are superseded. The published release links below still refer to 0.3.2 until a new release is explicitly published.
 
 ## Run
 
@@ -8,7 +10,7 @@ Download the [Windows x64 installer](https://github.com/davidwilliams-crypto/Dis
 
 Setup installs for the current Windows account, offers Start menu and desktop shortcuts, and registers an uninstaller. Uninstall preserves scan history, preferences, and unrelated files. The portable version requires no installation; it still saves history and preferences in your Windows profile. See [packaging and verification](docs/packaging.md) for build commands and package details.
 
-Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.2/DiskScope.exe`.
+Open `DiskScope.exe`, choose a folder or drive, then select **Scan**. Opening the app alone does not start a scan. A local package build places the executable at `dist/0.3.4/DiskScope.exe`.
 
 ## Helpdesk preview
 
@@ -20,6 +22,8 @@ Use the [technician runbook](docs/helpdesk-runbook.md), [real-world testing chec
 
 ## Investigation features
 
+- Refined native workspace with a compact header, unified investigation toolbar, wider search, aligned file rows, useful inspector and room for the map. Compact layouts preserve left-aligned filenames and a usable details viewport at larger text sizes.
+- Precise metadata search with quoted phrases, exclusions, `name:`, `path:`, `ext:` and exact `size:` comparisons; Ctrl+F focuses search and F1 explains examples. See the [search guide](docs/investigation-search.md). Large filtered result pages use bounded candidate storage and wide-folder maps skip unnecessary heap updates.
 - Overview with factual folder/type insights and real volume capacity when available.
 - Connected investigation workspace with explicit scanned location, coverage, draft-path distinction, compact navigation and a keyboard-operable file list at larger text sizes.
 - Session action outcomes separate verified path absence, logical scan change and observed available-space change. Recycling does not imply reclaimed space; incomplete or incompatible measurements remain unknown.
@@ -63,14 +67,14 @@ The optional `scripts/dev.ps1` helper uses the project-local toolchain under the
 .\scripts\dev.ps1 -CargoArgs @('build','--release','--locked')
 ```
 
-`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.2`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.92.0 or 1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
+`scripts/build.ps1` builds and packages to `dist/<version>` (currently `dist/0.3.4`), reading the version from `Cargo.toml`; notice collection also needs Python 3.9 or newer and, for the standard-library notices, the exact Rust release recorded under `docs/dependency-notices` (1.92.0 or 1.99.1). Ordinary `cargo build` needs Rust 1.92 or later. Packaging explicitly targets Windows x64 and selects the executable from Cargo's build output, including configured target directories. `BUILD_PROVENANCE.json` records the source revision, working-tree input hashes, compiler, configuration and executable digest; the package checksum manifest covers it. Use `cargo run -- 'C:\some folder'` to open a root directly. A first build needs access to crates.io or the already populated Cargo cache.
 
 `scripts/package-release.ps1 -Offline` builds the application, installer, and portable ZIP; NSIS 3.12 is additionally required. Use `-SkipBuild` only to package an already built, checksum-verified portable directory. The Windows x64 target uses static CRT linking through `.cargo/config.toml`.
 
 ## Repeatable command-line scans
 
 ```powershell
-$p = Start-Process .\dist\0.3.2\DiskScope.exe -ArgumentList '--scan "C:\some folder" --json "D:\scan.json" --backend normal' -PassThru -Wait
+$p = Start-Process .\dist\0.3.4\DiskScope.exe -ArgumentList '--scan "C:\some folder" --json "D:\scan.json" --backend normal' -PassThru -Wait
 $p.ExitCode
 ```
 

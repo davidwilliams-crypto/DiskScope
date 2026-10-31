@@ -28,10 +28,7 @@ pub fn build_treemap(model: &Model, root: NodeId, aspect: f32) -> Vec<MapItem> {
         }
         positive += 1;
         total += u128::from(child.logical);
-        largest.push(Reverse((child.logical, Reverse(id))));
-        if largest.len() > MAX_MAP_ITEMS {
-            largest.pop();
-        }
+        retain_map_candidate(&mut largest, (child.logical, Reverse(id)), MAX_MAP_ITEMS);
     }
     if total == 0 {
         return Vec::new();
@@ -121,6 +118,23 @@ pub fn build_treemap(model: &Model, root: NodeId, aspect: f32) -> Vec<MapItem> {
     items
 }
 
+/// Keep the largest logical weights, with smaller IDs winning equal-size ties.
+pub(crate) fn retain_map_candidate(
+    heap: &mut BinaryHeap<Reverse<(u64, Reverse<NodeId>)>>,
+    candidate: (u64, Reverse<NodeId>),
+    limit: usize,
+) -> bool {
+    if heap.len() < limit {
+        heap.push(Reverse(candidate));
+        true
+    } else if heap.peek().is_some_and(|worst| candidate > worst.0) {
+        *heap.peek_mut().expect("the full heap has a root") = Reverse(candidate);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +205,46 @@ mod tests {
     fn empty_zero_and_invalid_roots_have_no_rectangles() {
         assert!(build_treemap(&model(&[0, 0]), 0, 0.).is_empty());
         assert!(build_treemap(&model(&[1]), u32::MAX, 1.).is_empty());
+    }
+
+    #[test]
+    fn map_candidates_skip_heap_updates_for_noncompetitive_weights() {
+        let mut heap = BinaryHeap::new();
+        let updates = (0..100_000)
+            .filter(|&id| {
+                retain_map_candidate(&mut heap, (100_000 - u64::from(id), Reverse(id)), 100)
+            })
+            .count();
+        assert_eq!(updates, 100);
+        assert_eq!(heap.len(), 100);
+        assert_eq!(heap.peek().unwrap().0, (99_901, Reverse(99)));
+    }
+
+    #[test]
+    fn map_candidate_cutoff_preserves_exact_weights_and_id_ties() {
+        let candidates: Vec<_> = (0..5000)
+            .map(|id| {
+                (
+                    if id % 19 == 0 {
+                        u64::MAX
+                    } else {
+                        u64::from((id * 7919) % 17)
+                    },
+                    Reverse(id),
+                )
+            })
+            .collect();
+        for limit in [0, 1, 17, 2000, 6000] {
+            let mut heap = BinaryHeap::new();
+            for &candidate in &candidates {
+                retain_map_candidate(&mut heap, candidate, limit);
+            }
+            let mut result: Vec<_> = heap.into_iter().map(|Reverse(value)| value).collect();
+            result.sort_unstable_by(|a, b| b.cmp(a));
+            let mut oracle = candidates.clone();
+            oracle.sort_unstable_by(|a, b| b.cmp(a));
+            oracle.truncate(limit);
+            assert_eq!(result, oracle);
+        }
     }
 }

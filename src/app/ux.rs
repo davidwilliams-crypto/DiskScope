@@ -92,7 +92,7 @@ impl DiskScopeApp {
                         .size(10.0)
                         .color(p.faint),
                 );
-                ui.add_space(31.0);
+                ui.add_space(22.0);
                 overline(ui, "VIEWS", p);
                 for (mode, label) in [
                     (ViewMode::Overview, "Overview"),
@@ -248,9 +248,11 @@ impl DiskScopeApp {
         if self.preferences.stable_updates || self.pending.is_some() {
             self.update_controls(ui, p);
         }
+        self.navigation_notice(ui, p);
         if self.request.filters.is_active() || !self.request.search.is_empty() {
             self.filter_chips(ui, p);
         }
+        self.search_feedback(ui, p);
         let snapshot = self.visible.clone();
         let view = &snapshot.view;
         egui::ScrollArea::vertical()
@@ -446,28 +448,27 @@ impl DiskScopeApp {
     }
     pub(super) fn explore_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         self.navigation(ui, p);
-        if !investigation::compact(ui.ctx())
-            || self.preferences.stable_updates
-            || self.pending.is_some()
-        {
+        if self.preferences.stable_updates || self.pending.is_some() {
             self.update_controls(ui, p);
         }
-        if !investigation::compact(ui.ctx())
-            || self.request.filters.is_active()
-            || !self.request.search.is_empty()
-        {
+        self.navigation_notice(ui, p);
+        if self.request.filters.is_active() || !self.request.search.is_empty() {
             self.filter_chips(ui, p);
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         if investigation::compact(ui.ctx()) {
             self.query_controls(ui, p);
-            let height = (ui.available_height() - 80.0).clamp(100.0, 240.0);
+            let available = ui.available_height();
+            let details_reserve = (available * 0.45).clamp(110.0, 180.0);
+            let list_chrome =
+                20.0 + ui.spacing().interact_size.y + 3.0 * ui.spacing().item_spacing.y;
+            let body_height = (available - details_reserve - list_chrome).clamp(38.0, 240.0);
             if self.request.mode == ViewMode::Types {
-                self.types_table(ui, height, p);
+                self.types_table(ui, (available - details_reserve).max(100.0), p);
             } else {
-                self.compact_file_list(ui, height, p);
+                self.compact_file_list(ui, body_height, p);
             }
-            egui::ScrollArea::vertical()
+            let _details = egui::ScrollArea::vertical()
                 .id_salt("compact_details")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -478,6 +479,13 @@ impl DiskScopeApp {
                     self.treemap(ui, 220.0, p);
                     self.comparison_tray(ui, p);
                 });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("compact_details_viewport"),
+                    _details.inner_rect,
+                )
+            });
             return;
         }
         egui::Panel::right("inspector")
@@ -516,14 +524,14 @@ impl DiskScopeApp {
                         let available = ui.available_height();
                         let table_height = (available
                             * if self.preferences.map_focus {
-                                0.32
+                                0.36
                             } else {
-                                0.48
+                                0.60
                             })
-                        .clamp(180.0, 380.0);
+                        .clamp(200.0, 480.0);
                         self.explorer(ui, table_height, p);
                         ui.add_space(12.0);
-                        self.treemap(ui, (available - table_height - 12.0).max(240.0), p);
+                        self.treemap(ui, (available - table_height - 12.0).max(180.0), p);
                         self.comparison_tray(ui, p);
                     });
             });
@@ -556,7 +564,7 @@ impl DiskScopeApp {
             } else {
                 "Filters"
             };
-            if ui.button(filters_label).clicked() {
+            if self.request.mode == ViewMode::Overview && ui.button(filters_label).clicked() {
                 self.sync_filter_fields();
                 self.filter_open = true;
             }
@@ -567,18 +575,9 @@ impl DiskScopeApp {
             {
                 self.comparison_open = true;
             }
-            if !self.changes && self.visible.view.filters_active {
-                ui.label(
-                    RichText::new(format!(
-                        "{} matching files · {} logical",
-                        format_count(self.visible.view.matching_files),
-                        format_bytes(self.visible.view.matching_logical)
-                    ))
-                    .small()
-                    .color(p.accent),
-                );
-            }
         });
+    }
+    fn navigation_notice(&self, ui: &mut egui::Ui, p: Palette) {
         // While a restore is pending its focus is expected to miss for a
         // while, so the worker's "path is not present" note would mislead.
         if self.restore.is_none()
@@ -587,7 +586,7 @@ impl DiskScopeApp {
             ui.colored_label(p.muted, notice);
         }
     }
-    fn apply_pending(&mut self) {
+    pub(super) fn apply_pending(&mut self) {
         if let Some(pending) = self.pending.take()
             && admits_snapshot(
                 self.generation,
@@ -612,6 +611,17 @@ impl DiskScopeApp {
                 .small()
                 .color(p.muted),
             );
+            if self.visible.view.filters_active {
+                ui.label(
+                    RichText::new(format!(
+                        "{} matching files · {} logical",
+                        format_count(self.visible.view.matching_files),
+                        format_bytes(self.visible.view.matching_logical)
+                    ))
+                    .small()
+                    .color(p.accent),
+                );
+            }
             for field in FilterField::ALL {
                 if let Some(label) = field.chip_label(&self.request.filters)
                     && ui
@@ -627,7 +637,7 @@ impl DiskScopeApp {
             }
             if !self.request.search.is_empty()
                 && ui
-                    .small_button(format!("Name: {}  ×", self.request.search))
+                    .small_button(format!("Search: {}  ×", self.request.search))
                     .clicked()
             {
                 self.request.search.clear();

@@ -557,6 +557,14 @@ impl DiskScopeApp {
     }
     pub(super) fn keyboard(&mut self, ctx: &egui::Context) {
         if !self.transient_dialog_open() {
+            if self.generation != 0
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+            {
+                if self.changes || self.request.mode == ViewMode::Overview {
+                    self.destination(ViewMode::Largest);
+                }
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("investigation_search")));
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
                 self.open_palette();
             }
@@ -566,7 +574,10 @@ impl DiskScopeApp {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)) {
                 self.action(Action::Forward);
             }
-            if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            if (!ctx.egui_wants_keyboard_input()
+                || ctx.memory(|m| m.focused() == Some(egui::Id::new("investigation_search"))))
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1))
+            {
                 self.help_open = true;
             }
         }
@@ -800,6 +811,7 @@ impl DiskScopeApp {
             |ui| {
                 for (key, action) in [
                     ("Ctrl K", "Open commands"),
+                    ("Ctrl F", "Focus search in the investigation workspace"),
                     ("↑ / ↓, Enter", "Choose and run a command"),
                     ("Alt ← / Alt →", "Back / Forward with your context"),
                     ("Tab / Shift Tab", "Move keyboard focus"),
@@ -818,8 +830,19 @@ impl DiskScopeApp {
                     ),
                     ("F1", "Keyboard help"),
                 ] {
-                    detail(ui, key, action, p);
+                    help_detail(ui, key, action, p);
                 }
+                ui.separator();
+                ui.label(RichText::new("Search scanned files").strong());
+                ui.add(egui::Label::new(diskscope::search::SEARCH_HELP).wrap());
+                help_detail(
+                    ui,
+                    "Large downloads",
+                    "path:Downloads ext:zip,7z size:>=1GiB",
+                    p,
+                );
+                help_detail(ui, "Exclude drafts", "\"annual report\" -draft", p);
+                ui.separator();
                 ui.label(FILE_ACTION_HELP);
                 ui.add_space(10.0);
                 ui.label(
@@ -832,6 +855,18 @@ impl DiskScopeApp {
         }
     }
 }
+fn help_detail(ui: &mut egui::Ui, key: &str, action: &str, p: Palette) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, ui.spacing().interact_size.y],
+            egui::Label::new(RichText::new(key).small().color(p.muted))
+                .halign(Align::LEFT)
+                .wrap(),
+        );
+        ui.add(egui::Label::new(RichText::new(action).small()).wrap());
+    });
+}
+
 /// The two texts for one pinned row: sizes in the binary units every other
 /// view uses, and the exact byte counts for hover.
 struct ComparisonFigures {
@@ -1784,6 +1819,75 @@ mod tests {
         );
         assert!(!app.help_open);
         assert!(app.filter_open, "the window behind help must stay open");
+    }
+
+    #[test]
+    fn keyboard_help_explains_search_syntax_and_units() {
+        let (mut app, ctx) = idle_app();
+        app.help_open = true;
+        let output = settle_frames(&ctx, |ui| {
+            app.help_window(ui.ctx(), app.preferences.theme.palette())
+        });
+        let mut text = rendered_texts(&output.shapes).join(" ");
+        for _ in 0..4 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![key(egui::Key::PageDown, egui::Modifiers::NONE)],
+                    ..Default::default()
+                },
+                |ui| app.help_window(ui.ctx(), app.preferences.theme.palette()),
+            );
+            text.push_str(&rendered_texts(&output.shapes).join(" "));
+        }
+        assert!(text.contains("size:>=1GiB"), "rendered: {text}");
+        assert!(text.contains("Ctrl F"));
+    }
+
+    #[test]
+    fn help_shortcut_descriptions_wrap_without_overlapping_keys() {
+        fn find(shape: &egui::epaint::Shape, needle: &str) -> Option<Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == needle => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, needle)),
+                _ => None,
+            }
+        }
+        let (mut app, ctx) = idle_app();
+        app.help_open = true;
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(460.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.help_window(ui.ctx(), app.preferences.theme.palette()),
+            );
+        }
+        let rect = |text| {
+            output
+                .shapes
+                .iter()
+                .find_map(|s| find(&s.shape, text))
+                .unwrap()
+        };
+        let key = rect("Delete");
+        let action = rect(
+            "Check Recycle Bin availability, then open the confirmation for the selected file",
+        );
+        assert!(
+            action.left() >= key.right() + 2.0,
+            "key {key:?} overlaps action {action:?}"
+        );
+        assert!(
+            ctx.content_rect().contains_rect(action),
+            "description must fit viewport: {action:?}"
+        );
     }
 
     #[test]

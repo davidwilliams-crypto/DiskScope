@@ -165,6 +165,42 @@ fn assert_exact_page(model: &Model, request: &ViewRequest) {
 }
 
 #[test]
+fn repeated_bounded_partitions_and_deep_fallback_match_full_sort() {
+    let model = shuffled_model(12_000);
+    for sort in [
+        SortKey::Name,
+        SortKey::Logical,
+        SortKey::Allocated,
+        SortKey::Files,
+        SortKey::Modified,
+    ] {
+        for descending in [false, true] {
+            for (offset, limit) in [
+                (0, 1),
+                (13, 100),
+                (8090, 100),
+                (8193, 100),
+                (usize::MAX, 100),
+                (0, 0),
+            ] {
+                assert_exact_page(
+                    &model,
+                    &ViewRequest {
+                        mode: ViewMode::Largest,
+                        search: ".".into(),
+                        sort,
+                        descending,
+                        offset,
+                        limit,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn every_sort_direction_and_filter_page_matches_full_sort_ids() {
     let model = oracle_fixture();
     let requests = [
