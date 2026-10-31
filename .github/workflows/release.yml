@@ -162,6 +162,9 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job: name the repository explicitly so gh does
+          # not try to resolve it from a git working copy.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           status=$(tr -d '[:space:]' < release/signing-status.txt)
