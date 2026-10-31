@@ -31,13 +31,21 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../.github/workflows/windows.yml') -Raw
     $expression = [regex]::Match($workflow, '(?s)\$featureArgs = (?<expression>@\(switch .*?\}\))').Groups['expression'].Value
     Assert-True ([bool]$expression) 'Workflow must explicitly wrap its switch in an array.'
+    # Matrix values reach the script through the environment, never by text
+    # substitution into the script body.
+    Assert-True ($expression -cmatch '\$env:FEATURES') 'Workflow switch must read the feature matrix from $env:FEATURES.'
+    Assert-True ($workflow -cmatch 'FEATURES: \$\{\{ matrix\.features \}\}') 'Workflow must map matrix.features into the FEATURES environment variable.'
+    $previousFeatures = [Environment]::GetEnvironmentVariable('FEATURES', 'Process')
     foreach ($configuration in @('default', 'diagnostics', 'no-gui')) {
-        $scriptText = '$featureArgs = ' + $expression.Replace('${{ matrix.features }}', $configuration) + '; & python -c $probe @featureArgs'
+        $env:FEATURES = $configuration
+        $scriptText = '$featureArgs = ' + $expression + '; & python -c $probe @featureArgs'
         $actual = @((& ([scriptblock]::Create($scriptText))) | ConvertFrom-Json | ForEach-Object { $_ })
         if ($LASTEXITCODE -ne 0) { throw "Native argument probe failed: $configuration" }
         $expected = @(switch ($configuration) { 'diagnostics' { '--features'; 'diagnostics' } 'no-gui' { '--no-default-features' } })
         Assert-Arguments $actual $expected "Workflow argument boundaries changed: $configuration"
     }
+    if ($null -eq $previousFeatures) { Remove-Item Env:FEATURES -ErrorAction SilentlyContinue }
+    else { $env:FEATURES = $previousFeatures }
     $awkwardArguments = @('', 'a b', ('Unicode-' + [char]0x00e9), 'C:\folder with spaces\', 'C:\trailing\\', 'embedded"quote', 'slashes\\"quote')
     $nativeProbe = Invoke-HelpdeskProcess (Get-Command python -ErrorAction Stop).Source (@('-c', $probe) + $awkwardArguments) -Headless
     $roundtrip = @($nativeProbe.StandardOutput | ConvertFrom-Json | ForEach-Object { $_ })
