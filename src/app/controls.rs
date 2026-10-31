@@ -3,6 +3,13 @@ use super::*;
 #[derive(Clone, Default)]
 struct DialogFocus {
     invoker: Option<egui::Id>,
+    initialized: bool,
+}
+
+#[derive(Clone, Default)]
+struct PendingDialogRestore {
+    invoker: Option<egui::Id>,
+    retry: bool,
 }
 
 fn dialog_focus_key(title: &str) -> egui::Id {
@@ -16,6 +23,7 @@ pub(super) fn set_dialog_invoker(ctx: &egui::Context, title: &str, invoker: egui
             dialog_focus_key(title),
             DialogFocus {
                 invoker: Some(invoker),
+                initialized: false,
             },
         )
     });
@@ -24,8 +32,29 @@ pub(super) fn set_dialog_invoker(ctx: &egui::Context, title: &str, invoker: egui
 /// Capture the previously focused control once, before the first window draw.
 pub(super) fn remember_dialog_focus(ctx: &egui::Context, title: &str) {
     let focused = ctx.memory(|m| m.focused());
-    ctx.data_mut(|d| {
-        d.get_temp_mut_or_insert_with(dialog_focus_key(title), || DialogFocus { invoker: focused });
+    let first_draw = ctx.data_mut(|d| {
+        let saved = d.get_temp_mut_or_insert_with(dialog_focus_key(title), || DialogFocus {
+            invoker: focused,
+            initialized: false,
+        });
+        let first_draw = !saved.initialized;
+        saved.initialized = true;
+        first_draw
+    });
+    let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(title));
+    if first_draw {
+        ctx.move_to_top(layer);
+    }
+    ctx.memory_mut(|m| {
+        m.set_modal_layer(layer);
+        if first_draw && let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+        // A window's first sizing pass has no interactive controls yet.
+        // Retry on its visible pass, and wrap Tab after its last control.
+        if m.focused().is_none() && m.allows_interaction(layer) {
+            m.move_focus(egui::FocusDirection::Next);
+        }
     });
 }
 
@@ -34,10 +63,151 @@ pub(super) fn restore_dialog_focus(ctx: &egui::Context, title: &str) {
     let saved = ctx.data_mut(|d| d.remove_temp::<DialogFocus>(dialog_focus_key(title)));
     if let Some(id) = saved.and_then(|s| s.invoker) {
         ctx.memory_mut(|m| m.request_focus(id));
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("pending_dialog_focus_restore"),
+                PendingDialogRestore {
+                    invoker: Some(id),
+                    retry: false,
+                },
+            )
+        });
+    }
+}
+
+/// egui still applies the previous frame's modal layer while drawing the
+/// closing frame. Restore after those widgets can no longer surrender focus.
+pub(super) fn finish_dialog_frame(ctx: &egui::Context) {
+    let key = egui::Id::new("pending_dialog_focus_restore");
+    if let Some(mut pending) = ctx.data_mut(|d| d.remove_temp::<PendingDialogRestore>(key)) {
+        if let Some(id) = pending.invoker {
+            ctx.memory_mut(|m| {
+                if !pending.retry || m.focused().is_none() {
+                    m.request_focus(id);
+                }
+            });
+        }
+        if !pending.retry {
+            // A title-bar close registers this window's modal layer during
+            // its final draw. That stale layer can surrender focus once more
+            // on the next frame, unlike Escape (which closes before drawing).
+            pending.retry = true;
+            ctx.data_mut(|d| d.insert_temp(key, pending));
+        }
+        ctx.request_repaint();
+    }
+    if ctx.memory(|m| m.top_modal_layer().is_some() && m.focused().is_none()) {
+        ctx.request_repaint();
+    }
+}
+
+pub(super) const FILE_COLUMN_MIN_WIDTHS: [f32; 4] = [150.0, 72.0, 72.0, 50.0];
+const COLUMN_KEYBOARD_STEP: f32 = 16.0;
+
+fn table_keyboard_widths_key(ui: &egui::Ui, table_salt: &str) -> egui::Id {
+    ui.id()
+        .with(egui::Id::new(table_salt))
+        .with("keyboard_widths")
+}
+
+pub(super) fn take_table_keyboard_widths(ui: &egui::Ui, table_salt: &str) -> Option<Vec<f32>> {
+    ui.data_mut(|d| d.remove_temp::<Vec<f32>>(table_keyboard_widths_key(ui, table_salt)))
+}
+
+/// egui_extras 0.34.3 generates focusable column handles without widget info
+/// or keyboard resizing. Queue widths through its public initial/reset API.
+pub(super) fn describe_table_resize_handles(
+    ui: &egui::Ui,
+    table_salt: &str,
+    columns: &[&str],
+    widths: &[f32],
+    minimums: &[f32],
+    width_budget: f32,
+    p: Palette,
+) {
+    let state_id = ui.id().with(egui::Id::new(table_salt));
+    for (index, column) in columns.iter().enumerate() {
+        let id = state_id.with("resize_column").with(index);
+        let Some(response) = ui.ctx().read_response(id) else {
+            continue;
+        };
+        let current = widths[index];
+        let minimum = minimums[index];
+        let maximum = if index + 1 < widths.len() {
+            current + (widths[index + 1] - minimums[index + 1]).max(0.0)
+        } else {
+            width_budget - widths[..index].iter().sum::<f32>()
+        }
+        .max(minimum);
+        ui.ctx().accesskit_node_builder(id, |node| {
+            node.set_role(egui::accesskit::Role::Splitter);
+            node.set_label(format!("Resize {column} column"));
+            node.set_description(
+                "Press Left or Right to resize by 16 points, or drag with a pointing device.",
+            );
+            node.set_orientation(egui::accesskit::Orientation::Vertical);
+            node.set_numeric_value(f64::from(current));
+            node.set_min_numeric_value(f64::from(minimum));
+            node.set_max_numeric_value(f64::from(maximum));
+            node.set_numeric_value_step(f64::from(COLUMN_KEYBOARD_STEP));
+        });
+        if response.has_focus() {
+            ui.painter().vline(
+                response.rect.center().x,
+                response.rect.y_range(),
+                Stroke::new(2.0_f32, p.accent),
+            );
+            let delta = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                    Some(-COLUMN_KEYBOARD_STEP)
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                    Some(COLUMN_KEYBOARD_STEP)
+                } else {
+                    None
+                }
+            });
+            if let Some(delta) = delta {
+                ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+                let mut adjusted = widths.to_vec();
+                adjusted[index] = (current + delta).clamp(minimum, maximum);
+                if index + 1 < adjusted.len() {
+                    adjusted[index + 1] -= adjusted[index] - current;
+                }
+                ui.data_mut(|d| d.insert_temp(table_keyboard_widths_key(ui, table_salt), adjusted));
+                ui.ctx().request_repaint();
+            }
+        }
     }
 }
 
 impl DiskScopeApp {
+    fn transient_dialogs(&self) -> [(&'static str, bool); 7] {
+        [
+            ("Scan errors & skipped locations", self.show_errors),
+            ("Filter files", self.filter_open),
+            ("Commands", self.palette_open),
+            ("Appearance & settings", self.settings_open),
+            ("Keyboard help", self.help_open),
+            ("Pinned comparison", self.comparison_open),
+            ("Export investigation evidence", self.export_open),
+        ]
+    }
+    pub(super) fn transient_dialog_open(&self) -> bool {
+        self.transient_dialogs().iter().any(|(_, open)| *open)
+    }
+    pub(super) fn capture_dialog_invokers(&self, ctx: &egui::Context) {
+        let focused = ctx.memory(|m| m.focused());
+        for (title, open) in self.transient_dialogs() {
+            if open {
+                ctx.data_mut(|d| {
+                    d.get_temp_mut_or_insert_with(dialog_focus_key(title), || DialogFocus {
+                        invoker: focused,
+                        initialized: false,
+                    });
+                });
+            }
+        }
+    }
     pub(super) fn filter_window(&mut self, ctx: &egui::Context, p: Palette) {
         if !self.filter_open {
             return;
@@ -296,27 +466,21 @@ impl DiskScopeApp {
         }
     }
     pub(super) fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
-            self.open_palette();
+        if !self.transient_dialog_open() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
+                self.open_palette();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft)) {
+                self.action(Action::Back);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)) {
+                self.action(Action::Forward);
+            }
+            if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+                self.help_open = true;
+            }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft)) {
-            self.action(Action::Back);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)) {
-            self.action(Action::Forward);
-        }
-        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
-            self.help_open = true;
-        }
-        let dialogs = [
-            ("Scan errors & skipped locations", self.show_errors),
-            ("Filter files", self.filter_open),
-            ("Commands", self.palette_open),
-            ("Appearance & settings", self.settings_open),
-            ("Keyboard help", self.help_open),
-            ("Pinned comparison", self.comparison_open),
-            ("Export investigation evidence", self.export_open),
-        ];
+        let dialogs = self.transient_dialogs();
         // Let egui dismiss an open menu/ComboBox before its owning window.
         if !egui::Popup::is_any_open(ctx)
             && dialogs.iter().any(|(_, open)| *open)
@@ -653,6 +817,243 @@ pub(super) fn date_time_label(seconds: u64) -> String {
 mod tests {
     use super::super::test_support::{rendered_texts, settle_frames};
     use super::*;
+    use eframe::App as _;
+
+    fn app_frame(app: &mut DiskScopeApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+        );
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn assert_focus_in_dialog(ctx: &egui::Context, title: &str) {
+        let focused = ctx
+            .memory(|m| m.focused())
+            .unwrap_or_else(|| panic!("{title} needs a focused control"));
+        let response = ctx
+            .read_response(focused)
+            .expect("focused control must be rendered");
+        assert_eq!(
+            response.layer_id,
+            egui::LayerId::new(egui::Order::Middle, egui::Id::new(title)),
+            "focus escaped {title}"
+        );
+    }
+
+    #[test]
+    fn f1_help_initial_focus_and_tab_stay_inside_help_in_actual_app_frames() {
+        let (mut app, ctx) = idle_app();
+        for _ in 0..3 {
+            app_frame(&mut app, &ctx, vec![]);
+        }
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::F1, egui::Modifiers::NONE)],
+        );
+        assert!(app.help_open);
+        app_frame(&mut app, &ctx, vec![]);
+        assert_focus_in_dialog(&ctx, "Keyboard help");
+        for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+            for _ in 0..5 {
+                app_frame(&mut app, &ctx, vec![key(egui::Key::Tab, modifiers)]);
+                app_frame(&mut app, &ctx, vec![]);
+                assert_focus_in_dialog(&ctx, "Keyboard help");
+            }
+        }
+    }
+
+    #[test]
+    fn help_close_control_works_with_enter_and_space_and_restores_focus() {
+        for key_to_close in [egui::Key::Enter, egui::Key::Space] {
+            let (mut app, ctx) = idle_app();
+            for _ in 0..3 {
+                app_frame(&mut app, &ctx, vec![]);
+            }
+            app_frame(
+                &mut app,
+                &ctx,
+                vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            );
+            let invoker = ctx.memory(|m| m.focused());
+            app.help_open = true;
+            for _ in 0..3 {
+                app_frame(&mut app, &ctx, vec![]);
+            }
+            assert_focus_in_dialog(&ctx, "Keyboard help");
+            app_frame(
+                &mut app,
+                &ctx,
+                vec![key(key_to_close, egui::Modifiers::NONE)],
+            );
+            app_frame(&mut app, &ctx, vec![]);
+            assert!(
+                !app.help_open,
+                "{key_to_close:?} should activate the focused help close control"
+            );
+            assert_eq!(ctx.memory(|m| m.focused()), invoker);
+        }
+    }
+
+    #[test]
+    fn transient_dialogs_contain_tab_focus_and_escape_restores_real_invoker() {
+        for title in [
+            "Filter files",
+            "Commands",
+            "Appearance & settings",
+            "Pinned comparison",
+            "Export investigation evidence",
+            "Scan errors & skipped locations",
+        ] {
+            let (mut app, ctx) = idle_app();
+            for _ in 0..3 {
+                app_frame(&mut app, &ctx, vec![]);
+            }
+            app_frame(
+                &mut app,
+                &ctx,
+                vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            );
+            let invoker = ctx
+                .memory(|m| m.focused())
+                .expect("background control has focus");
+            match title {
+                "Filter files" => app.filter_open = true,
+                "Commands" => app.open_palette(),
+                "Appearance & settings" => app.settings_open = true,
+                "Pinned comparison" => app.comparison_open = true,
+                "Export investigation evidence" => app.export_open = true,
+                _ => app.show_errors = true,
+            }
+            for _ in 0..3 {
+                app_frame(&mut app, &ctx, vec![]);
+            }
+            assert_focus_in_dialog(&ctx, title);
+            for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+                for _ in 0..35 {
+                    app_frame(&mut app, &ctx, vec![key(egui::Key::Tab, modifiers)]);
+                    app_frame(&mut app, &ctx, vec![]);
+                    assert_focus_in_dialog(&ctx, title);
+                }
+            }
+            app_frame(&mut app, &ctx, vec![escape_key()]);
+            app_frame(&mut app, &ctx, vec![]);
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(invoker),
+                "{title} must restore its invoker"
+            );
+        }
+    }
+
+    #[test]
+    fn dialog_opening_frame_does_not_activate_the_background_with_enter() {
+        let (mut app, ctx) = idle_app();
+        for _ in 0..3 {
+            app_frame(&mut app, &ctx, vec![]);
+        }
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+        );
+        let invoker = ctx.memory(|m| m.focused()).unwrap();
+        app.destination(ViewMode::Largest);
+        app.help_open = true;
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(
+            app.request.mode,
+            ViewMode::Largest,
+            "Enter must not activate the underlying Overview control"
+        );
+        app_frame(&mut app, &ctx, vec![]);
+        app_frame(&mut app, &ctx, vec![escape_key()]);
+        app_frame(&mut app, &ctx, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(invoker));
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(
+            app.request.mode,
+            ViewMode::Overview,
+            "restored background control must work again"
+        );
+    }
+
+    #[test]
+    fn dialog_blocks_background_shortcuts_and_restores_nested_dialog_focus() {
+        let (mut app, ctx) = idle_app();
+        app.destination(ViewMode::Largest);
+        app.filter_open = true;
+        for _ in 0..3 {
+            app_frame(&mut app, &ctx, vec![]);
+        }
+        let filter_focus = ctx.memory(|m| m.focused());
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::K, egui::Modifiers::CTRL)],
+        );
+        assert!(
+            !app.palette_open,
+            "Ctrl K must not replace a dialog's focus"
+        );
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        assert_eq!(
+            app.request.mode,
+            ViewMode::Largest,
+            "Alt Left must not navigate the background"
+        );
+        app_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::F1, egui::Modifiers::NONE)],
+        );
+        assert!(
+            !app.help_open,
+            "F1 must not stack an unrequested dialog while editing"
+        );
+        // A deliberately opened second dialog restores the control in the
+        // first, then a second Escape closes that first dialog.
+        app.help_open = true;
+        for _ in 0..3 {
+            app_frame(&mut app, &ctx, vec![]);
+        }
+        assert_focus_in_dialog(&ctx, "Keyboard help");
+        app_frame(&mut app, &ctx, vec![escape_key()]);
+        app_frame(&mut app, &ctx, vec![]);
+        assert!(!app.help_open && app.filter_open);
+        assert_eq!(ctx.memory(|m| m.focused()), filter_focus);
+        app_frame(&mut app, &ctx, vec![escape_key()]);
+        assert!(!app.filter_open);
+    }
 
     fn escape_key() -> egui::Event {
         egui::Event::Key {

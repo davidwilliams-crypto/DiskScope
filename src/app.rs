@@ -1217,7 +1217,11 @@ impl DiskScopeApp {
         let mut action = None;
         let selected = self.request.selected;
         let mut row_focus = Vec::new();
+        let mut column_widths = Vec::new();
+        let mut column_minimums = controls::FILE_COLUMN_MIN_WIDTHS;
         let width = ui.available_width();
+        let width_budget =
+            width - ui.spacing().scroll.allocated_width() - 3.0 * ui.spacing().item_spacing.x;
         let width_id = ui.id().with("file_table_available_width");
         let width_changed = ui.data_mut(|data| {
             let previous = data.get_temp::<f32>(width_id);
@@ -1229,26 +1233,34 @@ impl DiskScopeApp {
             }
             changed
         });
-        let table = TableBuilder::new(ui)
+        let keyboard_widths =
+            controls::take_table_keyboard_widths(ui, "file_table").filter(|_| !width_changed);
+        let mut table = TableBuilder::new(ui)
             .id_salt("file_table")
             .striped(false)
             .resizable(true)
             .cell_layout(Layout::left_to_right(Align::Center))
-            .sense(Sense::click())
-            .column(Column::remainder().at_least(150.0))
-            .column(Column::initial(92.0).at_least(72.0))
-            .column(Column::initial(90.0).at_least(72.0))
-            .column(Column::initial(72.0).at_least(50.0))
+            .sense(Sense::CLICK)
             .min_scrolled_height(50.0)
             .max_scroll_height((height - 87.0).max(65.0));
+        for (index, minimum) in controls::FILE_COLUMN_MIN_WIDTHS.iter().enumerate() {
+            let column = if let Some(widths) = &keyboard_widths {
+                Column::initial(widths[index])
+            } else if index == 0 {
+                Column::remainder()
+            } else {
+                Column::initial([0.0, 92.0, 90.0, 72.0][index])
+            };
+            table = table.column(column.at_least(*minimum));
+        }
         // Saved resizable widths otherwise push the size columns outside the
         // clipped table after a window, inspector, or text-scale resize.
-        if width_changed {
+        if width_changed || keyboard_widths.is_some() {
             table.reset();
         }
         table
             .header(27.0, |mut header| {
-                for label in [
+                for (index, label) in [
                     "NAME",
                     "LOGICAL SIZE",
                     if view.row_scope_root != view.root {
@@ -1257,17 +1269,28 @@ impl DiskScopeApp {
                         "FOLDER SHARE"
                     },
                     "FILES",
-                ] {
-                    header.col(|ui| {
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let (used, _) = header.col(|ui| {
                         ui.label(RichText::new(label).small().color(p.faint));
                     });
+                    column_minimums[index] = column_minimums[index].max(used.width());
                 }
             })
             .body(|body| {
+                column_widths = body.widths().to_vec();
                 body.rows(29.0, view.rows.len(), |mut table_row| {
                     let row = &view.rows[table_row.index()];
                     table_row.set_selected(selected == Some(row.id));
+                    let mut keyboard_control = None;
                     table_row.col(|ui| {
+                        keyboard_control = Some(ui.interact(
+                            ui.max_rect(),
+                            ui.id().with("row_keyboard_control"),
+                            Sense::click(),
+                        ));
                         ui.add_space((row.depth.min(12) as f32) * 12.0);
                         if row.has_children {
                             if ui
@@ -1318,10 +1341,11 @@ impl DiskScopeApp {
                             );
                         }
                     });
-                    table_row.col(|ui| {
+                    let (used, _) = table_row.col(|ui| {
                         ui.add(egui::Label::new(format_bytes(row.logical)).selectable(false));
                     });
-                    table_row.col(|ui| {
+                    column_minimums[1] = column_minimums[1].max(used.width());
+                    let (used, _) = table_row.col(|ui| {
                         let fraction = row_share(row.logical, view);
                         let (bar, _) =
                             ui.allocate_exact_size(egui::vec2(28.0, 3.0), Sense::hover());
@@ -1342,13 +1366,27 @@ impl DiskScopeApp {
                             .selectable(false),
                         );
                     });
-                    table_row.col(|ui| {
+                    column_minimums[2] = column_minimums[2].max(used.width());
+                    let (used, _) = table_row.col(|ui| {
                         ui.add(
                             egui::Label::new(RichText::new(format_count(row.files)).color(p.muted))
                                 .selectable(false),
                         );
                     });
-                    let response = table_row.response();
+                    column_minimums[3] = column_minimums[3].max(used.width());
+                    let response = keyboard_control.unwrap().union(table_row.response());
+                    if response.has_focus() {
+                        response
+                            .ctx
+                            .layer_painter(response.layer_id)
+                            .with_clip_rect(response.interact_rect)
+                            .rect_stroke(
+                                response.rect,
+                                2.0,
+                                Stroke::new(1.0_f32, p.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                    }
                     row_focus.push((response.id, row.id, row.is_dir));
                     response.widget_info(|| {
                         egui::WidgetInfo::selected(
@@ -1402,6 +1440,24 @@ impl DiskScopeApp {
                     });
                 });
             });
+        controls::describe_table_resize_handles(
+            ui,
+            "file_table",
+            &[
+                "Name",
+                "Logical size",
+                if view.row_scope_root != view.root {
+                    "Scan share"
+                } else {
+                    "Folder share"
+                },
+                "Files",
+            ],
+            &column_widths,
+            &column_minimums,
+            width_budget,
+            p,
+        );
         if let Some(index) = row_focus
             .iter()
             .position(|(id, _, _)| ui.memory(|m| m.has_focus(*id)))
@@ -1499,7 +1555,7 @@ impl DiskScopeApp {
         let mut extension_lens = None;
         TableBuilder::new(ui)
             .id_salt("types_table")
-            .sense(Sense::click())
+            .sense(Sense::CLICK)
             .striped(false)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder())
@@ -1516,7 +1572,13 @@ impl DiskScopeApp {
             .body(|body| {
                 body.rows(29.0, view.types.len(), |mut row| {
                     let item = &view.types[row.index()];
+                    let mut keyboard_control = None;
                     row.col(|ui| {
+                        keyboard_control = Some(ui.interact(
+                            ui.max_rect(),
+                            ui.id().with("row_keyboard_control"),
+                            Sense::click(),
+                        ));
                         ui.add(
                             egui::Label::new(RichText::new("■").color(tile_color(&item.extension)))
                                 .selectable(false),
@@ -1529,7 +1591,19 @@ impl DiskScopeApp {
                     row.col(|ui| {
                         ui.add(egui::Label::new(format_count(item.files)).selectable(false));
                     });
-                    let response = row.response();
+                    let response = keyboard_control.unwrap().union(row.response());
+                    if response.has_focus() {
+                        response
+                            .ctx
+                            .layer_painter(response.layer_id)
+                            .with_clip_rect(response.interact_rect)
+                            .rect_stroke(
+                                response.rect,
+                                2.0,
+                                Stroke::new(1.0_f32, p.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                    }
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -1993,7 +2067,9 @@ impl eframe::App for DiskScopeApp {
         }
         let ctx = ui.ctx().clone();
         if !self.management.busy() {
-            self.file_action_keyboard(&ctx);
+            if !self.transient_dialog_open() {
+                self.file_action_keyboard(&ctx);
+            }
             if !self.management.busy() {
                 self.keyboard(&ctx);
             }
@@ -2005,6 +2081,12 @@ impl eframe::App for DiskScopeApp {
             self.mark_query_changed();
         }
         let p = self.preferences.theme.palette();
+        if self.transient_dialog_open() {
+            // Capture before disabling the invoker, since egui surrenders
+            // keyboard focus when a disabled widget is rendered.
+            self.capture_dialog_invokers(&ctx);
+            ui.disable();
+        }
         if investigation::compact(&ctx) {
             self.compact_navigation(ui, p);
         } else {
@@ -2052,6 +2134,7 @@ impl eframe::App for DiskScopeApp {
             self.export_window(&ctx);
         }
         self.management_dialog(&ctx, p);
+        controls::finish_dialog_frame(&ctx);
         self.submit_view();
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2842,6 +2925,409 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
+    }
+
+    #[test]
+    fn export_opening_frame_blocks_file_action_shortcuts() {
+        use eframe::App as _;
+        let eligible_file = || {
+            let (mut app, ctx) = table_fixture();
+            app.request.selected = Some(1);
+            let file = app
+                .visible
+                .view
+                .rows
+                .iter()
+                .find(|row| row.id == 1)
+                .unwrap()
+                .clone();
+            assert!(!file.is_dir);
+            Arc::make_mut(&mut app.visible).view.selected = Some(file);
+            app.dirty = false;
+            (app, ctx)
+        };
+        let (mut app, ctx) = eligible_file();
+        app.export_open = true;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Delete,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                }],
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+        );
+        assert!(
+            !app.management.busy(),
+            "Delete must not prepare a background file action while exporting"
+        );
+        assert!(app.export_open);
+        let (mut app, ctx) = eligible_file();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Delete,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                }],
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+        );
+        assert!(
+            app.management.busy(),
+            "the same selected file and shortcut must be eligible outside the dialog"
+        );
+    }
+
+    #[test]
+    fn keyboard_splitter_resize_changes_rendered_width_and_preserves_focus() {
+        let (mut app, ctx) = table_fixture();
+        ctx.enable_accesskit();
+        for _ in 0..3 {
+            table_frame(&mut app, &ctx, vec![]);
+        }
+        let mut splitter = None;
+        for _ in 0..24 {
+            let output = table_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            if let Some(focused) = ctx.memory(|m| m.focused()) {
+                let update = output.platform_output.accesskit_update.unwrap();
+                if update.nodes.iter().any(|(id, node)| {
+                    *id == focused.accesskit_id()
+                        && node.label() == Some("Resize Logical size column")
+                }) {
+                    splitter = Some(focused);
+                    break;
+                }
+            }
+        }
+        let splitter = splitter.expect("logical-size splitter must be reachable by Tab");
+        let before = table_frame(&mut app, &ctx, vec![]);
+        let share_before = text_center(&before.shapes, "FOLDER SHARE").x;
+        let files_before = text_center(&before.shapes, "FILES").x;
+        table_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let after = table_frame(&mut app, &ctx, vec![]);
+        assert!(
+            text_center(&after.shapes, "FOLDER SHARE").x > share_before + 4.0,
+            "Right must enlarge the real rendered logical-size column"
+        );
+        assert!(
+            (text_center(&after.shapes, "FILES").x - files_before).abs() < 1.0,
+            "an interior resize transfers adjacent width without overflowing the table"
+        );
+        assert_eq!(ctx.memory(|m| m.focused()), Some(splitter));
+        let update = after.platform_output.accesskit_update.unwrap();
+        let (_, node) = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == splitter.accesskit_id())
+            .unwrap();
+        let value = node
+            .numeric_value()
+            .expect("splitter exposes its real width");
+        assert!(
+            value >= node.min_numeric_value().unwrap()
+                && value <= node.max_numeric_value().unwrap()
+        );
+        assert!(node.description().unwrap().contains("Left"));
+        // The reverse key shrinks the rendered column; either direction can
+        // take a shorter final step at the column's content minimum.
+        table_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let restored = table_frame(&mut app, &ctx, vec![]);
+        assert!(
+            text_center(&restored.shapes, "FOLDER SHARE").x
+                < text_center(&after.shapes, "FOLDER SHARE").x - 4.0
+        );
+        for direction in [egui::Key::ArrowLeft, egui::Key::ArrowRight] {
+            for _ in 0..80 {
+                table_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Key {
+                        key: direction,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let output = table_frame(&mut app, &ctx, vec![]);
+                let update = output.platform_output.accesskit_update.unwrap();
+                let (_, node) = update
+                    .nodes
+                    .iter()
+                    .find(|(id, _)| *id == splitter.accesskit_id())
+                    .unwrap();
+                assert!(
+                    node.numeric_value().unwrap() >= 72.0,
+                    "logical width must respect its original minimum"
+                );
+                assert!(node.numeric_value().unwrap() <= node.max_numeric_value().unwrap() + 0.1);
+                assert!(
+                    (text_center(&output.shapes, "FILES").x - files_before).abs() < 1.0,
+                    "repeated resizing cannot push the last column out of the table"
+                );
+                assert_eq!(ctx.memory(|m| m.focused()), Some(splitter));
+            }
+        }
+        // A queued resize based on the old viewport cannot override the
+        // existing reset that keeps all columns visible after a resize.
+        table_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let resized = table_frame_at_width(&mut app, &ctx, vec![], 900.0);
+        let (mut fresh_app, fresh_ctx) = table_fixture();
+        for _ in 0..3 {
+            table_frame_at_width(&mut fresh_app, &fresh_ctx, vec![], 900.0);
+        }
+        let fresh = table_frame_at_width(&mut fresh_app, &fresh_ctx, vec![], 900.0);
+        for label in ["LOGICAL SIZE", "FOLDER SHARE", "FILES"] {
+            assert!(
+                (text_center(&resized.shapes, label).x - text_center(&fresh.shapes, label).x).abs()
+                    < 1.0,
+                "viewport reset must win over queued keyboard widths for {label}"
+            );
+        }
+        // Public reset/initial updates must leave native pointer resizing intact.
+        for _ in 0..2 {
+            table_frame_at_width(&mut app, &ctx, vec![], 900.0);
+        }
+        let point = ctx.read_response(splitter).unwrap().rect.center();
+        table_frame_at_width(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(point)],
+            900.0,
+        );
+        table_frame_at_width(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            900.0,
+        );
+        let dragged = point + egui::vec2(12.0, 0.0);
+        table_frame_at_width(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(dragged)],
+            900.0,
+        );
+        table_frame_at_width(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: dragged,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            900.0,
+        );
+        let pointer_resized = table_frame_at_width(&mut app, &ctx, vec![], 900.0);
+        assert!(
+            text_center(&pointer_resized.shapes, "FOLDER SHARE").x
+                > text_center(&resized.shapes, "FOLDER SHARE").x + 4.0,
+            "pointer drag must still resize the real column after keyboard resizing"
+        );
+    }
+
+    #[test]
+    fn every_table_splitter_honors_keyboard_minimum_and_table_fit() {
+        for (label, minimum) in [
+            ("Resize Name column", 150.0),
+            ("Resize Logical size column", 72.0),
+            ("Resize Folder share column", 72.0),
+            ("Resize Files column", 50.0),
+        ] {
+            let (mut app, ctx) = table_fixture();
+            ctx.enable_accesskit();
+            for _ in 0..3 {
+                table_frame(&mut app, &ctx, vec![]);
+            }
+            let mut splitter = None;
+            for _ in 0..24 {
+                let output = table_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                if let Some(focused) = ctx.memory(|m| m.focused())
+                    && output
+                        .platform_output
+                        .accesskit_update
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .any(|(id, node)| {
+                            *id == focused.accesskit_id() && node.label() == Some(label)
+                        })
+                {
+                    splitter = Some(focused);
+                    break;
+                }
+            }
+            let splitter = splitter.expect("named splitter must be keyboard reachable");
+            for direction in [egui::Key::ArrowLeft, egui::Key::ArrowRight] {
+                for _ in 0..80 {
+                    table_frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::Key {
+                            key: direction,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    );
+                    let output = table_frame(&mut app, &ctx, vec![]);
+                    let update = output.platform_output.accesskit_update.unwrap();
+                    let (_, node) = update
+                        .nodes
+                        .iter()
+                        .find(|(id, _)| *id == splitter.accesskit_id())
+                        .unwrap();
+                    let value = node.numeric_value().unwrap();
+                    assert!(value >= minimum, "{label} must honor its minimum");
+                    assert!(value <= node.max_numeric_value().unwrap() + 0.1);
+                    for (_, handle) in update
+                        .nodes
+                        .iter()
+                        .filter(|(_, n)| n.role() == egui::accesskit::Role::Splitter)
+                    {
+                        assert!(
+                            handle.bounds().unwrap().x1 <= 1000.0,
+                            "{label} must keep every column inside the viewport"
+                        );
+                    }
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(splitter));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_traversal_skips_static_table_headers_and_unnamed_cells() {
+        for types in [false, true] {
+            let (mut app, ctx) = table_fixture();
+            ctx.enable_accesskit();
+            if types {
+                app.request.mode = ViewMode::Types;
+                Arc::make_mut(&mut app.visible).view.types = vec![TypeStat {
+                    extension: ".mp4".into(),
+                    logical: 100,
+                    files: 1,
+                }];
+            }
+            for _ in 0..3 {
+                table_frame(&mut app, &ctx, vec![]);
+            }
+            let expected_rows = if types {
+                1
+            } else {
+                app.visible.view.rows.len()
+            };
+            let mut row_controls = std::collections::HashSet::new();
+            for _ in 0..24 {
+                let output = table_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let Some(focused) = ctx.memory(|m| m.focused()) else {
+                    continue;
+                };
+                let update = output.platform_output.accesskit_update.unwrap();
+                let (_, node) = update
+                    .nodes
+                    .iter()
+                    .find(|(id, _)| *id == focused.accesskit_id())
+                    .expect("focused table control must exist in accessibility tree");
+                assert!(
+                    !matches!(node.role(), egui::accesskit::Role::GenericContainer),
+                    "Tab must skip static header cells and anonymous body cells (types={types})"
+                );
+                let label = node.label().or(node.value()).unwrap_or("");
+                assert!(
+                    !label.is_empty()
+                        || !node.labelled_by().is_empty()
+                        || node.placeholder().is_some(),
+                    "every focus stop must have an accessible name: {node:?}"
+                );
+                if label.contains("demo.mp4")
+                    || label.contains("folder ·")
+                    || label.contains("Explore .mp4")
+                {
+                    row_controls.insert(focused);
+                }
+            }
+            assert_eq!(
+                row_controls.len(),
+                expected_rows,
+                "one named keyboard control per row"
+            );
+        }
     }
 
     #[test]
