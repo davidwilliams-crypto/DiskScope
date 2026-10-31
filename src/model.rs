@@ -438,6 +438,9 @@ pub struct ViewSnapshot {
     pub breakdown_root: Option<NodeId>,
     pub breakdown: Vec<BreakdownItem>,
     pub notice: Option<String>,
+    /// Controlled parser feedback, separate from navigation notices. A failed
+    /// query returns zero matches and must not be interpreted as valid absence.
+    pub search_error: Option<String>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct UiSnapshot {

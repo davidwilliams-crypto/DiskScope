@@ -669,22 +669,37 @@ struct SeenAttribute {
     name: Range<usize>,
 }
 impl SeenAttribute {
-    fn same_identity(&self, other: &Self, record: &[u8]) -> bool {
+    /// The attribute name as stored in `record`. Capture proves the range lies
+    /// inside the record, but reads still go through `get` so a future edit can
+    /// never turn a stale range into an out-of-bounds panic.
+    fn name<'a>(&self, record: &'a [u8]) -> Option<&'a [u8]> {
+        record.get(self.name.clone())
+    }
+    fn same_identity(&self, other: &Self, record: &[u8]) -> Result<bool> {
         // Instance ids differ between nearly all attributes, so test the cheap fields first.
-        self.id == other.id
+        let names = match (self.name(record), other.name(record)) {
+            (Some(mine), Some(theirs)) => (mine, theirs),
+            // A captured range outside the record is malformed state, not inequality.
+            _ => return Err(err("Stale attribute name range")),
+        };
+        Ok(self.id == other.id
             && self.kind == other.kind
             && self.start_vcn == other.start_vcn
-            && record[self.name.clone()] == record[other.name.clone()]
+            && names.0 == names.1)
     }
-    fn to_key(&self, record: &[u8]) -> AttributeKey {
+    fn to_key(&self, record: &[u8]) -> Result<AttributeKey> {
         let mut name = Vec::new();
-        extend_units(&mut name, &record[self.name.clone()]);
-        AttributeKey {
+        extend_units(
+            &mut name,
+            self.name(record)
+                .ok_or_else(|| err("Stale attribute name range"))?,
+        );
+        Ok(AttributeKey {
             kind: self.kind,
             id: self.id,
             start_vcn: self.start_vcn,
             name,
-        }
+        })
     }
 }
 
@@ -844,11 +859,14 @@ fn parse_record_in_place(
             start_vcn: if nonresident == 0 { 0 } else { u64_at(a, 16)? },
             name,
         };
-        if scratch
-            .seen
-            .iter()
-            .any(|earlier| earlier.same_identity(&identity, b))
-        {
+        let mut duplicate = false;
+        for earlier in &scratch.seen {
+            if earlier.same_identity(&identity, b)? {
+                duplicate = true;
+                break;
+            }
+        }
+        if duplicate {
             return Err(err("Duplicate attribute identity"));
         }
         scratch.seen.push(identity);
@@ -895,7 +913,11 @@ fn parse_record_in_place(
     // Only records that take part in an ATTRIBUTE_LIST are ever asked for their attribute keys,
     // so only they pay for owned copies. For a typical volume that is a tiny fraction of records.
     if record.base != 0 || !record.attribute_list.is_empty() {
-        record.attributes = scratch.seen.iter().map(|seen| seen.to_key(b)).collect();
+        record.attributes = scratch
+            .seen
+            .iter()
+            .map(|seen| seen.to_key(b))
+            .collect::<Result<HashSet<_>>>()?;
     }
     Ok(Some(record))
 }

@@ -40,10 +40,7 @@ pub fn build_icicle(model: &Model, root: NodeId) -> Vec<MapItem> {
             }
             total += u128::from(child.logical);
             count += 1;
-            heap.push(Reverse((child.logical, Reverse(id))));
-            if heap.len() > budget {
-                heap.pop();
-            }
+            crate::treemap::retain_map_candidate(&mut heap, (child.logical, Reverse(id)), budget);
         }
         if total == 0 {
             continue;

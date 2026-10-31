@@ -33,11 +33,7 @@ jobs:
             scope = 'Disposable hosted Windows Server only; manual client/fleet qualification pending.'
           } | ConvertTo-Json | Set-Content target/hosted-qualification/environment.json -Encoding utf8
       - name: Install pinned compiler
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup override set 1.92.0
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: ./scripts/install-pinned-toolchain.ps1
       - name: Fetch hash-pinned official portable NSIS 3.12
         run: |
           # Versioned official distribution; no Chocolatey install, PATH mutation,

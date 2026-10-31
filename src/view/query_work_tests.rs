@@ -8,6 +8,8 @@ struct Work {
     match_storage_bytes: usize,
     allocation_checks: usize,
     filter_normalizations: usize,
+    candidate_storage: usize,
+    traversal_storage: usize,
 }
 thread_local! {
     static WORK: Cell<Option<Work>> = const { Cell::new(None) };
@@ -34,6 +36,12 @@ pub(super) fn record_allocation_check() {
 }
 pub(super) fn record_filter_normalization() {
     record(|work| work.filter_normalizations += 1);
+}
+pub(super) fn record_candidate_storage(amount: usize) {
+    record(|work| work.candidate_storage = work.candidate_storage.max(amount));
+}
+pub(super) fn record_traversal_storage(amount: usize) {
+    record(|work| work.traversal_storage = work.traversal_storage.max(amount));
 }
 fn counted<T>(operation: impl FnOnce() -> T) -> (T, Work) {
     WORK.with(|work| assert_eq!(work.replace(Some(Work::default())), None));
@@ -73,6 +81,68 @@ fn fixture(unrelated: usize) -> (Model, RootSummary) {
         summary.append(&model, &ids);
     }
     (model, summary)
+}
+
+#[test]
+fn wide_query_scratch_is_bounded_by_page_and_depth() {
+    let (model, _) = fixture(30_000);
+    for limit in [0, 1, 100] {
+        let (view, work) = counted(|| {
+            build_view(
+                &model,
+                &ViewRequest {
+                    mode: ViewMode::Largest,
+                    search: "txt".into(),
+                    limit,
+                    ..Default::default()
+                },
+                1,
+            )
+        });
+        assert_eq!(view.total_rows, 30_001);
+        assert_eq!(view.rows.len(), limit);
+        // Folder breakdown independently retains at most twelve candidate IDs.
+        assert!(
+            work.candidate_storage <= (2 * limit).max(12),
+            "page scratch: {work:?}"
+        );
+        assert!(
+            work.traversal_storage <= 3,
+            "wide traversal scratch: {work:?}"
+        );
+    }
+}
+
+#[test]
+fn depth_first_walk_preserves_preorder_without_a_sibling_queue() {
+    let (model, _) = fixture(5);
+    let (ids, work) = counted(|| {
+        let mut ids = Vec::new();
+        visit_subtree(&model, 0, |id| ids.push(id));
+        ids
+    });
+    assert_eq!(ids, vec![0, 1, 3, 2, 4, 5, 6, 7, 8]);
+    assert!(work.traversal_storage <= 3, "{work:?}");
+}
+
+#[test]
+fn invalid_search_does_not_traverse_matches_or_allocate_match_flags() {
+    let (model, summary) = fixture(30_000);
+    let (view, work) = counted(|| {
+        build_view_with_summary(
+            &model,
+            &ViewRequest {
+                mode: ViewMode::Largest,
+                search: "size:invalid".into(),
+                ..Default::default()
+            },
+            1,
+            &summary,
+        )
+    });
+    assert_eq!(view.total_rows, 0);
+    assert_eq!(work.match_evaluations, 0);
+    assert_eq!(work.match_storage_bytes, 0);
 }
 
 #[test]

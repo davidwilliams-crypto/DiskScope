@@ -19,6 +19,11 @@ $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $version = Get-ReleaseVersion -ProjectRoot $projectRoot
 if ($version -eq '0.3.2') { throw 'Candidate must be a different version from the fixed published 0.3.2 baseline.' }
 $baselineVersion = '0.3.2'
+# Upgrade-baseline digests are the only network-downloaded binaries CI executes.
+# Rotation ownership sits with the release manager: when a published release
+# becomes the new baseline, recompute both digests from that release's own
+# SHA256SUMS.txt and update this version, these digests and the guard above
+# together. Never learn a new digest from the download response.
 $baselineInstallerHash = '807263cd323d6f154d4122723e7fe87e4999098246ca7b68fbfcf93cc4a03704'
 $baselineArchiveHash = 'f15b5553d781e9f90d9764bb55490733c43d09d8b69504a67367c6ca53ea6874'
 $uninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\DiskScope'

@@ -9,6 +9,9 @@ use std::{
 
 /// Snapshot output is bounded even if a caller requests an excessive page size.
 pub const MAX_PAGE_ROWS: usize = 2048;
+/// Early pages keep at most twice this many IDs while partitioning batches.
+/// Deep pages use the linear selection fallback rather than retaining a huge prefix.
+const MAX_RANK_WINDOW: usize = 8192;
 /// Type bucket and filter token for files whose name has no extension.
 pub const NO_EXTENSION: &str = "(no extension)";
 
@@ -175,6 +178,9 @@ fn build_view_impl(
     };
     let filter = FileFilter::new(&request.search, &request.filters);
     view.filters_active = filter.is_active();
+    if let Err(error) = &filter.query {
+        view.search_error = Some(error.clone());
+    }
     view.root_path = model.path(request.root);
     view.total_logical = root.logical;
     view.unique_allocated = {
@@ -226,8 +232,20 @@ fn build_view_impl(
     };
     view.row_scope_root = scope;
     view.row_scope_logical = model.nodes[scope as usize].logical;
+    if filter.query.is_err() {
+        return view;
+    }
     let limit = request.limit.min(MAX_PAGE_ROWS);
+    let rank_window = if limit == 0 {
+        Some(0)
+    } else {
+        request
+            .offset
+            .checked_add(limit)
+            .filter(|end| *end <= MAX_RANK_WINDOW)
+    };
     let mut candidates = Vec::new();
+    let mut candidate_cutoff = None;
     let mut types: HashMap<String, (u64, u64)> = HashMap::new();
     // Local lenses retain only scoped matches/ancestors. A whole-scan lens uses
     // a compact bitmap because its necessary traversal may match every file.
@@ -241,11 +259,6 @@ fn build_view_impl(
                 ViewMode::Overview | ViewMode::Types | ViewMode::Explorer
             ) || summary.covers_largest_page(request, limit))
     });
-    let indexed_total_rows = summary
-        .filter(|_| request.mode == ViewMode::Largest)
-        .map(|summary| {
-            usize::try_from(summary.files).expect("file count is bounded by the arena length")
-        });
     if let Some(summary) = summary {
         // These assertions check the private Scan insertion invariant; they are
         // not a validity heuristic for callers that mutate public Model fields.
@@ -270,7 +283,7 @@ fn build_view_impl(
             visited.bump();
             let node = &model.nodes[id as usize];
             let mut extension_key = None;
-            if !filter.matches(node, &mut extension_key) {
+            if !filter.matches(model, id, &mut extension_key) {
                 return;
             }
             if view.filters_active {
@@ -299,7 +312,13 @@ fn build_view_impl(
             if request.mode == ViewMode::Largest
                 || (request.mode == ViewMode::Explorer && view.filters_active)
             {
-                candidates.push(id);
+                push_candidate(
+                    &mut candidates,
+                    &mut candidate_cutoff,
+                    id,
+                    rank_window,
+                    |a, b| compare(model, request, *a, *b),
+                );
             }
         });
         drop(visited);
@@ -379,15 +398,7 @@ fn build_view_impl(
             return view;
         }
         view.types = stats.into_iter().take(5).collect();
-        candidates = root
-            .children
-            .iter()
-            .copied()
-            .filter(|id| !view.filters_active || matched.contains(id))
-            .collect();
-        diagnostics::add(Metric::QueryCandidates, candidates.len() as u64);
-        let sort_span = Span::new(Metric::QuerySort);
-        candidates.sort_unstable_by(|a, b| {
+        let order = |a: &NodeId, b: &NodeId| {
             model.nodes[*b as usize]
                 .logical
                 .cmp(&model.nodes[*a as usize].logical)
@@ -395,18 +406,23 @@ fn build_view_impl(
                     normalized_name_order(&model.nodes[*a as usize], &model.nodes[*b as usize])
                 })
                 .then_with(|| a.cmp(b))
-        });
+        };
+        for &id in &root.children {
+            if !view.filters_active || matched.contains(&id) {
+                view.total_rows += 1;
+                push_candidate(&mut candidates, &mut candidate_cutoff, id, Some(6), order);
+            }
+        }
+        diagnostics::add(Metric::QueryCandidates, candidates.len() as u64);
+        let sort_span = Span::new(Metric::QuerySort);
+        let page = rank_page_by(&mut candidates, 0, 6, order);
         drop(sort_span);
-        view.total_rows = candidates.len();
-        view.rows = candidates
-            .into_iter()
-            .take(6)
-            .map(|id| row(model, id, 0))
-            .collect();
+        view.rows = page.iter().map(|&id| row(model, id, 0)).collect();
         return view;
     }
     diagnostics::add(Metric::QueryCandidates, candidates.len() as u64);
-    view.total_rows = indexed_total_rows.unwrap_or(candidates.len());
+    view.total_rows =
+        usize::try_from(view.matching_files).expect("file count is bounded by the arena length");
     let sort_span = Span::new(Metric::QuerySort);
     let page = rank_page_by(&mut candidates, request.offset, limit, |a, b| {
         compare(model, request, *a, *b)
@@ -414,6 +430,34 @@ fn build_view_impl(
     drop(sort_span);
     view.rows = page.iter().map(|&id| row(model, id, 0)).collect();
     view
+}
+
+/// Partition bounded batches instead of keeping all matching IDs or paying a
+/// heap comparison for every file. The retained prefix contains the best window
+/// under the same total comparator used by final pagination.
+fn push_candidate(
+    values: &mut Vec<NodeId>,
+    cutoff: &mut Option<NodeId>,
+    id: NodeId,
+    window: Option<usize>,
+    mut compare: impl FnMut(&NodeId, &NodeId) -> Ordering,
+) {
+    if window == Some(0) {
+        return;
+    }
+    if cutoff.is_some_and(|boundary| compare(&id, &boundary) != Ordering::Less) {
+        return;
+    }
+    values.push(id);
+    #[cfg(test)]
+    query_work_tests::record_candidate_storage(values.len());
+    if let Some(keep) = window
+        && values.len() >= 2 * keep
+    {
+        let (_, boundary, _) = values.select_nth_unstable_by(keep, &mut compare);
+        *cutoff = Some(*boundary);
+        values.truncate(keep);
+    }
 }
 
 /// Rank only the requested window. The caller's total comparator preserves the
@@ -504,14 +548,14 @@ impl MatchFlags {
 }
 
 struct FileFilter<'a> {
-    query: String,
+    query: Result<crate::search::SearchQuery, String>,
     extensions: HashSet<String>,
     ranges: &'a QueryFilter,
 }
 impl<'a> FileFilter<'a> {
     fn new(query: &str, filters: &'a QueryFilter) -> Self {
         Self {
-            query: query.trim().to_lowercase(),
+            query: crate::search::SearchQuery::parse(query),
             extensions: filters
                 .extensions
                 .iter()
@@ -525,9 +569,13 @@ impl<'a> FileFilter<'a> {
         }
     }
     fn is_active(&self) -> bool {
-        !self.query.is_empty() || self.ranges.is_active()
+        match &self.query {
+            Ok(query) => query.is_active() || self.ranges.is_active(),
+            Err(_) => true,
+        }
     }
-    fn matches(&self, node: &Node, extension_key: &mut Option<String>) -> bool {
+    fn matches(&self, model: &Model, id: NodeId, extension_key: &mut Option<String>) -> bool {
+        let node = &model.nodes[id as usize];
         #[cfg(test)]
         query_work_tests::record_match_evaluation();
         let filters = self.ranges;
@@ -540,16 +588,24 @@ impl<'a> FileFilter<'a> {
             && filters
                 .modified_before
                 .is_none_or(|before| node.modified.is_some_and(|m| m <= before))
-            && (self.query.is_empty()
-                || node
-                    .name
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(&self.query))
             && (self.extensions.is_empty()
                 || self
                     .extensions
                     .contains(extension_key.get_or_insert_with(|| extension(node))))
+            && self.query.as_ref().is_ok_and(|query| {
+                if !query.is_active() {
+                    return true;
+                }
+                if query.needs_extension() && extension_key.is_none() {
+                    *extension_key = Some(extension(node));
+                }
+                query.matches(
+                    &node.name.to_string_lossy(),
+                    node.logical,
+                    extension_key.as_deref().unwrap_or(""),
+                    || model.path(id).to_string_lossy().into_owned(),
+                )
+            })
     }
 }
 
@@ -603,25 +659,30 @@ fn populate_breakdown(model: &Model, request: &ViewRequest, view: &mut ViewSnaps
     let mut direct = 0u64;
     let mut has_direct = false;
     let mut dirs = Vec::new();
+    let mut cutoff = None;
     for &id in &model.nodes[root as usize].children {
         let node = &model.nodes[id as usize];
         if node.is_dir {
-            dirs.push(id);
+            push_candidate(&mut dirs, &mut cutoff, id, Some(6), |a, b| {
+                model.nodes[*b as usize]
+                    .logical
+                    .cmp(&model.nodes[*a as usize].logical)
+                    .then_with(|| a.cmp(b))
+            });
         } else {
             has_direct = true;
             direct = direct.saturating_add(node.logical);
         }
     }
-    dirs.sort_unstable_by(|a, b| {
+    let page = rank_page_by(&mut dirs, 0, if has_direct { 5 } else { 6 }, |a, b| {
         model.nodes[*b as usize]
             .logical
             .cmp(&model.nodes[*a as usize].logical)
             .then_with(|| a.cmp(b))
     });
-    view.breakdown = dirs
-        .into_iter()
-        .take(if has_direct { 5 } else { 6 })
-        .map(|id| BreakdownItem {
+    view.breakdown = page
+        .iter()
+        .map(|&id| BreakdownItem {
             id: Some(id),
             name: model.nodes[id as usize].name.to_string_lossy().into_owned(),
             logical: model.nodes[id as usize].logical,
@@ -707,13 +768,28 @@ fn push_children(
 }
 
 fn visit_subtree(model: &Model, root: NodeId, mut visitor: impl FnMut(NodeId)) {
-    let mut pending = vec![root];
-    while let Some(id) = pending.pop() {
-        if let Some(node) = model.nodes.get(id as usize) {
+    let Some(node) = model.nodes.get(root as usize) else {
+        return;
+    };
+    #[cfg(test)]
+    summary_tests::record_visit();
+    visitor(root);
+    let mut pending = vec![node.children.iter()];
+    while let Some(children) = pending.last_mut() {
+        if let Some(&id) = children.next() {
+            let Some(node) = model.nodes.get(id as usize) else {
+                continue;
+            };
             #[cfg(test)]
             summary_tests::record_visit();
             visitor(id);
-            pending.extend(node.children.iter().rev().copied());
+            if !node.children.is_empty() {
+                pending.push(node.children.iter());
+            }
+            #[cfg(test)]
+            query_work_tests::record_traversal_storage(pending.len());
+        } else {
+            pending.pop();
         }
     }
 }
@@ -786,6 +862,8 @@ fn row(model: &Model, id: NodeId, depth: u16) -> Row {
 mod query_work_tests;
 #[cfg(test)]
 mod ranking_tests;
+#[cfg(test)]
+mod search_tests;
 #[cfg(test)]
 mod summary_tests;
 

@@ -1,4 +1,4 @@
-<# Requires cargo-deny 0.20.2 installed with cargo install --locked --version 0.20.2 cargo-deny. #>
+<# Requires cargo-deny 0.20.2 installed from the digest-pinned package by scripts/install-cargo-deny.ps1. #>
 param([switch]$Offline)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false

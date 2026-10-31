@@ -7,6 +7,7 @@ permissions:
 jobs:
   tests:
     runs-on: windows-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -15,15 +16,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install pinned compiler
         shell: pwsh
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup override set 1.92.0
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: ./scripts/install-pinned-toolchain.ps1 -Component rustfmt, clippy
       - name: Validate
         shell: pwsh
+        env:
+          # Matrix values reach the script through the environment, never by
+          # text substitution into the script body.
+          FEATURES: ${{ matrix.features }}
         run: |
-          $featureArgs = @(switch ('${{ matrix.features }}') {
+          $featureArgs = @(switch ($env:FEATURES) {
             'diagnostics' { @('--features', 'diagnostics') }
             'no-gui' { @('--no-default-features') }
             default { @() }
@@ -66,30 +67,24 @@ jobs:
           ./scripts/test-helpdesk-tooling.ps1 -RequireJunction -Executable $artifact.executable
   supply-chain:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install pinned advisory/license checker
+      - name: Install pinned compiler and digest-pinned advisory/license checker
         shell: pwsh
         run: |
-          rustup toolchain install 1.92.0 --profile minimal
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup override set 1.92.0
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo install cargo-deny --version 0.20.2 --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/install-pinned-toolchain.ps1
+          ./scripts/install-cargo-deny.ps1
       - name: Locked dependency, advisory, license and source gates
         shell: pwsh
         run: ./scripts/check-supply-chain.ps1
   compiler-floor:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install declared minimum compiler
         shell: pwsh
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup override set 1.92.0
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: ./scripts/install-pinned-toolchain.ps1
       - name: Build locked default GUI on declared minimum
         run: cargo build --release --locked --target x86_64-pc-windows-msvc

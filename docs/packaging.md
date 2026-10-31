@@ -17,7 +17,15 @@ Setup defaults to `%LOCALAPPDATA%\Programs\DiskScope`, requires no administrator
 
 Uninstall removes only files named in its compiled payload inventory, its shortcuts, and its registration. It does not recursively remove the program directory. Files you added to that directory are preserved, as are history under `%LOCALAPPDATA%\DiskScope\history` and preferences under `%APPDATA%\DiskScope\data\app.ron`. An explicit `DISKSCOPE_HISTORY_DIR` override is also untouched. The portable version requires no installation but still uses these profile locations; it is not a self-contained settings profile on a USB drive.
 
-The packages are unsigned. Windows may display an unknown-publisher or SmartScreen prompt. SHA-256 hashes check file integrity; they do not authenticate a publisher.
+The packages are Authenticode-signed only when repository signing is configured (see [Release pipeline](#release-pipeline)); otherwise they are unsigned and Windows may display an unknown-publisher or SmartScreen prompt. SHA-256 hashes check file integrity. Publisher authentication is provided independently by the GitHub artifact attestations attached to every workflow-built package: verify a download with `gh attestation verify <file> --repo davidwilliams-crypto/DiskScope`.
+
+## Release pipeline
+
+Published releases are built by `.github/workflows/release.yml`, not on a local machine. Pushing a tag `v<version>` that matches `Cargo.toml` builds the exact checked-out tree on a disposable GitHub-hosted Windows runner using the pinned compiler (`scripts/install-pinned-toolchain.ps1` verifies the exact upstream release and commit hash) and the digest-pinned NSIS compiler, packages both formats, attests every published file with GitHub artifact attestations, verifies checksums again, and creates the GitHub release. A `workflow_dispatch` run performs the same attested build without publishing.
+
+Optional Authenticode signing is inactive by default and changes no unsigned behavior. To enable it, set repository variable `AUTHENTICODE_SIGNING` to `true` and provide secrets `AUTHENTICODE_CERT_PFX_BASE64` and `AUTHENTICODE_CERT_PASSWORD` (a code-signing PFX); optional variable `AUTHENTICODE_TIMESTAMP_URL` defaults to DigiCert's timestamp server, and setting `AUTHENTICODE_SIGNER_THUMBPRINT` promotes `scripts/verify-release-signatures.ps1` to a release gate. Signing runs before packaging so both the installer and the portable ZIP embed the signed executable, then signs the installer container through `scripts/sign-release.ps1`, which regenerates both checksum manifests. `BUILD_PROVENANCE.json` keeps the pre-signing executable digest; the signed bytes remain covered by the refreshed manifests and the attestations.
+
+Digest rotation ownership: the pinned cargo-deny package (`scripts/install-cargo-deny.ps1`), the pinned compiler identity (`scripts/install-pinned-toolchain.ps1`) and the NSIS archive digest are recorded in this repository and must never be updated from a download response. The published-binary baseline digests in `scripts/test-installer-upgrade.ps1` belong to the release manager: when a new published release becomes the upgrade baseline, recompute its digests from that release's own `SHA256SUMS.txt` and update the version and hashes together in one change.
 
 ## Building
 

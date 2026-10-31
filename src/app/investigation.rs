@@ -16,13 +16,37 @@ impl DiskScopeApp {
         }
     }
     pub(super) fn compact_file_list(&mut self, ui: &mut egui::Ui, height: f32, p: Palette) {
+        const SIZE_WIDTH: f32 = 105.0;
+        // Reserve the same scrollbar gutter above and inside the list so the
+        // numeric column never moves when scrolling becomes necessary.
+        let name_width = (ui.available_width()
+            - ui.spacing().scroll.allocated_width()
+            - SIZE_WIDTH
+            - ui.spacing().item_spacing.x)
+            .max(100.0);
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 105.0).max(100.0);
-            ui.add_sized(
-                [width, 20.0],
-                egui::Label::new(RichText::new("NAME").small().color(p.faint)).halign(Align::LEFT),
+            ui.allocate_ui_with_layout(
+                egui::vec2(name_width, 20.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(name_width, 20.0));
+                    ui.add(
+                        egui::Label::new(RichText::new("NAME").small().color(p.faint))
+                            .selectable(false),
+                    );
+                },
             );
-            ui.label(RichText::new("LOGICAL SIZE").small().color(p.faint));
+            ui.allocate_ui_with_layout(
+                egui::vec2(SIZE_WIDTH, 20.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(SIZE_WIDTH, 20.0));
+                    ui.add(
+                        egui::Label::new(RichText::new("LOGICAL SIZE").small().color(p.faint))
+                            .selectable(false),
+                    );
+                },
+            );
         });
         let snapshot = self.visible.clone();
         let rows = &snapshot.view.rows;
@@ -32,6 +56,7 @@ impl DiskScopeApp {
         let mut list = egui::ScrollArea::vertical()
             .id_salt("compact_files")
             .max_height(height)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false]);
         if let Some(index) = target.and_then(|target| rows.iter().position(|row| row.id == target))
         {
@@ -41,11 +66,13 @@ impl DiskScopeApp {
             for index in range {
                 let row = &rows[index];
                 ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 105.0).max(100.0);
                     let response = ui.add_sized(
-                        [width, 32.0],
-                        egui::Button::selectable(self.request.selected == Some(row.id), &row.name)
-                            .wrap_mode(egui::TextWrapMode::Truncate),
+                        [name_width, 32.0],
+                        egui::Button::selectable(
+                            self.request.selected == Some(row.id),
+                            (row.name.as_str(), egui::Atom::grow()),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate),
                     );
                     if target == Some(row.id) {
                         response.request_focus();
@@ -96,7 +123,14 @@ impl DiskScopeApp {
                             action = Some(Action::Navigate(row.id));
                         }
                     }
-                    ui.label(format_bytes(row.logical));
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIZE_WIDTH, 32.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            ui.set_min_size(egui::vec2(SIZE_WIDTH, 32.0));
+                            ui.add(egui::Label::new(format_bytes(row.logical)).selectable(false));
+                        },
+                    );
                     response.on_hover_text(row.path.to_string_lossy());
                 });
             }
@@ -226,6 +260,9 @@ impl DiskScopeApp {
             return "Choose a location to investigate";
         }
         if !map && (self.request.filters.is_active() || !self.request.search.is_empty()) {
+            if diskscope::search::SearchQuery::parse(&self.request.search).is_err() {
+                return "Correct the search to see matching files";
+            }
             return "No matches in this scope";
         }
         match self.scan_state() {
@@ -336,13 +373,13 @@ impl DiskScopeApp {
                     ui.label(RichText::new("DiskScope").strong().color(p.accent));
                     ui.menu_button(
                         if self.changes {
-                            "Changes ▾"
+                            "Changes"
                         } else {
                             match self.request.mode {
-                                ViewMode::Overview => "Overview ▾",
-                                ViewMode::Explorer => "Explorer ▾",
-                                ViewMode::Largest => "Largest files ▾",
-                                ViewMode::Types => "File types ▾",
+                                ViewMode::Overview => "Overview",
+                                ViewMode::Explorer => "Explorer",
+                                ViewMode::Largest => "Largest files",
+                                ViewMode::Types => "File types",
                             }
                         },
                         |ui| {

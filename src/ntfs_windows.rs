@@ -345,7 +345,11 @@ fn extents(handle: &Handle, g: &Geometry, cancelled: &impl Fn() -> bool) -> Resu
             cancelled,
         )?;
         let page = parse_extents(&out[..bytes], start, g.total_clusters)?;
-        let last = page.last().unwrap();
+        // parse_extents rejects a zero-extent header, so every page has a final
+        // extent; prove that here instead of indexing the page with unwrap.
+        let Some(last) = page.last() else {
+            return Err(err("Empty MFT extent page"));
+        };
         start = last
             .vcn
             .checked_add(last.clusters)

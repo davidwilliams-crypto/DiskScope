@@ -12,6 +12,7 @@ pub mod ntfs;
 pub mod platform;
 pub mod recycle_policy;
 pub mod resources;
+pub mod search;
 pub mod session;
 pub mod treemap;
 pub mod view;

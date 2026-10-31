@@ -1,0 +1,190 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      validation_file:
+        description: 'Validation record shipped inside the packages'
+        default: 'docs/validation-helpdesk-assurance-2026-10-30.md'
+permissions:
+  contents: read
+jobs:
+  build:
+    # Builds the published packages on a disposable hosted runner and proves
+    # their provenance with GitHub artifact attestations. This is not client,
+    # fleet or publisher qualification; those gates stay manual.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    permissions:
+      contents: read
+      id-token: write # Artifact Signing OIDC token for attestations.
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Require disposable hosted runner and record the environment
+        env:
+          AUTHENTICODE_SIGNING: ${{ vars.AUTHENTICODE_SIGNING }}
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'Release builds are restricted to disposable GitHub-hosted Windows runners.'
+          }
+          New-Item -ItemType Directory -Path target/release-build | Out-Null
+          [ordered]@{
+            schema_version = 1; observed_at_utc = [DateTime]::UtcNow.ToString('o')
+            commit = $env:GITHUB_SHA; ref = $env:GITHUB_REF; run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT; image_os = $env:ImageOS; image_version = $env:ImageVersion
+            authenticode_signing = if ($env:AUTHENTICODE_SIGNING) { $env:AUTHENTICODE_SIGNING } else { 'unset' }
+            scope = 'Hosted build provenance and integrity only; manual client/fleet/publisher qualification pending.'
+          } | ConvertTo-Json | Set-Content target/release-build/environment.json -Encoding utf8
+      - name: Install pinned compiler
+        run: ./scripts/install-pinned-toolchain.ps1
+      - name: Refuse a tag that disagrees with the manifest version
+        run: |
+          . ./scripts/release-tools.ps1
+          $version = Get-ReleaseVersion -ProjectRoot $PWD
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match the Cargo.toml version $version."
+          }
+          Write-Output "Packaging DiskScope $version."
+      - name: Fetch hash-pinned official portable NSIS 3.12
+        run: |
+          # Same pinned distribution the installer-qualification workflow uses;
+          # never accept a new digest from a response.
+          $zip = Join-Path $env:RUNNER_TEMP 'nsis-3.12.zip'
+          $headerPath = Join-Path $env:RUNNER_TEMP 'nsis-3.12-http-headers.txt'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'diskscope-nsis-3.12'
+          if ((Test-Path -LiteralPath $zip) -or (Test-Path -LiteralPath $headerPath) -or (Test-Path -LiteralPath $toolRoot)) { throw 'NSIS destination already exists.' }
+          # SourceForge can return HTTP 200 HTML to Invoke-WebRequest. The
+          # independently reproduced curl download follows the official mirror
+          # redirect to the pinned ZIP.
+          $metadata = @(& curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 3000000 --dump-header $headerPath --output $zip --write-out "%{http_code}`n%{content_type}`n%{size_download}" 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip')
+          $downloadExit = $LASTEXITCODE
+          if ($downloadExit -ne 0) { throw "NSIS download failed with curl exit $downloadExit; archive not trusted/extracted." }
+          if ($metadata.Count -ne 3) { throw 'Unexpected curl response metadata; archive not trusted/extracted.' }
+          $length = (Get-Item -LiteralPath $zip).Length
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $stream = [IO.File]::OpenRead($zip)
+          try {
+            $prefix = New-Object byte[] 4
+            $read = $stream.Read($prefix, 0, $prefix.Length)
+            $magic = [BitConverter]::ToString($prefix, 0, $read)
+          } finally { $stream.Dispose() }
+          $downloadEvidence = [ordered]@{
+            observed_at_utc = [DateTime]::UtcNow.ToString('o'); http_status = [string]$metadata[0]
+            content_type = [string]$metadata[1]; downloaded_bytes = $length; curl_downloaded_bytes = [string]$metadata[2]
+            first_four_bytes_hex = $magic; sha256 = $hash
+            expected_bytes = 2362938; expected_sha256 = '56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f'
+          }
+          $downloadEvidence | ConvertTo-Json | Set-Content target/release-build/nsis-download.json -Encoding utf8
+          if ($metadata[0] -cne '200' -or [string]$metadata[1] -notmatch '^(application/(octet-stream|zip|x-zip-compressed))(;|$)' -or $length -ne 2362938 -or $magic -cne '50-4B-03-04' -or $hash -cne $downloadEvidence.expected_sha256) {
+            throw 'NSIS 3.12 HTTP metadata, ZIP magic, size or hash mismatch; archive not trusted/extracted.'
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $toolRoot
+          $compiler = Join-Path $toolRoot 'nsis-3.12/makensis.exe'
+          $version = & $compiler /VERSION
+          if ($LASTEXITCODE -ne 0 -or $version.Trim() -cne 'v3.12') { throw 'Unexpected NSIS compiler version.' }
+          "DISKSCOPE_NSIS=$compiler" >> $env:GITHUB_ENV
+      - name: Build the exact checked-out payload
+        env:
+          VALIDATION_FILE: ${{ inputs.validation_file || 'docs/validation-helpdesk-assurance-2026-10-30.md' }}
+        run: |
+          if (-not (Test-Path -LiteralPath $env:VALIDATION_FILE -PathType Leaf)) { throw "Validation record not found: $env:VALIDATION_FILE" }
+          ./scripts/build.ps1 -PackageDirectory target/release-build/payload -ValidationFile $env:VALIDATION_FILE
+      - name: Authenticode-sign the payload executable (optional)
+        if: vars.AUTHENTICODE_SIGNING == 'true'
+        env:
+          AUTHENTICODE_CERT_PFX_BASE64: ${{ secrets.AUTHENTICODE_CERT_PFX_BASE64 }}
+          AUTHENTICODE_CERT_PASSWORD: ${{ secrets.AUTHENTICODE_CERT_PASSWORD }}
+          AUTHENTICODE_TIMESTAMP_URL: ${{ vars.AUTHENTICODE_TIMESTAMP_URL }}
+          AUTHENTICODE_SIGNER_THUMBPRINT: ${{ vars.AUTHENTICODE_SIGNER_THUMBPRINT }}
+        run: ./scripts/sign-release.ps1 -Path target/release-build/payload/DiskScope.exe -ManifestDirectory target/release-build/payload
+      - name: Package installer and portable ZIP
+        run: ./scripts/package-release.ps1 -SkipBuild -PackageDirectory target/release-build/payload -OutputDirectory target/release-build/packages -NsisCompiler $env:DISKSCOPE_NSIS
+      - name: Authenticode-sign the installer and refresh its manifest (optional)
+        if: vars.AUTHENTICODE_SIGNING == 'true'
+        env:
+          AUTHENTICODE_CERT_PFX_BASE64: ${{ secrets.AUTHENTICODE_CERT_PFX_BASE64 }}
+          AUTHENTICODE_CERT_PASSWORD: ${{ secrets.AUTHENTICODE_CERT_PASSWORD }}
+          AUTHENTICODE_TIMESTAMP_URL: ${{ vars.AUTHENTICODE_TIMESTAMP_URL }}
+          AUTHENTICODE_SIGNER_THUMBPRINT: ${{ vars.AUTHENTICODE_SIGNER_THUMBPRINT }}
+        run: |
+          . ./scripts/release-tools.ps1
+          $version = Get-ReleaseVersion -ProjectRoot $PWD
+          ./scripts/sign-release.ps1 -Path (Join-Path $PWD "target/release-build/packages/DiskScope-$version-windows-x64-setup.exe") -ManifestDirectory target/release-build/packages
+      - name: Record signing status and final checksums
+        env:
+          AUTHENTICODE_SIGNING: ${{ vars.AUTHENTICODE_SIGNING }}
+        run: |
+          # The status file drives the release notes; it deliberately lives
+          # outside packages/ so it is never mistaken for a checksummed asset.
+          $status = if ($env:AUTHENTICODE_SIGNING -ceq 'true') { 'signed' } else { 'unsigned' }
+          Set-Content -LiteralPath target/release-build/signing-status.txt -Value $status -Encoding utf8
+          Get-Content -LiteralPath target/release-build/packages/SHA256SUMS.txt
+      - name: Attest the published packages
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            target/release-build/packages/DiskScope-*-windows-x64-setup.exe
+            target/release-build/packages/DiskScope-*-windows-x64-portable.zip
+            target/release-build/packages/INSTALLER_NOTICES.txt
+            target/release-build/packages/SHA256SUMS.txt
+      - name: Retain the complete build record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/release-build/
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    needs: build
+    # Publishing only follows a version tag on the project's own repository;
+    # workflow_dispatch runs stop after the attested build.
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'davidwilliams-crypto/DiskScope'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the attested build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: release
+      - name: Verify checksums before publishing
+        run: |
+          cd release/packages
+          sha256sum --check --strict SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          status=$(tr -d '[:space:]' < release/signing-status.txt)
+          {
+            echo "## DiskScope ${TAG#v}"
+            echo
+            if [ "$status" = signed ]; then
+              echo 'Packages are Authenticode-signed; Windows should show the configured publisher.'
+            else
+              echo 'The packages are unsigned; Windows may show an unknown-publisher or SmartScreen prompt. Publisher authentication is provided by build provenance attestations:'
+            fi
+            echo 'Verify a download against its CI build provenance with:'
+            echo '```'
+            echo "gh attestation verify <file> --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+            echo
+            echo 'SHA-256 checksums:'
+            echo '```'
+            cat release/packages/SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" --title "DiskScope ${TAG#v}" --notes-file notes.md \
+            release/packages/DiskScope-*-windows-x64-setup.exe \
+            release/packages/DiskScope-*-windows-x64-portable.zip \
+            release/packages/INSTALLER_NOTICES.txt \
+            release/packages/SHA256SUMS.txt
