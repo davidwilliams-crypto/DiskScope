@@ -4,6 +4,8 @@ mod controls;
 mod investigation;
 mod journal;
 mod management;
+#[cfg(test)]
+mod modal_enter_tests;
 mod native;
 mod outcome;
 mod state;
@@ -933,7 +935,11 @@ impl DiskScopeApp {
                 self.path_edited = true;
                 self.draft_path = None;
             }
-            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Disabled text edits can lose focus as a modal opens. Raw Enter
+            // belongs to that modal, not to the background path completion.
+            let enter = ui.is_enabled()
+                && response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui
                 .add_enabled(
                     !self.picker_open,
