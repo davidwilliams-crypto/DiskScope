@@ -1,5 +1,9 @@
 # DiskScope 0.3.3 post-fix assessment
 
+Later desktop fixes, final candidate identity and revised scores are recorded in
+[the local-PC follow-up](helpdesk-local-pc-rescore-2026-10-31.md). The evidence and
+artifact hashes below describe the earlier candidate and remain historical.
+
 Assessment date: 30 October 2026. **The all-90/A target is not yet met.**
 The user confirmed that an approved signing certificate and a clean client
 Windows/ScreenConnect lab are unavailable. The code fixes and automated tests
