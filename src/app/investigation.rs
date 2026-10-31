@@ -160,7 +160,8 @@ impl DiskScopeApp {
                     ui.label(self.access_mode.history_message());
                 }
             });
-            ui.menu_button(
+            let export_was_open = self.export_open;
+            let evidence_menu = ui.menu_button(
                 if self.session_policy.helpdesk {
                     "Helpdesk & evidence"
                 } else {
@@ -172,6 +173,13 @@ impl DiskScopeApp {
                     self.evidence_controls(ui);
                 },
             );
+            if !export_was_open && self.export_open {
+                controls::set_dialog_invoker(
+                    ui.ctx(),
+                    "Export investigation evidence",
+                    evidence_menu.response.id,
+                );
+            }
         });
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 240.0).max(80.0);

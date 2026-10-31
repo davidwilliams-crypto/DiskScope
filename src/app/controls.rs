@@ -9,7 +9,7 @@ struct DialogFocus {
 #[derive(Clone, Default)]
 struct PendingDialogRestore {
     invoker: Option<egui::Id>,
-    retry: bool,
+    probing: bool,
 }
 
 fn dialog_focus_key(title: &str) -> egui::Id {
@@ -68,30 +68,50 @@ pub(super) fn restore_dialog_focus(ctx: &egui::Context, title: &str) {
                 egui::Id::new("pending_dialog_focus_restore"),
                 PendingDialogRestore {
                     invoker: Some(id),
-                    retry: false,
+                    probing: false,
                 },
             )
         });
     }
 }
 
-/// egui still applies the previous frame's modal layer while drawing the
-/// closing frame. Restore after those widgets can no longer surrender focus.
+/// The preceding modal layer disables its invoker during this closing draw.
+/// A rendered, disabled control surrenders the probe focus; an absent one
+/// leaves it untouched. This distinguishes current controls from egui's
+/// `read_response` fallback to widgets that existed only in the previous pass.
+pub(super) fn begin_dialog_focus_restore(ctx: &egui::Context) {
+    if ctx.memory(|m| m.top_modal_layer().is_none()) {
+        return;
+    }
+    let invoker = ctx.data_mut(|data| {
+        let key = egui::Id::new("pending_dialog_focus_restore");
+        let mut pending = data.get_temp::<PendingDialogRestore>(key)?;
+        let invoker = pending.invoker?;
+        pending.probing = true;
+        data.insert_temp(key, pending);
+        Some(invoker)
+    });
+    if let Some(invoker) = invoker {
+        ctx.memory_mut(|m| m.request_focus(invoker));
+    }
+}
+
+/// Restore only after the closing draw has proved the invoker still exists.
 pub(super) fn finish_dialog_frame(ctx: &egui::Context) {
     let key = egui::Id::new("pending_dialog_focus_restore");
-    if let Some(mut pending) = ctx.data_mut(|d| d.remove_temp::<PendingDialogRestore>(key)) {
+    if let Some(pending) = ctx.data_mut(|d| d.remove_temp::<PendingDialogRestore>(key)) {
         if let Some(id) = pending.invoker {
             ctx.memory_mut(|m| {
-                if !pending.retry || m.focused().is_none() {
+                if pending.probing && m.focused().is_none() {
                     m.request_focus(id);
+                } else {
+                    m.surrender_focus(id);
                 }
             });
         }
-        if !pending.retry {
-            // A title-bar close registers this window's modal layer during
-            // its final draw. That stale layer can surrender focus once more
-            // on the next frame, unlike Escape (which closes before drawing).
-            pending.retry = true;
+        if pending.invoker.is_some() && !pending.probing {
+            // Title-close happens after the invoker was drawn. Emit safe root
+            // focus now, and probe its liveness on the requested next frame.
             ctx.data_mut(|d| d.insert_temp(key, pending));
         }
         ctx.request_repaint();
@@ -99,6 +119,64 @@ pub(super) fn finish_dialog_frame(ctx: &egui::Context) {
     if ctx.memory(|m| m.top_modal_layer().is_some() && m.focused().is_none()) {
         ctx.request_repaint();
     }
+}
+
+/// Keep a transient window inside the client in logical points (after both
+/// native display scaling and the app's text zoom have reduced that area).
+pub(super) fn show_dialog<R>(
+    window: egui::Window<'_>,
+    ctx: &egui::Context,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<egui::InnerResponse<Option<R>>> {
+    let viewport = ctx.content_rect();
+    window
+        .max_width((viewport.width() - 40.0).max(1.0))
+        .max_height((viewport.height() - 80.0).max(1.0))
+        .constrain_to(viewport.shrink(8.0))
+        .vscroll(true)
+        .show(ctx, |ui| {
+            let result = contents(ui);
+            if ui.memory(|m| m.allows_interaction(ui.layer_id())) {
+                let page = ui.clip_rect().height() * 0.8;
+                let delta = ui.input_mut(|input| {
+                    if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                        Some(-page)
+                    } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                        Some(page)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(delta) = delta {
+                    ui.scroll_with_delta_animation(
+                        egui::vec2(0.0, delta),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                } else if let Some(response) = ui
+                    .memory(|m| m.focused())
+                    .and_then(|id| ui.ctx().read_response(id))
+                    .filter(|response| {
+                        response.layer_id == ui.layer_id()
+                            && response.gained_focus()
+                            && ui.min_rect().intersects(response.rect)
+                    })
+                {
+                    let clip = ui.clip_rect();
+                    let delta = if response.rect.bottom() > clip.bottom() {
+                        clip.bottom() - response.rect.bottom() - ui.spacing().item_spacing.y
+                    } else if response.rect.top() < clip.top() {
+                        clip.top() - response.rect.top() + ui.spacing().item_spacing.y
+                    } else {
+                        0.0
+                    };
+                    ui.scroll_with_delta_animation(
+                        egui::vec2(0.0, delta),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                }
+            }
+            result
+        })
 }
 
 pub(super) const FILE_COLUMN_MIN_WIDTHS: [f32; 4] = [150.0, 72.0, 72.0, 50.0];
@@ -214,12 +292,14 @@ impl DiskScopeApp {
         }
         remember_dialog_focus(ctx, "Filter files");
         let mut open = true;
-        egui::Window::new("Filter files")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .show(ctx, |ui| {
+        show_dialog(
+            egui::Window::new("Filter files")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0),
+            ctx,
+            |ui| {
                 ui.label(
                     RichText::new(
                         "Conditions apply together. Folder map area stays logical; matches are highlighted.",
@@ -233,7 +313,8 @@ impl DiskScopeApp {
                         .hint_text(".mp4, .mkv")
                         .char_limit(1024)
                         .desired_width(f32::INFINITY),
-                ).labelled_by(label.id);
+                )
+                .labelled_by(label.id);
                 ui.horizontal_wrapped(|ui| {
                     for category in &FILE_CATEGORIES {
                         if ui.small_button(category.label).clicked() {
@@ -249,14 +330,19 @@ impl DiskScopeApp {
                             ("Minimum size · MiB", &mut self.filter_min, "Any size"),
                             ("Maximum size · MiB", &mut self.filter_max, "No maximum"),
                             ("Modified since · UTC", &mut self.filter_after, "YYYY-MM-DD"),
-                            ("Modified through · UTC", &mut self.filter_before, "YYYY-MM-DD"),
+                            (
+                                "Modified through · UTC",
+                                &mut self.filter_before,
+                                "YYYY-MM-DD",
+                            ),
                         ] {
                             let label = ui.label(label);
                             ui.add(
                                 egui::TextEdit::singleline(field)
                                     .desired_width(190.0)
                                     .hint_text(hint),
-                            ).labelled_by(label.id);
+                            )
+                            .labelled_by(label.id);
                             ui.end_row();
                         }
                     });
@@ -292,7 +378,8 @@ impl DiskScopeApp {
                 if let Some(error) = self.filter_error {
                     ui.colored_label(p.accent, error);
                 }
-            });
+            },
+        );
         self.filter_open &= open;
         if !self.filter_open {
             self.filter_error = None;
@@ -325,10 +412,13 @@ impl DiskScopeApp {
         }
         remember_dialog_focus(ctx, "Pinned comparison");
         let mut open = true;
-        egui::Window::new("Pinned comparison")
-            .open(&mut open)
-            .default_width(650.0)
-            .show(ctx, |ui| self.comparison_tray(ui, p));
+        show_dialog(
+            egui::Window::new("Pinned comparison")
+                .open(&mut open)
+                .default_width(650.0),
+            ctx,
+            |ui| self.comparison_tray(ui, p),
+        );
         self.comparison_open = open;
         if !open {
             restore_dialog_focus(ctx, "Pinned comparison");
@@ -527,13 +617,15 @@ impl DiskScopeApp {
         remember_dialog_focus(ctx, "Commands");
         let mut open = true;
         let mut chosen = None;
-        egui::Window::new("Commands")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 100.0])
-            .default_width(480.0)
-            .show(ctx, |ui| {
+        show_dialog(
+            egui::Window::new("Commands")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 100.0])
+                .default_width(480.0),
+            ctx,
+            |ui| {
                 let label = ui.label("Find a command");
                 let response = ui
                     .add(
@@ -595,7 +687,8 @@ impl DiskScopeApp {
                         .small()
                         .color(p.muted),
                 );
-            });
+            },
+        );
         self.palette_open &= open;
         if !self.palette_open {
             restore_dialog_focus(ctx, "Commands");
@@ -615,11 +708,13 @@ impl DiskScopeApp {
             self.preferences.text_scale,
             self.preferences.reduced_motion,
         );
-        egui::Window::new("Appearance & settings")
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(370.0)
-            .show(ctx, |ui| {
+        show_dialog(
+            egui::Window::new("Appearance & settings")
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(370.0),
+            ctx,
+            |ui| {
                 overline(ui, "COLOR THEME", p);
                 ui.horizontal_wrapped(|ui| {
                     for theme in Theme::ALL {
@@ -637,10 +732,16 @@ impl DiskScopeApp {
                 ui.checkbox(&mut self.preferences.map_focus, "Give the map more room");
                 ui.add_space(12.0);
                 overline(ui, "SCANNING", p);
-                ui.add_enabled(!self.session_policy.helpdesk, egui::Checkbox::new(&mut self.preferences.ntfs_preview, "NTFS preview acceleration"))
-                    .on_hover_text(
-                        "Experimental. Unsupported cases fall back to the normal folder scan.",
-                    );
+                ui.add_enabled(
+                    !self.session_policy.helpdesk,
+                    egui::Checkbox::new(
+                        &mut self.preferences.ntfs_preview,
+                        "NTFS preview acceleration",
+                    ),
+                )
+                .on_hover_text(
+                    "Experimental. Unsupported cases fall back to the normal folder scan.",
+                );
                 ui.add_space(12.0);
                 overline(ui, "WINDOWS ACCESS", p);
                 self.access_controls(ui, p);
@@ -654,7 +755,10 @@ impl DiskScopeApp {
                 }
                 ui.label(self.session_policy.label());
                 if self.persistence_allowed() {
-                    ui.label(format!("History location: {}", self.history_directory.display()));
+                    ui.label(format!(
+                        "History location: {}",
+                        self.history_directory.display()
+                    ));
                     ui.label("For a session without saved metadata, close this window and launch with --no-history. For helpdesk diagnostics, launch with --helpdesk.");
                 }
                 if self.session_policy != SessionPolicy::default() {
@@ -667,7 +771,8 @@ impl DiskScopeApp {
                     .small()
                     .color(p.muted),
                 );
-            });
+            },
+        );
         self.settings_open = open;
         if !open {
             restore_dialog_focus(ctx, "Appearance & settings");
@@ -687,19 +792,30 @@ impl DiskScopeApp {
             return;
         }
         remember_dialog_focus(ctx, "Keyboard help");
-        egui::Window::new("Keyboard help")
-            .open(&mut self.help_open)
-            .collapsible(false)
-            .show(ctx, |ui| {
+        show_dialog(
+            egui::Window::new("Keyboard help")
+                .open(&mut self.help_open)
+                .collapsible(false),
+            ctx,
+            |ui| {
                 for (key, action) in [
                     ("Ctrl K", "Open commands"),
                     ("↑ / ↓, Enter", "Choose and run a command"),
                     ("Alt ← / Alt →", "Back / Forward with your context"),
                     ("Tab / Shift Tab", "Move keyboard focus"),
                     ("Space / Enter", "Activate the focused control or map item"),
-                    ("Delete", "Check Recycle Bin availability, then open the confirmation for the selected file"),
-                    ("Shift Delete", "Open permanent-delete confirmation for the selected file"),
-                    ("Escape", "Cancel a confirmation or close the foremost dialog"),
+                    (
+                        "Delete",
+                        "Check Recycle Bin availability, then open the confirmation for the selected file",
+                    ),
+                    (
+                        "Shift Delete",
+                        "Open permanent-delete confirmation for the selected file",
+                    ),
+                    (
+                        "Escape",
+                        "Cancel a confirmation or close the foremost dialog",
+                    ),
                     ("F1", "Keyboard help"),
                 ] {
                     detail(ui, key, action, p);
@@ -709,7 +825,8 @@ impl DiskScopeApp {
                 ui.label(
                     "Map items have names and logical sizes. The table offers the same objects and paths.",
                 );
-            });
+            },
+        );
         if !self.help_open {
             restore_dialog_focus(ctx, "Keyboard help");
         }
@@ -815,7 +932,7 @@ pub(super) fn date_time_label(seconds: u64) -> String {
 }
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{rendered_texts, settle_frames};
+    use super::super::test_support::{physical_app_frame, rendered_texts, settle_frames};
     use super::*;
     use eframe::App as _;
 
@@ -855,6 +972,470 @@ mod tests {
             egui::LayerId::new(egui::Order::Middle, egui::Id::new(title)),
             "focus escaped {title}"
         );
+    }
+
+    fn physical_text_is_visible(
+        output: &egui::FullOutput,
+        needle: &str,
+        physical_size: egui::Vec2,
+    ) -> bool {
+        fn find(shape: &egui::epaint::Shape, needle: &str) -> Option<Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().contains(needle) => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, needle))
+                }
+                _ => None,
+            }
+        }
+        output.shapes.iter().any(|shape| {
+            find(&shape.shape, needle).is_some_and(|rect| {
+                shape.clip_rect.contains_rect(rect)
+                    && Rect::from_min_size(egui::Pos2::ZERO, physical_size).contains_rect(
+                        Rect::from_min_max(
+                            (rect.min.to_vec2() * output.pixels_per_point).to_pos2(),
+                            (rect.max.to_vec2() * output.pixels_per_point).to_pos2(),
+                        ),
+                    )
+            })
+        })
+    }
+
+    fn painted_text_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        fn find(shape: &egui::epaint::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, label))
+                }
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, label))
+            .unwrap_or_else(|| panic!("missing painted {label}"))
+    }
+
+    #[test]
+    fn compact_popup_export_restores_a_live_parent_control_in_the_accessibility_tree() {
+        let (mut app, ctx) = idle_app();
+        ctx.enable_accesskit();
+        app.session_policy = SessionPolicy {
+            helpdesk: true,
+            no_history: true,
+        };
+        let physical_size = egui::vec2(1440.0, 820.0);
+        physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+        app.preferences.text_scale = TextScale::Largest;
+        app.apply_appearance(&ctx);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+        }
+        let parent = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Helpdesk & evidence"))
+            .unwrap()
+            .0;
+        for label in ["Helpdesk & evidence", "Incident & evidence…"] {
+            let point = painted_text_center(&output, label);
+            physical_app_frame(
+                &mut app,
+                &ctx,
+                physical_size,
+                1.0,
+                vec![egui::Event::PointerMoved(point)],
+            );
+            for pressed in [true, false] {
+                output = physical_app_frame(
+                    &mut app,
+                    &ctx,
+                    physical_size,
+                    1.0,
+                    vec![egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            for _ in 0..3 {
+                output = physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+            }
+        }
+        assert!(app.export_open);
+        for step in 0..3 {
+            let output = physical_app_frame(
+                &mut app,
+                &ctx,
+                physical_size,
+                1.0,
+                if step == 0 {
+                    vec![escape_key()]
+                } else {
+                    vec![]
+                },
+            );
+            let update = output.platform_output.accesskit_update.unwrap();
+            assert!(
+                update.nodes.iter().any(|(id, _)| *id == update.focus),
+                "close frame {step} must never reference a removed popup control as accessibility focus"
+            );
+            assert_eq!(
+                update.focus, parent,
+                "restore the stable menu button rather than its removed child"
+            );
+        }
+        assert!(!app.export_open);
+    }
+
+    #[test]
+    fn closing_a_dialog_while_switching_to_compact_layout_never_focuses_removed_sidebar() {
+        let (mut app, ctx) = idle_app();
+        ctx.enable_accesskit();
+        for _ in 0..3 {
+            physical_app_frame(&mut app, &ctx, egui::vec2(1440.0, 820.0), 1.0, vec![]);
+        }
+        physical_app_frame(
+            &mut app,
+            &ctx,
+            egui::vec2(1440.0, 820.0),
+            1.0,
+            vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+        );
+        let invoker = ctx.memory(|m| m.focused()).unwrap();
+        app.settings_open = true;
+        for _ in 0..3 {
+            physical_app_frame(&mut app, &ctx, egui::vec2(1440.0, 820.0), 1.0, vec![]);
+        }
+        for step in 0..3 {
+            let output = physical_app_frame(
+                &mut app,
+                &ctx,
+                egui::vec2(900.0, 640.0),
+                1.0,
+                if step == 0 {
+                    vec![escape_key()]
+                } else {
+                    vec![]
+                },
+            );
+            let update = output.platform_output.accesskit_update.unwrap();
+            assert_ne!(
+                update.focus,
+                invoker.accesskit_id(),
+                "the sidebar invoker disappeared in compact layout"
+            );
+            assert!(
+                update.nodes.iter().any(|(id, _)| *id == update.focus),
+                "every close-frame focus must be a live node"
+            );
+        }
+    }
+
+    #[test]
+    fn native_settings_zoom_escape_sequence_is_accepted_by_windows_accesskit_consumer() {
+        let (mut app, ctx) = idle_app();
+        ctx.enable_accesskit();
+        app.session_policy = SessionPolicy {
+            helpdesk: true,
+            no_history: true,
+        };
+        let physical_size = egui::vec2(1440.0, 820.0);
+        for _ in 0..3 {
+            physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+        }
+        let mut reached = false;
+        for _ in 0..40 {
+            let output = physical_app_frame(
+                &mut app,
+                &ctx,
+                physical_size,
+                1.0,
+                vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            );
+            if let Some(focused) = ctx.memory(|m| m.focused())
+                && output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(id, node)| {
+                        *id == focused.accesskit_id() && node.label() == Some("Settings")
+                    })
+            {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached);
+        physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![enter_key()]);
+        assert!(app.settings_open);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+        }
+        let point = painted_text_center(&output, "150%");
+        physical_app_frame(
+            &mut app,
+            &ctx,
+            physical_size,
+            1.0,
+            vec![egui::Event::PointerMoved(point)],
+        );
+        for pressed in [true, false] {
+            physical_app_frame(
+                &mut app,
+                &ctx,
+                physical_size,
+                1.0,
+                vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        for _ in 0..3 {
+            physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+        }
+        assert_eq!(app.preferences.text_scale, TextScale::Largest);
+        physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![escape_key()]);
+        for _ in 0..3 {
+            physical_app_frame(&mut app, &ctx, physical_size, 1.0, vec![]);
+        }
+        assert!(!app.settings_open);
+    }
+
+    #[test]
+    fn settings_at_150_percent_fits_physical_client_and_scrolls_to_safety_copy() {
+        for (physical_size, native_scale) in [
+            (egui::vec2(900.0, 640.0), 1.0),
+            (egui::vec2(1440.0, 820.0), 1.0),
+            (egui::vec2(1440.0, 820.0), 1.25),
+        ] {
+            let (mut app, ctx) = idle_app();
+            app.session_policy = SessionPolicy {
+                helpdesk: true,
+                no_history: true,
+            };
+            physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+            app.preferences.text_scale = TextScale::Largest;
+            app.preferences.reduced_motion = true;
+            app.apply_appearance(&ctx);
+            app.settings_open = true;
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+            }
+            assert!((output.pixels_per_point - native_scale * 1.5).abs() < 0.01);
+            assert!(
+                (ctx.content_rect().width() * output.pixels_per_point - physical_size.x).abs()
+                    < 1.0,
+                "test viewport must represent actual physical client pixels"
+            );
+            let window = ctx
+                .memory(|m| m.area_rect(egui::Id::new("Appearance & settings")))
+                .unwrap();
+            assert!(
+                ctx.content_rect().contains_rect(window),
+                "settings must fit the physical client at native={native_scale}: {window:?} vs {:?}",
+                ctx.content_rect()
+            );
+            for _ in 0..12 {
+                if physical_text_is_visible(&output, "Scans read metadata.", physical_size) {
+                    break;
+                }
+                physical_app_frame(
+                    &mut app,
+                    &ctx,
+                    physical_size,
+                    native_scale,
+                    vec![key(egui::Key::PageDown, egui::Modifiers::NONE)],
+                );
+                output = physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+            }
+            assert!(
+                physical_text_is_visible(&output, "Scans read metadata.", physical_size),
+                "keyboard scrolling must reveal the complete safety paragraph"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_windows_fit_scaled_clients_and_keyboard_targets_remain_visible() {
+        for title in [
+            "Filter files",
+            "Commands",
+            "Appearance & settings",
+            "Keyboard help",
+            "Pinned comparison",
+            "Scan errors & skipped locations",
+            "Export investigation evidence",
+        ] {
+            for native_scale in [1.0, 1.25] {
+                let physical_size = egui::vec2(900.0, 640.0);
+                let (mut app, ctx) = idle_app();
+                ctx.enable_accesskit();
+                app.session_policy = SessionPolicy {
+                    helpdesk: true,
+                    no_history: true,
+                };
+                physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+                app.preferences.text_scale = TextScale::Largest;
+                app.preferences.reduced_motion = true;
+                app.apply_appearance(&ctx);
+                let target = match title {
+                    "Filter files" => {
+                        app.filter_open = true;
+                        "Apply filters"
+                    }
+                    "Commands" => {
+                        app.open_palette();
+                        "Edit filters"
+                    }
+                    "Appearance & settings" => {
+                        app.settings_open = true;
+                        "Give the map more room"
+                    }
+                    "Keyboard help" => {
+                        app.help_open = true;
+                        "Close window"
+                    }
+                    "Pinned comparison" => {
+                        app.comparison_open = true;
+                        app.request.pinned = vec![1, 2, 3, 4];
+                        let mut model = Model::new(PathBuf::from(r"C:\fixture"));
+                        model.insert_batch(
+                            0,
+                            (1..=4)
+                                .map(|index| Entry {
+                                    name: format!("comparison fixture {index}").into(),
+                                    is_dir: false,
+                                    reparse: false,
+                                    logical: 100,
+                                    allocated: Some(4096),
+                                    modified: None,
+                                    identity: None,
+                                })
+                                .collect(),
+                        );
+                        Arc::make_mut(&mut app.visible).view =
+                            diskscope::view::build_view(&model, &app.request, 1);
+                        "Unpin comparison fixture 4"
+                    }
+                    "Scan errors & skipped locations" => {
+                        app.show_errors = true;
+                        Arc::make_mut(&mut app.snapshot).progress.errors = (0..20)
+                            .map(|index| ScanError {
+                                path: PathBuf::from(format!(r"C:\fixture\error-{index}")),
+                                message: "Permission denied; the scan continues.".into(),
+                            })
+                            .collect();
+                        "Copy error and path"
+                    }
+                    _ => {
+                        app.export_open = true;
+                        "Choose destination…"
+                    }
+                };
+                for _ in 0..4 {
+                    physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+                }
+                let window = ctx.memory(|m| m.area_rect(egui::Id::new(title))).unwrap();
+                assert!(
+                    ctx.content_rect().contains_rect(window),
+                    "{title} exceeds physical client at native {native_scale}: {window:?} vs {:?}",
+                    ctx.content_rect()
+                );
+                let mut reached = false;
+                let mut target_controls = std::collections::HashSet::new();
+                for _ in 0..40 {
+                    physical_app_frame(
+                        &mut app,
+                        &ctx,
+                        physical_size,
+                        native_scale,
+                        vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+                    );
+                    physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+                    physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+                    physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+                    let output =
+                        physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+                    if let Some(focused) = ctx.memory(|m| m.focused()) {
+                        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+                        let focused_node = &update
+                            .nodes
+                            .iter()
+                            .find(|(id, _)| *id == focused.accesskit_id())
+                            .unwrap()
+                            .1;
+                        if let Some(bounds) = focused_node.bounds() {
+                            let rect = Rect::from_min_max(
+                                egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                                egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+                            );
+                            assert!(
+                                ctx.content_rect().contains_rect(rect),
+                                "{title}: every tabbed control must fit the scaled client: {focused_node:?}"
+                            );
+                        }
+                        if let Some((_, node)) = update.nodes.iter().find(|(id, node)| {
+                            *id == focused.accesskit_id() && node.label() == Some(target)
+                        }) {
+                            target_controls.insert(focused);
+                            if title == "Scan errors & skipped locations"
+                                && target_controls.len() < 20
+                            {
+                                continue;
+                            }
+                            let bounds = node.bounds().unwrap();
+                            let rect = Rect::from_min_max(
+                                egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                                egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+                            );
+                            assert!(
+                                ctx.content_rect().contains_rect(rect),
+                                "{title}: {target} is outside client"
+                            );
+                            if target != "Close window" {
+                                let painted_target = if title == "Pinned comparison" {
+                                    "×"
+                                } else {
+                                    target
+                                };
+                                assert!(
+                                    physical_text_is_visible(
+                                        &output,
+                                        painted_target,
+                                        physical_size
+                                    ),
+                                    "{title}: {target} paint is clipped after Tab"
+                                );
+                            }
+                            reached = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(reached, "{title}: {target} must be keyboard reachable");
+            }
+        }
     }
 
     #[test]
@@ -1230,7 +1811,19 @@ mod tests {
         let output = settle_frames(ctx, |ui| {
             app.command_palette(ui.ctx(), app.preferences.theme.palette())
         });
-        rendered_texts(&output.shapes)
+        let mut texts = rendered_texts(&output.shapes);
+        for _ in 0..8 {
+            palette_frame(
+                app,
+                ctx,
+                vec![key(egui::Key::PageDown, egui::Modifiers::NONE)],
+            );
+            let output = settle_frames(ctx, |ui| {
+                app.command_palette(ui.ctx(), app.preferences.theme.palette())
+            });
+            texts.extend(rendered_texts(&output.shapes));
+        }
+        texts
     }
 
     fn enter_key() -> egui::Event {

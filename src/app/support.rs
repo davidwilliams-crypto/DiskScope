@@ -59,6 +59,7 @@ impl DiskScopeApp {
         if response.clicked() {
             controls::set_dialog_invoker(ui.ctx(), "Export investigation evidence", response.id);
             self.export_open = true;
+            self.export_feedback = None;
         }
     }
 
@@ -68,54 +69,138 @@ impl DiskScopeApp {
         }
         controls::remember_dialog_focus(ctx, "Export investigation evidence");
         let mut open = true;
-        let viewport = ctx.content_rect();
-        let max_width = (viewport.width() - 40.0).max(1.0);
-        egui::Window::new("Export investigation evidence")
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(560.0_f32.min(max_width))
-            .max_width(max_width)
-            .max_height((viewport.height() - 80.0).max(1.0))
-            .constrain_to(viewport.shrink(8.0))
-            .vscroll(true)
-            .show(ctx, |ui| {
+        controls::show_dialog(
+            egui::Window::new("Export investigation evidence")
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(560.0),
+            ctx,
+            |ui| {
                 ui.strong("Incident context · session only");
                 let label = ui.label("Ticket / incident reference (optional)");
-                ui.add(egui::TextEdit::singleline(&mut self.incident_ticket).char_limit(512).desired_width(f32::INFINITY)).labelled_by(label.id);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.incident_ticket)
+                        .char_limit(512)
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(label.id);
                 let label = ui.label("Endpoint label for this ticket (optional)");
-                ui.add(egui::TextEdit::singleline(&mut self.endpoint_label).char_limit(512).desired_width(f32::INFINITY)).labelled_by(label.id);
-                ui.checkbox(&mut self.export_redacted, "Redact paths, incident labels and action details");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.endpoint_label)
+                        .char_limit(512)
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(label.id);
+                ui.checkbox(
+                    &mut self.export_redacted,
+                    "Redact paths, incident labels and action details",
+                );
                 ui.label(if self.export_redacted {
                     "Paths, native identifiers, labels and error/action text are omitted."
                 } else {
                     "Full report includes customer paths, identifiers and action details. Review before sharing."
                 });
                 let label = ui.label("Destination JSON file (new file only)");
-                if ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(f32::INFINITY)).labelled_by(label.id).changed() { self.export_native_path = None; }
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.export_path)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .labelled_by(label.id)
+                    .changed()
+                {
+                    self.export_native_path = None;
+                    self.export_feedback = None;
+                }
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(!self.export_busy, egui::Button::new("Choose destination…")).clicked() {
+                    if ui
+                        .add_enabled(!self.export_busy, egui::Button::new("Choose destination…"))
+                        .clicked()
+                    {
                         self.export_busy = true;
-                        let tx = self.native_tx.clone(); let context = ctx.clone();
-                        if let Err(error) = std::thread::Builder::new().name("evidence-destination".into()).spawn(move || {
-                            let path = rfd::FileDialog::new().set_file_name("DiskScope-evidence.json").add_filter("JSON report", &["json"]).save_file();
-                            let _ = tx.send(NativeResult::ExportDestination(path)); context.request_repaint();
-                        }) { self.export_busy = false; self.notice = Some(format!("Could not open destination picker: {error}")); }
+                        self.export_feedback = Some("Choosing destination…".into());
+                        let tx = self.native_tx.clone();
+                        let context = ctx.clone();
+                        if let Err(error) = std::thread::Builder::new()
+                            .name("evidence-destination".into())
+                            .spawn(move || {
+                                let path = rfd::FileDialog::new()
+                                    .set_file_name("DiskScope-evidence.json")
+                                    .add_filter("JSON report", &["json"])
+                                    .save_file();
+                                let _ = tx.send(NativeResult::ExportDestination(path));
+                                context.request_repaint();
+                            })
+                        {
+                            self.export_busy = false;
+                            let message = format!("Could not open destination picker: {error}");
+                            self.export_feedback = Some(message.clone());
+                            self.notice = Some(message);
+                        }
                     }
-                    if ui.add_enabled(self.generation > 0 && !self.export_busy && !self.export_path.trim().is_empty(), egui::Button::new("Save evidence")).clicked() {
+                    if ui
+                        .add_enabled(
+                            self.generation > 0 && !self.export_path.trim().is_empty(),
+                            egui::Button::new("Save evidence"),
+                        )
+                        .clicked()
+                        && !self.export_busy
+                    {
                         self.export_busy = true;
-                        let path = self.export_native_path.clone().unwrap_or_else(|| PathBuf::from(&self.export_path));
-                        let snapshot = self.evidence_snapshot(); let evidence_context = self.evidence_context();
-                        let tx = self.native_tx.clone(); let context = ctx.clone();
-                        if let Err(error) = std::thread::Builder::new().name("evidence-export".into()).spawn(move || {
-                            let report = evidence::build_report(&snapshot, &evidence_context);
-                            let result = evidence::write_report_new(&report, &path).map(|()| path).map_err(|e| e.to_string());
-                            let _ = tx.send(NativeResult::Export(result)); context.request_repaint();
-                        }) { self.export_busy = false; self.notice = Some(format!("Could not start evidence export: {error}")); }
+                        self.export_feedback = Some("Saving evidence…".into());
+                        let path = self
+                            .export_native_path
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from(&self.export_path));
+                        let snapshot = self.evidence_snapshot();
+                        let evidence_context = self.evidence_context();
+                        let tx = self.native_tx.clone();
+                        let context = ctx.clone();
+                        if let Err(error) = std::thread::Builder::new()
+                            .name("evidence-export".into())
+                            .spawn(move || {
+                                let report = evidence::build_report(&snapshot, &evidence_context);
+                                let result = evidence::write_report_new(&report, &path)
+                                    .map(|()| path)
+                                    .map_err(|e| e.to_string());
+                                let _ = tx.send(NativeResult::Export(result));
+                                context.request_repaint();
+                            })
+                        {
+                            self.export_busy = false;
+                            let message = format!("Could not start evidence export: {error}");
+                            self.export_feedback = Some(message.clone());
+                            self.notice = Some(message);
+                        }
                     }
                 });
-                if self.export_busy { ui.label("Working in background…"); }
-                if self.generation == 0 { ui.label("Scan a folder before saving evidence."); }
-                ui.small(format!("{} action requests retained · bounded visible rows · new files only", self.action_journal.len()));
+                if let Some(message) = &self.export_feedback {
+                    ui.push_id("export_feedback", |ui| {
+                        let response = ui.add(egui::Label::new(message).wrap());
+                        ui.ctx().accesskit_node_builder(response.id, |node| {
+                            node.set_role(egui::accesskit::Role::Status);
+                            node.set_live(egui::accesskit::Live::Polite);
+                            node.set_live_atomic();
+                            node.set_value(message.as_str());
+                        });
+                        let changed = ui.data_mut(|data| {
+                            let previous = data.get_temp::<String>(response.id);
+                            data.insert_temp(response.id, message.clone());
+                            previous.as_ref() != Some(message)
+                        });
+                        if changed {
+                            response
+                                .scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+                        }
+                    });
+                }
+                if self.generation == 0 {
+                    ui.label("Scan a folder before saving evidence.");
+                }
+                ui.small(format!(
+                    "{} action requests retained · bounded visible rows · new files only",
+                    self.action_journal.len()
+                ));
                 ui.collapsing("Report contents & limits", |ui| {
                     ui.label("Save a bounded JSON summary for the correct incident ticket, using an approved ticket location. Existing files are never overwritten.");
                     ui.label("It includes scan coverage, errors, visible rows and any current action review. It is not a full inventory or restorable comparison baseline.");
@@ -125,7 +210,8 @@ impl DiskScopeApp {
                     ui.label("Redacted reports retain counts and measurements. Native identities are observations, not proof of an endpoint's ownership. Associate the report with the correct ticket.");
                     ui.label("Full reports contain customer filenames, paths, identifiers and action details. Review before sharing. Incident labels remain in this session only; explicit exports retain the selected report content.");
                 });
-            });
+            },
+        );
         self.export_open = open;
         if !open {
             controls::restore_dialog_focus(ctx, "Export investigation evidence");
@@ -137,6 +223,278 @@ impl DiskScopeApp {
 mod tests {
     use super::*;
     use eframe::App;
+
+    fn export_test_app() -> (DiskScopeApp, egui::Context) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = DiskScopeApp::new_session(
+            &cc,
+            None,
+            AccessMode::Standard,
+            SessionPolicy {
+                helpdesk: true,
+                no_history: true,
+            },
+        );
+        app.export_open = true;
+        app.generation = 1;
+        app.export_path = "C:\\new-evidence.json".into();
+        (app, ctx)
+    }
+
+    fn export_app_frame(
+        app: &mut DiskScopeApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        test_support::physical_app_frame(app, ctx, egui::vec2(1440.0, 820.0), 1.0, events)
+    }
+
+    #[test]
+    fn export_native_results_are_polite_enabled_status_inside_the_dialog() {
+        for result in [
+            Ok(PathBuf::from("C:\\ticket-evidence.json")),
+            Err("Destination already exists; it was not overwritten.".into()),
+        ] {
+            let (mut app, ctx) = export_test_app();
+            for _ in 0..3 {
+                export_app_frame(&mut app, &ctx, vec![]);
+            }
+            let expected = if result.is_ok() {
+                "Evidence exported to"
+            } else {
+                "Evidence export failed:"
+            };
+            app.native_tx.send(NativeResult::Export(result)).unwrap();
+            app.logic(&ctx, &mut eframe::Frame::_new_kittest());
+            let output = export_app_frame(&mut app, &ctx, vec![]);
+            let update = output.platform_output.accesskit_update.unwrap();
+            let (_, status) = update.nodes.iter().find(|(_, node)| node.role() == egui::accesskit::Role::Status
+                && node.value().is_some_and(|value| value.contains(expected)))
+                .expect("export result must appear in its dialog's status instead of only the disabled background");
+            assert!(!status.is_disabled());
+            assert_eq!(status.live(), Some(egui::accesskit::Live::Polite));
+            assert!(status.is_live_atomic());
+            assert!(app.export_open && !app.export_busy);
+            assert!(app.notice.as_ref().unwrap().contains(expected));
+        }
+    }
+
+    #[test]
+    fn busy_export_keeps_save_focus_without_starting_a_duplicate_worker() {
+        let (mut app, ctx) = export_test_app();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("must-not-be-created.json");
+        app.export_path = path.to_string_lossy().into_owned();
+        for _ in 0..3 {
+            export_app_frame(&mut app, &ctx, vec![]);
+        }
+        let mut save_focus = None;
+        for _ in 0..30 {
+            let output = export_app_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            if let Some(focused) = ctx.memory(|m| m.focused())
+                && output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(id, node)| {
+                        *id == focused.accesskit_id() && node.label() == Some("Save evidence")
+                    })
+            {
+                save_focus = Some(focused);
+                break;
+            }
+        }
+        let save_focus = save_focus.expect("Save is keyboard reachable");
+        app.export_busy = true;
+        let output = export_app_frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(save_focus),
+            "starting an async export must not send focus back to Ticket"
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == save_focus.accesskit_id())
+                .unwrap()
+                .1
+                .is_disabled()
+        );
+        for _ in 0..3 {
+            export_app_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match app.native_rx.recv_timeout(remaining) {
+                Ok(NativeResult::Export(_)) => {
+                    panic!("Enter while busy must not enqueue a duplicate export result")
+                }
+                Ok(_) => {} // Independent location/attribution workers may finish.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(error) => panic!("native channel unexpectedly closed: {error}"),
+            }
+        }
+        assert!(!path.exists());
+        app.native_tx
+            .send(NativeResult::Export(Err("Existing destination.".into())))
+            .unwrap();
+        app.logic(&ctx, &mut eframe::Frame::_new_kittest());
+        export_app_frame(&mut app, &ctx, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(save_focus));
+    }
+
+    #[test]
+    fn export_result_is_visible_at_real_150_percent_clients_without_moving_save_focus() {
+        for (physical_size, native_scale) in [
+            (egui::vec2(900.0, 640.0), 1.0),
+            (egui::vec2(900.0, 640.0), 1.25),
+            (egui::vec2(1440.0, 820.0), 1.0),
+        ] {
+            let (mut app, ctx) = export_test_app();
+            test_support::physical_app_frame(&mut app, &ctx, physical_size, native_scale, vec![]);
+            app.preferences.text_scale = TextScale::Largest;
+            app.preferences.reduced_motion = true;
+            app.apply_appearance(&ctx);
+            for _ in 0..4 {
+                test_support::physical_app_frame(
+                    &mut app,
+                    &ctx,
+                    physical_size,
+                    native_scale,
+                    vec![],
+                );
+            }
+            let mut save_focus = None;
+            for _ in 0..30 {
+                let output = test_support::physical_app_frame(
+                    &mut app,
+                    &ctx,
+                    physical_size,
+                    native_scale,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                if let Some(focused) = ctx.memory(|m| m.focused())
+                    && output
+                        .platform_output
+                        .accesskit_update
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .any(|(id, node)| {
+                            *id == focused.accesskit_id() && node.label() == Some("Save evidence")
+                        })
+                {
+                    save_focus = Some(focused);
+                    break;
+                }
+            }
+            let save_focus = save_focus.expect("Save is reachable in the scaled client");
+            app.export_busy = true;
+            app.native_tx
+                .send(NativeResult::Export(Err(
+                    "Destination already exists; it was not overwritten.".into(),
+                )))
+                .unwrap();
+            app.logic(&ctx, &mut eframe::Frame::_new_kittest());
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = test_support::physical_app_frame(
+                    &mut app,
+                    &ctx,
+                    physical_size,
+                    native_scale,
+                    vec![],
+                );
+            }
+            assert!((output.pixels_per_point - native_scale * 1.5).abs() < 0.01);
+            painted_text_rect(
+                &output,
+                app.export_feedback.as_deref().unwrap(),
+                ctx.content_rect(),
+            );
+            assert_eq!(ctx.memory(|m| m.focused()), Some(save_focus));
+        }
+    }
+
+    #[test]
+    fn editing_the_export_destination_clears_the_previous_result() {
+        let (mut app, ctx) = export_test_app();
+        app.native_tx
+            .send(NativeResult::Export(Err("Old destination error".into())))
+            .unwrap();
+        app.logic(&ctx, &mut eframe::Frame::_new_kittest());
+        for _ in 0..3 {
+            export_app_frame(&mut app, &ctx, vec![]);
+        }
+        let mut reached = false;
+        for _ in 0..30 {
+            let output = export_app_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            if let Some(focused) = ctx.memory(|m| m.focused())
+                && output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(id, node)| {
+                        *id == focused.accesskit_id()
+                            && node.value() == Some(app.export_path.as_str())
+                    })
+            {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached);
+        export_app_frame(&mut app, &ctx, vec![egui::Event::Text("-edited".into())]);
+        assert_eq!(app.export_path, "C:\\new-evidence.json-edited");
+        assert!(
+            app.export_feedback.is_none(),
+            "a previous result must not describe the newly edited destination"
+        );
+    }
 
     fn painted_text_rect(output: &egui::FullOutput, expected: &str, viewport: Rect) -> Rect {
         fn find(shape: &egui::epaint::Shape, expected: &str) -> Option<Rect> {
@@ -167,7 +525,9 @@ mod tests {
     }
 
     #[test]
-    fn export_primary_fields_and_save_are_visible_without_scrolling_at_compact_text_scales() {
+    fn export_primary_fields_fit_a_900_by_640_point_viewport() {
+        // This is a logical-point layout test. Smaller physical clients with
+        // native scaling and 150% zoom are covered by the scroll/focus tests.
         for scale in [TextScale::Normal, TextScale::Largest] {
             for redacted in [true, false] {
                 let cc = eframe::CreationContext::_new_kittest(egui::Context::default());

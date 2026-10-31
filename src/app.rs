@@ -48,6 +48,14 @@ pub(crate) fn configure_session_options(
     if !policy.persistence_allowed() {
         options.persistence_path = Some(PathBuf::from(r"\\.\NUL"));
         options.persist_window = false;
+        // Private sessions have no saved placement. Let Windows fit their
+        // initial window to the current work area instead of cascading a
+        // 900-point client below the taskbar on smaller remote desktops.
+        options.viewport = options
+            .viewport
+            .clone()
+            .with_maximized(true)
+            .with_clamp_size_to_monitor_size(true);
     }
 }
 
@@ -207,6 +215,7 @@ pub struct DiskScopeApp {
     export_redacted: bool,
     export_path: String,
     export_busy: bool,
+    export_feedback: Option<String>,
     export_native_path: Option<PathBuf>,
     incident_ticket: String,
     endpoint_label: String,
@@ -344,6 +353,7 @@ impl DiskScopeApp {
             export_redacted: true,
             export_path: String::new(),
             export_busy: false,
+            export_feedback: None,
             export_native_path: None,
             incident_ticket: String::new(),
             endpoint_label: String::new(),
@@ -599,6 +609,7 @@ impl DiskScopeApp {
                 }
                 NativeResult::ExportDestination(path) => {
                     self.export_busy = false;
+                    self.export_feedback = None;
                     if let Some(path) = path {
                         self.export_path = path.to_string_lossy().into_owned();
                         self.export_native_path = Some(path);
@@ -606,13 +617,15 @@ impl DiskScopeApp {
                 }
                 NativeResult::Export(result) => {
                     self.export_busy = false;
-                    self.notice = Some(match result {
+                    let message = match result {
                         Ok(path) => format!(
                             "Evidence exported to {}. Attach it to the correct ticket using your approved process.",
                             path.display()
                         ),
                         Err(error) => format!("Evidence export failed: {error}"),
-                    });
+                    };
+                    self.export_feedback = Some(message.clone());
+                    self.notice = Some(message);
                 }
                 NativeResult::Locations(locations) => self.locations = locations,
                 NativeResult::Folder(path) => {
@@ -2016,10 +2029,12 @@ impl DiskScopeApp {
             return;
         }
         controls::remember_dialog_focus(ctx, "Scan errors & skipped locations");
-        egui::Window::new("Scan errors & skipped locations")
-            .open(&mut self.show_errors)
-            .default_size([650.0, 350.0])
-            .show(ctx, |ui| {
+        controls::show_dialog(
+            egui::Window::new("Scan errors & skipped locations")
+                .open(&mut self.show_errors)
+                .default_size([650.0, 350.0]),
+            ctx,
+            |ui| {
                 let progress = &self.snapshot.progress;
                 ui.label(format!(
                     "{} errors · {} skipped entries",
@@ -2034,21 +2049,24 @@ impl DiskScopeApp {
                     .color(p.muted),
                 );
                 ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for error in &progress.errors {
-                        ui.add(
-                            egui::Label::new(RichText::new(error.path.to_string_lossy()).strong())
+                for error in &progress.errors {
+                    ui.add(
+                        egui::Label::new(RichText::new(error.path.to_string_lossy()).strong())
                             .wrap(),
-                        )
-                        .on_hover_text(error.path.to_string_lossy());
-                        ui.label(RichText::new(&error.message).small().color(p.muted));
-                        if ui.button("Copy error and path").clicked() { ui.ctx().copy_text(format!("{}\n{}", error.path.display(), error.message)); }
+                    )
+                    .on_hover_text(error.path.to_string_lossy());
+                    ui.label(RichText::new(&error.message).small().color(p.muted));
+                    let copy = ui.button("Copy error and path");
+                    if copy.clicked() {
+                        ui.ctx()
+                            .copy_text(format!("{}\n{}", error.path.display(), error.message));
                     }
-                });
+                }
                 if progress.errors.is_empty() {
                     ui.label("No error samples.");
                 }
-            });
+            },
+        );
         if !self.show_errors {
             controls::restore_dialog_focus(ctx, "Scan errors & skipped locations");
         }
@@ -2081,6 +2099,7 @@ impl eframe::App for DiskScopeApp {
             self.mark_query_changed();
         }
         let p = self.preferences.theme.palette();
+        controls::begin_dialog_focus_restore(&ctx);
         if self.transient_dialog_open() {
             // Capture before disabling the invoker, since egui surrenders
             // keyboard focus when a disabled widget is rendered.

@@ -37,6 +37,10 @@ need named human owners; a source change does not assign those responsibilities.
 - AccessKit names, focus and polite state feedback are tested independently of
   full Narrator/remote qualification. Do not count simulated controls as human task
   success or count an ignored native test as executed.
+- Every emitted accessibility focus ID must resolve in the current accumulated
+  consumer tree, including popup closure and text-scale/layout changes. Previous-
+  frame widget responses cannot establish current invoker liveness. Keep the
+  actual Windows-consumer frame tests when upgrading the GUI dependencies.
 
 ## Release and incident cadence
 

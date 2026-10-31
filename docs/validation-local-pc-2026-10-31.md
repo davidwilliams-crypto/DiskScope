@@ -28,9 +28,30 @@ passed afterward. Tests cover opening-frame background activation, first focus,
 forward/reverse containment, nested dialogs, Escape/title-close restoration,
 row selection, all column splitter bounds, viewport reset and pointer resizing.
 Independent read-only review found no actionable regression in the final diff.
-Fresh local default tests: 473 passed / 15 ignored; diagnostics: 476 passed /
+Fresh local default tests: 482 passed / 15 ignored; diagnostics: 485 passed /
 15 ignored. Final headless, lint, packaging, hosted and new-binary desktop results
 are recorded separately rather than inferred from this description.
+
+The intermediate source `0c9b01e` passed hosted tests but was rejected after a
+native crash: Settings -> 150% text -> Escape exited with code 101 because an
+AccessKit focused ID was absent from the node list. Its stderr/exit record is
+retained in research/local-pc-desktop/compact-exit-repro/ and its package directory
+is marked DO NOT DEPLOY. A removed sidebar or popup child could be restored as
+focus. The follow-up proves the invoker exists in the current render, uses the
+stable compact menu parent, and safely falls back to root when the target is gone.
+The exact sequence and intermediate frames now pass the same AccessKit Consumer
+tree validation used by Windows. This adds only a test dependency already locked
+transitively, without changing production dependencies.
+
+Native 150% testing also found clipped Settings content and export feedback hidden
+behind the modal. All seven transient dialogs now use viewport bounds, vertical
+scrolling and keyboard/focus reveal at actual native display scaling plus app
+zoom. Export success/failure is an enabled polite status inside its dialog, and
+busy Save retains focus while a separate callback guard prevents duplicate work.
+Private sessions start maximized within Windows' work area so their initial
+cascaded window does not hide bottom controls. Ordinary saved placement remains
+unchanged. Accept these fixes only with corresponding exact-binary native test
+records; this implementation description alone does not establish a native pass.
 
 ## Additional observed local evidence
 
