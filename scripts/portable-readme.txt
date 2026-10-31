@@ -1,4 +1,4 @@
-DiskScope 0.3.3 preview - Windows x64
+DiskScope 0.3.4 preview - Windows x64
 
 Requires Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable
 graphics driver. The Visual C++ runtime is linked into the executable.

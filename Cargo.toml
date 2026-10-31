@@ -1,6 +1,6 @@
 [package]
 name = "diskscope"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 # Locked Windows GUI dependency floor (eframe/egui 0.34.3).
 rust-version = "1.92"
