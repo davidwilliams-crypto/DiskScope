@@ -119,4 +119,37 @@ mod tests {
         fs::write(&file, vec![b' '; 4097]).unwrap();
         assert!(SessionPolicy::beside_executable(&exe).is_err());
     }
+
+    /// A policy entry that exists but cannot be opened is present and
+    /// unreadable, not missing: it must abort startup instead of silently
+    /// re-enabling file actions and persistence.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_policy_link_is_present_but_unreadable_and_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("DiskScope.exe");
+        let file = temp.path().join(POLICY_FILE);
+        // The companion entry is there, but its target is gone.
+        std::os::unix::fs::symlink(temp.path().join("removed-policy-target.json"), &file).unwrap();
+        assert!(
+            fs::symlink_metadata(&file).is_ok(),
+            "the policy entry exists beside the executable"
+        );
+        let loaded = SessionPolicy::beside_executable(&exe);
+        assert!(
+            loaded.is_err(),
+            "a present but unreadable policy must not relax to {loaded:?}"
+        );
+        // A policy that really is missing keeps ordinary behaviour.
+        fs::remove_file(&file).unwrap();
+        assert_eq!(
+            SessionPolicy::beside_executable(&exe).unwrap(),
+            SessionPolicy::default()
+        );
+        // And a link to a readable policy is still honoured.
+        let target = temp.path().join("policy-target.json");
+        fs::write(&target, br#"{"helpdesk":true}"#).unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+        assert!(SessionPolicy::beside_executable(&exe).unwrap().helpdesk);
+    }
 }
