@@ -44,7 +44,18 @@ impl SessionPolicy {
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                // Opening follows links, so "not found" can describe a missing
+                // target of an entry that is there. Only a directory entry that
+                // is itself confirmed absent counts as a missing policy.
+                return match fs::symlink_metadata(&path) {
+                    Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Ok(_) | Err(_) => Err(format!(
+                        "Cannot read session policy {}: {error}",
+                        path.display()
+                    )),
+                };
             }
             Err(error) => {
                 return Err(format!(
