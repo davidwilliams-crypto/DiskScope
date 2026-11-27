@@ -129,7 +129,7 @@ user/machine registry views, shortcuts, default/profile directories and running
 DiskScope processes. Cleanup uses only a byte-verified uninstaller belonging to
 the exact fixture registration, plus the unchanged owned profile canary and its
 proven-empty, initially absent parent. It retains its bounded workspace fixture.
-`test-installer-upgrade-preflight.ps1` passed 34 pure/synthetic checks on both
+`test-installer-upgrade-preflight.ps1` passed 35 pure/synthetic checks on both
 PowerShell 7 and Windows PowerShell 5.1: missing hosted context, self-hosted
 execution, existing registration/path/process, and missing/unrelated/relative
 uninstaller ownership are refused; positive assertion paths also run. The shared

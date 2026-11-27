@@ -58,5 +58,13 @@ if (@(Get-InstallerUpgradeRetainedNewerFiles $baseline $baseline).Count -ne 0) {
 $script:checks++
 if ((@(Get-InstallerUpgradeRetainedNewerFiles $candidate $baseline) -join '|') -cne 'licenses\url-2.5.8\LICENSE') { throw 'Retained newer files do not follow the baseline-then-candidate argument order.' }
 $script:checks++
+# The hosted upgrade script itself only runs on a disposable runner, under
+# PowerShell 7. Parse it here under both hosts, so a syntax error fails now
+# rather than after the candidate installer has been built.
+$upgradeScript = Join-Path $PSScriptRoot 'test-installer-upgrade.ps1'
+$tokens = $null; $parseErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile($upgradeScript, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count) { throw ("test-installer-upgrade.ps1 does not parse under PowerShell $($PSVersionTable.PSVersion): " + (($parseErrors | ForEach-Object { $_.Message }) -join '; ')) }
+$script:checks++
 Write-Output "Installer upgrade preflight: $script:checks checks passed. Synthetic state tests only; no installer, registry write, profile write or trust mutation."
 exit 0

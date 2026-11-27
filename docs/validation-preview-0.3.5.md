@@ -47,7 +47,7 @@ trailing dot run ignored; a file outside the installation folder left
 untouched; a manifest that does not list the application ignored; a listed
 file held open by another handle aborting the update with nothing removed. The
 script compiles under NSIS 3.12 with warnings denied. The qualification
-harness's pure checks pass (34) under Windows PowerShell 5.1.
+harness's pure checks pass (35) under Windows PowerShell 5.1.
 
 Hosted results are the workflow runs of the release commit: Windows validation
 and installer lifecycle qualification are required before the draft exists.
