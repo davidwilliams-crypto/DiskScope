@@ -22,6 +22,8 @@ if (-not $NsisCompiler) {
 $NsisCompiler = (Resolve-Path -LiteralPath $NsisCompiler -ErrorAction Stop).ProviderPath
 $nsisNotices = Join-Path (Split-Path -Parent $NsisCompiler) 'COPYING'
 if (-not (Test-Path -LiteralPath $nsisNotices -PathType Leaf)) { throw 'NSIS COPYING notices are required beside the compiler.' }
+$setupIcon = Join-Path $projectRoot 'packaging\icon.ico'
+if (-not (Test-Path -LiteralPath $setupIcon -PathType Leaf)) { throw "The setup icon is required: $setupIcon" }
 # build.ps1 checks scripts\portable-readme.txt against Cargo.toml before it
 # compiles anything. With -SkipBuild the existing payload's own README.txt is
 # validated by Assert-ReleasePayload below instead.
@@ -47,7 +49,7 @@ $installer = Join-Path $stage $installerName
 $archive = Join-Path $stage $archiveName
 $numericVersion = ($version -split '[-+]')[0] + '.0'
 $sizeKiB = [math]::Ceiling(($stagedFiles | Measure-Object -Property Length -Sum).Sum / 1KB)
-& $NsisCompiler '/V2' '/WX' "/DAPP_VERSION=$version" "/DPRODUCT_VERSION=$numericVersion" "/DOUTPUT_FILE=$installer" "/DPAYLOAD_INCLUDE=$include" "/DESTIMATED_SIZE=$sizeKiB" "/DNSIS_NOTICES=$nsisNotices" (Join-Path $projectRoot 'packaging\DiskScope.nsi')
+& $NsisCompiler '/V2' '/WX' "/DAPP_VERSION=$version" "/DPRODUCT_VERSION=$numericVersion" "/DOUTPUT_FILE=$installer" "/DPAYLOAD_INCLUDE=$include" "/DESTIMATED_SIZE=$sizeKiB" "/DNSIS_NOTICES=$nsisNotices" "/DSETUP_ICON=$setupIcon" (Join-Path $projectRoot 'packaging\DiskScope.nsi')
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $installer)) { throw 'Installer compilation failed.' }
 New-PortableArchive -Directory $payload -Destination $archive -Version $version
 Copy-Item -LiteralPath $nsisNotices -Destination (Join-Path $stage 'INSTALLER_NOTICES.txt')

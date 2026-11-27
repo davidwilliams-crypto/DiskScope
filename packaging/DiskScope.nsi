@@ -30,6 +30,9 @@ ManifestDPIAware true
 !ifndef NSIS_NOTICES
   !error "NSIS_NOTICES must identify the compiler's COPYING file."
 !endif
+!ifndef SETUP_ICON
+  !error "SETUP_ICON is required; use scripts/package-release.ps1."
+!endif
 !include "${PAYLOAD_INCLUDE}"
 
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\DiskScope"
@@ -59,6 +62,8 @@ Var RegisteredInstall
 Var NoShortcuts
 
 !define MUI_ABORTWARNING
+!define MUI_ICON "${SETUP_ICON}"
+!define MUI_UNICON "${SETUP_ICON}"
 !define MUI_WELCOMEPAGE_TITLE "Install DiskScope ${APP_VERSION}"
 !define MUI_WELCOMEPAGE_TEXT "DiskScope will be installed for your Windows account.$\r$\n$\r$\nRequires Windows 10 or later on an Intel or AMD 64-bit PC and graphics support for OpenGL 2.0 or later.$\r$\n$\r$\nClose DiskScope before installing or updating. Your scan history and preferences are preserved."
 !insertmacro MUI_PAGE_WELCOME
