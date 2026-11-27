@@ -28,15 +28,15 @@ impl DiskScopeApp {
         context.endpoint_label =
             (!self.endpoint_label.trim().is_empty()).then(|| self.endpoint_label.trim().to_owned());
         context.attribution = self.attribution.clone();
-        let limits = if self.session_policy.helpdesk {
-            diskscope::engine::ScanLimits::helpdesk()
-        } else {
-            diskscope::engine::ScanLimits::default()
-        };
+        let limits = diskscope::engine::ScanLimits::for_session(self.session_policy.helpdesk);
         context.resource_observation = self.controller.resource_observation();
         context.resource_refusal_reason = self.controller.resource_refusal_reason();
         context.admission_limits = Some(limits);
-        context.memory_budget = Some(limits.memory_budget());
+        context.memory_budget = Some(
+            self.controller
+                .effective_memory_budget()
+                .unwrap_or_else(|| limits.memory_budget()),
+        );
         context.view_request = Some(self.request.clone());
         context.redaction = if self.export_redacted {
             Redaction::Redacted

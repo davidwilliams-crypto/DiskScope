@@ -29,7 +29,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Admission limits for the normal in-memory inventory. Estimated bytes are
 /// deliberately conservative accounting, not a guarantee of process peak RAM.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanLimits {
     pub max_nodes: usize,
     pub max_estimated_bytes: usize,
@@ -42,6 +42,13 @@ impl Default for ScanLimits {
         }
     }
 }
+/// Share of installed memory an ordinary session may charge to its inventory
+/// estimate. The estimate is deliberately about twice what a node really costs.
+const SCALED_SHARE: u64 = 3;
+/// Node ceiling for the largest scaled budget. The byte budget binds first on
+/// ordinary machines; this keeps the node count bounded on any machine.
+const SCALED_MAX_NODES: usize = 16_000_000;
+
 impl ScanLimits {
     pub fn helpdesk() -> Self {
         Self {
@@ -49,8 +56,43 @@ impl ScanLimits {
             max_estimated_bytes: 256 * 1024 * 1024,
         }
     }
-    /// Memory tripwires are independent of estimated inventory bytes. Smaller
-    /// inventory caps receive the conservative helpdesk policy by default.
+    /// The limits a session starts with: the fixed helpdesk policy, or the
+    /// ordinary budget scaled to installed memory.
+    pub fn for_session(helpdesk: bool) -> Self {
+        if helpdesk {
+            Self::helpdesk()
+        } else {
+            Self::scaled(resources::total_physical_bytes())
+        }
+    }
+    /// Ordinary sessions scale the inventory budget with installed memory so a
+    /// whole drive can finish on a typical PC. One third of installed RAM is the
+    /// estimated-inventory budget, no lower than the fixed default and no higher
+    /// than the shared ceiling. Small or unmeasurable machines keep the fixed
+    /// default; helpdesk limits never scale.
+    pub fn scaled(total_physical_bytes: Option<u64>) -> Self {
+        let default = Self::default();
+        let Some(total) = total_physical_bytes else {
+            return default;
+        };
+        let bytes = total.saturating_div(SCALED_SHARE).clamp(
+            default.max_estimated_bytes as u64,
+            resources::SCALED_CEILING_BYTES,
+        );
+        let per_node = (std::mem::size_of::<Node>() * 2 + 192) as u64;
+        Self {
+            max_nodes: usize::try_from(
+                (bytes / per_node).clamp(default.max_nodes as u64, SCALED_MAX_NODES as u64),
+            )
+            .unwrap_or(default.max_nodes),
+            max_estimated_bytes: usize::try_from(bytes).unwrap_or(default.max_estimated_bytes),
+        }
+    }
+    /// Memory tripwires are sampled separately from estimated inventory bytes.
+    /// Smaller inventory caps receive the conservative helpdesk policy by
+    /// default. Anything larger keeps at least the ordinary tripwire and may rise
+    /// with the inventory budget, never above the shared ceiling, so a drive that
+    /// fits the budget is not stopped just short of the end by a lower fixed one.
     pub fn memory_budget(self) -> MemoryBudget {
         let helpdesk = Self::helpdesk();
         if self.max_nodes <= helpdesk.max_nodes
@@ -58,7 +100,11 @@ impl ScanLimits {
         {
             MemoryBudget::helpdesk()
         } else {
-            MemoryBudget::default()
+            let mut budget = MemoryBudget::default();
+            budget.max_private_bytes = u64::try_from(self.max_estimated_bytes)
+                .unwrap_or(u64::MAX)
+                .clamp(budget.max_private_bytes, resources::SCALED_CEILING_BYTES);
+            budget
         }
     }
 }
@@ -71,8 +117,28 @@ struct MemoryMonitor {
     /// Coordinator writes only on an actual refusal. Sampler recovery must not
     /// rewrite why the retained partial inventory stopped.
     refusal: Mutex<Option<(u64, String)>>,
+    /// The tripwire the coordinator is enforcing for a generation. It can
+    /// differ from the limits' own value (an NTFS preview keeps the fixed
+    /// ordinary one), so evidence reports this rather than a reconstruction.
+    budget: Mutex<Option<(u64, MemoryBudget)>>,
 }
 impl MemoryMonitor {
+    fn set_budget(&self, generation: u64, budget: MemoryBudget) {
+        *self
+            .budget
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some((generation, budget));
+    }
+    fn budget(&self, generation: u64) -> Option<MemoryBudget> {
+        let budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        budget
+            .as_ref()
+            .filter(|(enforced, _)| *enforced == generation)
+            .map(|(_, budget)| *budget)
+    }
     fn spawn(
         probe: impl Fn() -> Result<MemoryObservation, ProbeError> + Send + 'static,
         signals: Arc<Signals>,
@@ -319,6 +385,13 @@ impl Controller {
             .filter(|(limited, _)| *limited == generation)
             .map(|(_, reason)| reason.clone())
     }
+    /// The memory tripwire the coordinator is enforcing for the current scan,
+    /// once it has taken the start. Evidence reports this instead of
+    /// reconstructing it from the limits, which an NTFS preview narrows.
+    pub fn effective_memory_budget(&self) -> Option<MemoryBudget> {
+        self.resources
+            .budget(self.signals.generation.load(Ordering::Acquire))
+    }
     pub fn cancel(&self) {
         self.signals.cancel.store(true, Ordering::Release);
         self.mailboxes.doorbell.set(());
@@ -452,6 +525,9 @@ struct Scan {
     model: Arc<Model>,
     root_summary: Option<crate::view::RootSummary>,
     history_captured: bool,
+    /// Whether this coordinator holds history capture. Only then could a
+    /// baseline ever have been saved, so only then does a limit say it was not.
+    history_possible: bool,
     next_node: usize,
     outstanding: usize,
     state: ScanState,
@@ -488,6 +564,22 @@ fn model_mut(model: &mut Arc<Model>) -> &mut Model {
 const NTFS_NEEDS_DRIVE_ROOT: &str = "NTFS reading requires a whole local drive root such as \
      C:\\; using normal enumeration for this path.";
 
+/// Plain byte size for a limit in user-facing text: whole GiB or MiB for a
+/// round limit, otherwise one decimal place with the exact byte count.
+fn describe_bytes(bytes: usize) -> String {
+    const GIB: usize = 1 << 30;
+    const MIB: usize = 1 << 20;
+    match bytes {
+        0 => "0 bytes".into(),
+        1 => "1 byte".into(),
+        bytes if bytes >= GIB && bytes % GIB == 0 => format!("{} GiB", bytes / GIB),
+        bytes if bytes >= GIB => format!("{:.1} GiB ({bytes} bytes)", bytes as f64 / GIB as f64),
+        bytes if bytes >= MIB && bytes % MIB == 0 => format!("{} MiB", bytes / MIB),
+        bytes if bytes >= MIB => format!("{:.1} MiB ({bytes} bytes)", bytes as f64 / MIB as f64),
+        bytes => format!("{bytes} bytes"),
+    }
+}
+
 impl Scan {
     fn new(start: Start) -> Self {
         let mut model = Model::new(start.root.clone());
@@ -502,9 +594,18 @@ impl Scan {
         };
         let fallback_reason = (start.backend == BackendChoice::Ntfs && kind == TaskKind::Directory)
             .then(|| NTFS_NEEDS_DRIVE_ROOT.to_owned());
+        // The raw NTFS path builds its model in the worker and never charges the
+        // inventory estimate, so the memory tripwire is its only ceiling: keep
+        // that at the ordinary fixed value rather than the scaled one.
+        let mut memory_budget = start.memory_budget;
+        if kind == TaskKind::Ntfs {
+            memory_budget.max_private_bytes = memory_budget
+                .max_private_bytes
+                .min(MemoryBudget::default().max_private_bytes);
+        }
         Self {
             limits: start.limits,
-            memory_budget: start.memory_budget,
+            memory_budget,
             resource_reason: None,
             estimated_bytes: std::mem::size_of::<Node>()
                 .saturating_add(start.root.as_os_str().len()),
@@ -514,6 +615,7 @@ impl Scan {
             model: Arc::new(model),
             root_summary: (kind == TaskKind::Directory).then(crate::view::RootSummary::new),
             history_captured: false,
+            history_possible: false,
             next_node: 0,
             outstanding: 0,
             state: ScanState::Preparing,
@@ -557,6 +659,39 @@ impl Scan {
         }
         true
     }
+    /// Names the limit that stopped admission, so the status line and evidence
+    /// say which budget bound instead of a generic limit.
+    fn inventory_limit_reason(&self, nodes_reached: bool) -> String {
+        if nodes_reached {
+            format!(
+                "Estimated inventory admission stopped at the limit of {} nodes.",
+                self.limits.max_nodes
+            )
+        } else {
+            format!(
+                "Estimated inventory admission budget of {} reached.",
+                describe_bytes(self.limits.max_estimated_bytes)
+            )
+        }
+    }
+    /// Keeps the inventory refusal beside the memory tripwire's, so evidence
+    /// reports why the retained partial inventory stopped. A refusal already
+    /// recorded for this generation is kept; an older generation's is replaced.
+    fn record_inventory_refusal(&self, monitor: &MemoryMonitor) {
+        let Some(reason) = self.resource_reason.as_deref() else {
+            return;
+        };
+        let mut refusal = monitor
+            .refusal
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if refusal
+            .as_ref()
+            .is_none_or(|(generation, _)| *generation != self.generation)
+        {
+            *refusal = Some((self.generation, reason.to_owned()));
+        }
+    }
     fn normal_fallback(&mut self, reason: String) {
         // Raw attempts publish no partial model. Replace every accounting structure
         // before scheduling a normal attempt within this user-visible generation.
@@ -579,6 +714,9 @@ impl Scan {
         self.estimated_bytes =
             std::mem::size_of::<Node>().saturating_add(self.model.root_path.as_os_str().len());
         self.resource_limited = false;
+        // The raw attempt kept the fixed ordinary tripwire. The normal scan that
+        // replaces it charges the inventory estimate, so its own limits apply.
+        self.memory_budget = self.limits.memory_budget();
     }
     fn insert_entries(&mut self, parent: NodeId, mut entries: Vec<Entry>) {
         let mut accepted = 0;
@@ -590,10 +728,11 @@ impl Scan {
                 .saturating_add(192)
                 .saturating_add(entry.name.len().saturating_mul(2));
             let next = self.estimated_bytes.checked_add(cost);
-            if self.model.nodes.len().saturating_add(accepted) >= self.limits.max_nodes
-                || next.is_none_or(|n| n > self.limits.max_estimated_bytes)
-            {
+            let nodes_reached =
+                self.model.nodes.len().saturating_add(accepted) >= self.limits.max_nodes;
+            if nodes_reached || next.is_none_or(|n| n > self.limits.max_estimated_bytes) {
                 self.resource_limited = true;
+                self.resource_reason = Some(self.inventory_limit_reason(nodes_reached));
                 break;
             }
             self.estimated_bytes = next.unwrap();
@@ -624,7 +763,13 @@ impl Scan {
             }
         }
         if self.resource_limited {
-            self.record_error(0, self.model.root_path.clone(), "Scan resource limit reached; results are partial. Scan a smaller folder. Estimated inventory bytes are not measured peak process memory.".into());
+            let reason = self
+                .resource_reason
+                .as_deref()
+                .unwrap_or("Estimated inventory admission budget reached.");
+            self.record_error(0, self.model.root_path.clone(), format!(
+                "{reason} Scan resource limit reached; results are partial. Scan a smaller folder. Estimated inventory bytes are not measured peak process memory."
+            ));
             self.finish(ScanState::Partial);
         }
     }
@@ -711,12 +856,16 @@ impl Scan {
     fn snapshot(&self, request: &ViewRequest) -> UiSnapshot {
         let root = &self.model.nodes[0];
         let message: String = if self.resource_limited {
-            format!(
-                "{} Scan resource limit reached; partial inventory retained. Choose a smaller folder. No complete baseline was saved.",
+            let mut message = format!(
+                "{} Scan resource limit reached; partial inventory retained. Choose a smaller folder.",
                 self.resource_reason
                     .as_deref()
                     .unwrap_or("Estimated inventory admission budget reached.")
-            )
+            );
+            if self.history_possible {
+                message.push_str(" No complete baseline was saved.");
+            }
+            message
         } else if self.state == ScanState::Preparing {
             "Waiting for a background memory observation and an available worker; previous I/O may still be finishing.".into()
         } else if self.state == ScanState::Partial {
@@ -847,7 +996,10 @@ fn coordinate(
         let mut scheduler_blocked = false;
         if let Some(start) = starts.take() {
             let _replacement = Span::new(Metric::Replacement);
-            scan = Some(Scan::new(start));
+            let mut replacement = Scan::new(start);
+            replacement.history_possible = history.is_some();
+            resources.set_budget(replacement.generation, replacement.memory_budget);
+            scan = Some(replacement);
             dirty = true;
             first_publication = true;
             made_progress = true;
@@ -911,6 +1063,8 @@ fn coordinate(
                             }
                             Err(reason) => active.normal_fallback(reason),
                         }
+                        // A fallback replaces the narrow raw tripwire.
+                        resources.set_budget(active.generation, active.memory_budget);
                         dirty = true;
                     }
                     Event::Started(generation, path) if generation == active.generation => {
@@ -932,6 +1086,7 @@ fn coordinate(
                         active.insert_entries(parent, entries);
                         if active.resource_limited {
                             signals.limit_generation(active.generation);
+                            active.record_inventory_refusal(&resources);
                         }
                         dirty = true;
                     }
@@ -1387,6 +1542,306 @@ mod tests {
         assert_eq!(snapshot.progress.files, 0);
         assert_ne!(snapshot.progress.state, ScanState::Complete);
     }
+
+    #[test]
+    fn ordinary_limits_scale_with_installed_memory_between_fixed_bounds() {
+        let gib = 1u64 << 30;
+        let default = ScanLimits::default();
+        let per_node = (std::mem::size_of::<Node>() * 2 + 192) as u64;
+        // Unknown and small machines keep the fixed default exactly.
+        assert_eq!(ScanLimits::scaled(None), default);
+        assert_eq!(ScanLimits::scaled(Some(0)), default);
+        assert_eq!(ScanLimits::scaled(Some(2 * gib)), default);
+        // One third of installed RAM, with the node count following the bytes.
+        let sixteen = ScanLimits::scaled(Some(16 * gib));
+        assert_eq!(sixteen.max_estimated_bytes as u64, 16 * gib / 3);
+        assert_eq!(sixteen.max_nodes as u64, 16 * gib / 3 / per_node);
+        // Never above the shared ceiling, however large the machine.
+        let huge = ScanLimits::scaled(Some(1024 * gib));
+        assert_eq!(
+            huge.max_estimated_bytes as u64,
+            resources::SCALED_CEILING_BYTES
+        );
+        assert_eq!(huge.max_nodes, SCALED_MAX_NODES);
+        // The helpdesk policy is a separate, fixed budget.
+        assert_eq!(ScanLimits::for_session(true), ScanLimits::helpdesk());
+    }
+
+    #[test]
+    fn scaled_inventory_budgets_lift_the_memory_tripwire_only_as_far_as_the_ceiling() {
+        let gib = 1u64 << 30;
+        // The fixed default keeps its tripwire.
+        assert_eq!(
+            ScanLimits::default().memory_budget().max_private_bytes,
+            MemoryBudget::default().max_private_bytes
+        );
+        // A small inventory budget never lowers it.
+        assert_eq!(
+            ScanLimits {
+                max_nodes: 6_000_000,
+                max_estimated_bytes: 2 * gib as usize,
+            }
+            .memory_budget()
+            .max_private_bytes,
+            2 * gib
+        );
+        // A larger one lifts the tripwire with it, and never past the ceiling.
+        assert_eq!(
+            ScanLimits {
+                max_nodes: 16_000_000,
+                max_estimated_bytes: 6 * gib as usize,
+            }
+            .memory_budget()
+            .max_private_bytes,
+            6 * gib
+        );
+        assert_eq!(
+            ScanLimits {
+                max_nodes: usize::MAX,
+                max_estimated_bytes: usize::MAX,
+            }
+            .memory_budget()
+            .max_private_bytes,
+            resources::SCALED_CEILING_BYTES
+        );
+        // Helpdesk-sized caps keep the conservative helpdesk policy.
+        assert_eq!(
+            ScanLimits {
+                max_nodes: 1_000,
+                max_estimated_bytes: 1_000,
+            }
+            .memory_budget(),
+            MemoryBudget::helpdesk()
+        );
+    }
+
+    #[test]
+    fn inventory_limits_are_named_by_the_scan_that_hit_them() {
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start_limited(
+            "fixture".into(),
+            BackendChoice::Normal,
+            ScanLimits {
+                max_nodes: 3,
+                max_estimated_bytes: usize::MAX,
+            },
+        );
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                task.parent,
+                vec![
+                    fixture_entry("one", false, 10),
+                    fixture_entry("two", false, 20),
+                    fixture_entry("three", false, 30),
+                ],
+            ))
+            .unwrap();
+        let snapshot = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 2);
+        assert!(
+            snapshot
+                .progress
+                .message
+                .contains("stopped at the limit of 3 nodes"),
+            "{}",
+            snapshot.progress.message
+        );
+        assert!(
+            !snapshot.progress.message.contains("baseline"),
+            "a coordinator without history could never have saved one: {}",
+            snapshot.progress.message
+        );
+        assert!(
+            controller
+                .resource_refusal_reason()
+                .is_some_and(|reason| reason.contains("limit of 3 nodes")),
+            "evidence names the inventory limit as well"
+        );
+        drop(controller);
+
+        // Room for the root and exactly one entry; then the byte budget binds.
+        let per_entry = std::mem::size_of::<Node>() * 2 + 192 + 2 * "one".len();
+        let budget = std::mem::size_of::<Node>() + "fixture".len() + per_entry;
+        let (mut controller, tasks, events) = controlled_io();
+        let generation = controller.start_limited(
+            "fixture".into(),
+            BackendChoice::Normal,
+            ScanLimits {
+                max_nodes: 100,
+                max_estimated_bytes: budget,
+            },
+        );
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                task.parent,
+                vec![
+                    fixture_entry("one", false, 10),
+                    fixture_entry("two", false, 20),
+                ],
+            ))
+            .unwrap();
+        let snapshot = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 1);
+        let named = format!("budget of {budget} bytes reached");
+        assert!(
+            snapshot.progress.message.contains(&named),
+            "{}",
+            snapshot.progress.message
+        );
+        assert!(
+            snapshot
+                .progress
+                .errors
+                .iter()
+                .any(|error| error.message.contains(&named)),
+            "the recorded error names the budget as well"
+        );
+    }
+
+    #[test]
+    fn limit_sizes_read_as_units_with_the_exact_byte_count() {
+        assert_eq!(describe_bytes(0), "0 bytes");
+        assert_eq!(describe_bytes(1), "1 byte");
+        assert_eq!(describe_bytes(7), "7 bytes");
+        assert_eq!(describe_bytes(256 * 1024 * 1024), "256 MiB");
+        assert_eq!(
+            describe_bytes(5 * 1024 * 1024 + 512),
+            "5.0 MiB (5243392 bytes)"
+        );
+        assert_eq!(describe_bytes(1 << 30), "1 GiB");
+        let third = 16 * (1u64 << 30) / 3;
+        assert_eq!(describe_bytes(third as usize), "5.3 GiB (5726623061 bytes)");
+        assert_eq!(describe_bytes(8 << 30), "8 GiB");
+    }
+
+    #[test]
+    fn the_ntfs_preview_keeps_the_fixed_memory_tripwire() {
+        let start = |backend: BackendChoice| {
+            let scaled = ScanLimits::scaled(Some(64 * (1u64 << 30)));
+            Start {
+                generation: 1,
+                root: PathBuf::from("C:\\"),
+                backend,
+                limits: scaled,
+                memory_budget: scaled.memory_budget(),
+            }
+        };
+        assert_eq!(
+            start(BackendChoice::Ntfs).memory_budget.max_private_bytes,
+            resources::SCALED_CEILING_BYTES
+        );
+        let mut preview = Scan::new(start(BackendChoice::Ntfs));
+        assert_eq!(
+            preview.memory_budget.max_private_bytes,
+            MemoryBudget::default().max_private_bytes
+        );
+        // The normal scan that replaces a failed raw attempt charges the
+        // inventory estimate, so it takes the scaled tripwire back.
+        preview.normal_fallback("raw volume access denied".into());
+        assert_eq!(preview.kind, TaskKind::Directory);
+        assert_eq!(
+            preview.memory_budget.max_private_bytes,
+            resources::SCALED_CEILING_BYTES
+        );
+        assert_eq!(
+            Scan::new(start(BackendChoice::Normal))
+                .memory_budget
+                .max_private_bytes,
+            resources::SCALED_CEILING_BYTES
+        );
+    }
+
+    #[test]
+    fn evidence_can_read_the_tripwire_the_coordinator_actually_enforces() {
+        let (mut controller, tasks, events) = controlled_io();
+        let scaled = ScanLimits::scaled(Some(64 * (1u64 << 30)));
+        let fixed = MemoryBudget::default().max_private_bytes;
+        let generation = controller.start_with_resources(
+            "C:\\".into(),
+            BackendChoice::Ntfs,
+            scaled,
+            scaled.memory_budget(),
+        );
+        let enforced = |controller: &Controller| {
+            controller
+                .effective_memory_budget()
+                .map(|budget| budget.max_private_bytes)
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while enforced(&controller).is_none() {
+            assert!(Instant::now() < deadline, "the start was never taken");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(enforced(&controller), Some(fixed));
+        assert_eq!(
+            tasks.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+            TaskKind::Ntfs
+        );
+        events
+            .send(Event::NtfsResult(
+                generation,
+                Err("raw volume access denied".into()),
+            ))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while enforced(&controller) != Some(resources::SCALED_CEILING_BYTES) {
+            assert!(
+                Instant::now() < deadline,
+                "the fallback kept the narrow tripwire"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // A new ordinary start reports nothing until the coordinator takes it,
+        // then its scaled tripwire: the previous scan's value never leaks.
+        controller.start_limited("fresh".into(), BackendChoice::Normal, scaled);
+        assert_eq!(enforced(&controller), None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while enforced(&controller) != Some(resources::SCALED_CEILING_BYTES) {
+            assert!(
+                Instant::now() < deadline,
+                "a new start lost the scaled tripwire"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_limit_reports_a_missing_baseline_only_when_history_could_have_saved_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = crate::history::HistoryService::new(temp.path().join("history"));
+        let (mut controller, tasks, events) = controlled_io_with_history(Some(history.capture()));
+        let generation = controller.start_limited(
+            "fixture".into(),
+            BackendChoice::Normal,
+            ScanLimits {
+                max_nodes: 1,
+                max_estimated_bytes: usize::MAX,
+            },
+        );
+        let task = tasks.recv_timeout(Duration::from_secs(1)).unwrap();
+        events
+            .send(Event::Entries(
+                generation,
+                task.parent,
+                vec![fixture_entry("one", false, 10)],
+            ))
+            .unwrap();
+        let snapshot = wait_snapshot(&controller, |s| s.progress.state == ScanState::Partial);
+        assert_eq!(snapshot.progress.files, 0);
+        assert!(
+            snapshot
+                .progress
+                .message
+                .contains("No complete baseline was saved."),
+            "{}",
+            snapshot.progress.message
+        );
+    }
+
     use super::*;
 
     fn controlled_io() -> (Controller, Receiver<Task>, Sender<Event>) {

@@ -20,7 +20,10 @@ need named human owners; a source change does not assign those responsibilities.
   Partial, failed and cancelled inventories cannot become complete baselines.
 - Catalog ownership, byte/node/retention limits, free-space admission and protection
   metadata remain fail-closed. Older executables do not honor baseline protection.
-  Whole-drive scalability requires architecture and measurements, not raised caps.
+  Ordinary sessions scale their inventory budget with installed memory (one third
+  of RAM as estimated storage, 1-8 GiB) over an arena that grows in bounded steps;
+  helpdesk limits stay fixed. Whole-drive scalability beyond that requires
+  architecture and measurements, not raised caps.
 - Optional attribution never blocks a CLI deadline or probes from a UI frame.
   GUI requests/results are bounded and newest unsent work is retained for retry.
   Native observations are not proof of endpoint ownership; redaction hides them.

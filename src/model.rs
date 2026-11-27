@@ -52,6 +52,11 @@ pub struct ScanError {
     pub message: String,
 }
 
+/// The node arena grows by at most a quarter once it is large. `Vec`'s doubling
+/// briefly holds the old and the doubled buffer and then leaves up to half of it
+/// empty, which on a multi-million-node inventory is gigabytes of spare memory.
+const ARENA_MIN_GROWTH: usize = 1024;
+
 #[derive(Debug)]
 pub struct Model {
     pub root_path: PathBuf,
@@ -97,6 +102,14 @@ impl Model {
             seen_files: HashMap::new(),
         }
     }
+    /// Bounds the arena's spare capacity: once the arena is larger than
+    /// [`ARENA_MIN_GROWTH`] it grows by a quarter at a time instead of doubling.
+    fn reserve_node_slot(&mut self) {
+        if self.nodes.len() == self.nodes.capacity() {
+            self.nodes
+                .reserve_exact((self.nodes.len() / 4).max(ARENA_MIN_GROWTH));
+        }
+    }
     pub fn insert_batch(&mut self, parent: NodeId, entries: Vec<Entry>) -> Vec<NodeId> {
         if self.nodes.get(parent as usize).is_none_or(|n| !n.is_dir) {
             self.record_error(self.root_path.clone(), "Invalid scanner parent".into());
@@ -139,6 +152,7 @@ impl Model {
             } else {
                 files = files.saturating_add(1)
             }
+            self.reserve_node_slot();
             self.nodes.push(Node {
                 id,
                 parent: Some(parent),
@@ -465,6 +479,28 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn node_arena_spare_capacity_stays_bounded_as_it_grows() {
+        let mut m = Model::new(PathBuf::from("C:\\fixture"));
+        let mut widest_spare = 0usize;
+        for batch in 0..20 {
+            let entries = (0..10_000)
+                .map(|index| file(&format!("f{batch}-{index}"), 1, Some(1), 1))
+                .collect();
+            m.insert_batch(0, entries);
+            widest_spare = widest_spare.max(m.nodes.capacity() - m.nodes.len());
+        }
+        assert_eq!(m.nodes.len(), 200_001);
+        // Doubling leaves nearly half the arena empty after a growth step.
+        // Sampled after every batch, the quarter-step arena never holds a third
+        // spare.
+        assert!(
+            widest_spare * 3 < m.nodes.capacity(),
+            "spare capacity {widest_spare} of {} is not bounded",
+            m.nodes.capacity()
+        );
+    }
+
     #[test]
     fn nested_logical_totals_are_additive() {
         let mut m = Model::new(PathBuf::from("C:\\fixture"));

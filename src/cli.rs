@@ -311,10 +311,16 @@ impl ScanSource for Controller {
 
 /// Starts a scan on `controller` and waits for it to finish or time out.
 ///
-/// The timing clock starts before controller start/view setup. Controller
-/// construction, optional caller attribution and report writing are excluded.
+/// The scan uses the ordinary session limits, so it measures what the
+/// application does. The timing clock starts before controller start/view
+/// setup. Controller construction, optional caller attribution and report
+/// writing are excluded.
 pub fn execute_scan(controller: &mut Controller, options: &ScanOptions) -> ScanRun {
-    execute_scan_limited(controller, options, crate::engine::ScanLimits::default())
+    execute_scan_limited(
+        controller,
+        options,
+        crate::engine::ScanLimits::for_session(false),
+    )
 }
 
 pub fn execute_scan_limited(
@@ -517,17 +523,17 @@ pub fn run_scan_command_with_policy(
             let _ = attribution_tx.send(attribution);
         });
     let mut controller = Controller::new();
-    let limits = if policy.helpdesk {
-        crate::engine::ScanLimits::helpdesk()
-    } else {
-        crate::engine::ScanLimits::default()
-    };
+    let limits = crate::engine::ScanLimits::for_session(policy.helpdesk);
     let run = execute_scan_limited(&mut controller, options, limits);
     let mut context = EvidenceContext::new(options.root.clone());
     context.attribution = available_attribution(&attribution_rx);
     context.resource_observation = controller.resource_observation();
     context.admission_limits = Some(limits);
-    context.memory_budget = Some(limits.memory_budget());
+    context.memory_budget = Some(
+        controller
+            .effective_memory_budget()
+            .unwrap_or_else(|| limits.memory_budget()),
+    );
     context.resource_refusal_reason = controller.resource_refusal_reason();
     context.redaction = Redaction::Full;
     context.access_context = match crate::admin::elevation_kind() {

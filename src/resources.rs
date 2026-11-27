@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 pub const MAX_OBSERVATION_AGE: Duration = Duration::from_secs(2);
 const MIB: u64 = 1024 * 1024;
+/// Upper bound for everything that scales with installed memory, so even a very
+/// large machine never admits an unbounded inventory.
+pub const SCALED_CEILING_BYTES: u64 = 8 * 1024 * MIB;
 
 /// Separate from estimated inventory accounting: private committed process bytes
 /// include the rest of this application too. Reserve is deliberately left unused.
@@ -145,6 +148,31 @@ pub fn observe_native() -> Result<MemoryObservation, ProbeError> {
     ))
 }
 
+/// Installed physical memory, read once per process. `None` when the platform
+/// cannot report it; callers then keep the fixed conservative limits.
+pub fn total_physical_bytes() -> Option<u64> {
+    static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(total_physical_bytes_native)
+}
+
+#[cfg(windows)]
+fn total_physical_bytes_native() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `MEMORYSTATUSEX` is a plain structure that receives its documented
+    // size and a valid writable pointer. The query is read-only and needs no
+    // enumeration or elevation.
+    unsafe {
+        let mut system: MEMORYSTATUSEX = std::mem::zeroed();
+        system.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut system) != 0).then_some(system.ullTotalPhys)
+    }
+}
+
+#[cfg(not(windows))]
+fn total_physical_bytes_native() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +233,18 @@ mod tests {
         assert!(sample.observed_utc_epoch_ms.is_some());
         assert!(sample.source.contains("GlobalMemoryStatusEx"));
         assert!(sample.source.contains("K32GetProcessMemoryInfo"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_memory_probe_reports_a_plausible_total_and_is_stable() {
+        let total = total_physical_bytes().expect("read-only Windows memory probe");
+        assert!(total >= 64 * MIB, "a Windows PC reports at least 64 MiB");
+        assert!(total < 1 << 50, "physical memory fits far below a petabyte");
+        assert_eq!(
+            Some(total),
+            total_physical_bytes(),
+            "the cached value is stable"
+        );
     }
 }

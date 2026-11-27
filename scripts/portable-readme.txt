@@ -16,8 +16,9 @@ Use HELP_DESK_RUNBOOK.md and HELP_DESK_QUALIFICATION.md before a fleet rollout.
 The release is MIT-licensed; see LICENSE and the separate third-party notices.
 
 Normal scans stop with explicit partial results when inventory admission limits
-are reached: 5 million nodes / 1 GiB estimated storage in ordinary mode,
-1 million nodes / 256 MiB estimated storage in helpdesk mode. These estimates
+are reached. Ordinary mode scales its budget with installed memory: one third
+of RAM as estimated storage, from 1 GiB up to 8 GiB, with at most 16 million
+nodes. Helpdesk mode keeps the fixed 1 million nodes / 256 MiB. These estimates
 are not measured process RAM limits. Investigate smaller folders when limited.
 Use Export ticket evidence for a bounded JSON summary. Redaction is on by
 default in the GUI; CLI JSON includes paths. Exports refuse existing files.

@@ -661,11 +661,7 @@ impl DiskScopeApp {
             } else {
                 BackendChoice::Normal
             },
-            if self.session_policy.helpdesk {
-                diskscope::engine::ScanLimits::helpdesk()
-            } else {
-                diskscope::engine::ScanLimits::default()
-            },
+            diskscope::engine::ScanLimits::for_session(self.session_policy.helpdesk),
         );
         self.scan_started_utc = diskscope::evidence::utc_now_epoch_ms();
         self.scan_finished_utc = None;
