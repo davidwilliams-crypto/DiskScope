@@ -229,7 +229,7 @@ try {
     $script:attemptedInstallation = $false
     Assert-True ($null -eq (Get-UpgradeRegistration)) 'Uninstall registration remains.'
     Assert-True (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $installedUninstaller)) 'Owned application/uninstaller remains after uninstall.'
-    foreach ($relative in @($baseline.hashes.Keys)) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $installDirectory $relative)))) "Baseline payload remains after uninstall: $relative" }
+    foreach ($relative in @($baseline.hashes.Keys)) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $installDirectory $relative))) "Baseline payload remains after uninstall: $relative" }
     Assert-OwnedCanaries
     # After the baseline's uninstaller only the user's canary and the newer
     # files it cannot know may remain: nothing of the baseline and nothing else.
