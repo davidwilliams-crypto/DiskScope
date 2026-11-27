@@ -98,6 +98,7 @@ $script:attemptedInstallation = $false
 $profileCreated = $false
 $started = [DateTime]::UtcNow.ToString('o')
 $failure = $null
+$retainedNewer = @()
 $cleanupFailure = $null
 $status = 'failed'
 function Assert-True([bool]$Condition, [string]$Message) {
@@ -143,7 +144,8 @@ function Assert-OwnedCanaries {
     Assert-True (@(Get-ChildItem -LiteralPath $localData -Force).Count -eq 1) 'Unexpected profile data appeared; no history-format compatibility claim is allowed.'
     Assert-True (-not (Test-Path -LiteralPath $roamingData)) 'Unexpected roaming profile data appeared.'
 }
-function Assert-InstalledStage($Payload, [string]$StageName) {
+function Assert-InstalledStage($Payload, [string]$StageName, [string[]]$RetainedNewerFiles = @()) {
+    $retainedSeen = [Collections.Generic.List[string]]::new()
     $registration = Get-UpgradeRegistration
     Assert-InstallerUpgradeOwnedLocation $installDirectory $registration
     # Establish cleanup ownership before outcome assertions. A diagnostic failure
@@ -163,6 +165,13 @@ function Assert-InstalledStage($Payload, [string]$StageName) {
     }
     foreach ($file in @(Get-ReleaseFiles -Directory $installDirectory)) {
         $relative = $file.FullName.Substring($installDirectory.Length + 1)
+        if ($relative -in $RetainedNewerFiles) {
+            # A file only the candidate ships, which the published baseline's
+            # installer cannot know. It must still be exactly the candidate's.
+            Assert-True ((Get-FileHash -LiteralPath $file.FullName).Hash -ceq $candidate.hashes[$relative]) "Retained newer file changed at $StageName`: $relative"
+            $retainedSeen.Add($relative)
+            Continue
+        }
         Assert-True ($Payload.hashes.ContainsKey($relative) -or $relative -in @('Uninstall.exe', 'INSTALLER_NOTICES.txt', 'unrelated user file.keep')) "Unexpected/stale installed file at $StageName`: $relative"
     }
     Assert-OwnedCanaries
@@ -172,7 +181,7 @@ function Assert-InstalledStage($Payload, [string]$StageName) {
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
     Assert-True ((Get-DiskScopeReportVersion $report $Payload.version) -ceq $Payload.version -and $report.complete -and $report.files -eq 1 -and $report.logical_bytes -eq 11 -and $report.errors_total -eq 0) 'Installed stage version/known-answer report mismatch.'
     Assert-OwnedCanaries
-    $script:stages.Add([pscustomobject]@{ id = $StageName; status = 'passed'; observed_at_utc = [DateTime]::UtcNow.ToString('o'); version = $Payload.version; executable_sha256 = (Get-FileHash -LiteralPath $installedExe).Hash.ToLowerInvariant(); expected_executable_sha256 = $Payload.executable_sha256.ToLowerInvariant(); payload_files_verified = $Payload.hashes.Count; registration_views = @{ current_user64 = $registration; current_user32 = $user32; machine64 = $machine64; machine32 = $machine32 }; cli = $process })
+    $script:stages.Add([pscustomobject]@{ id = $StageName; status = 'passed'; observed_at_utc = [DateTime]::UtcNow.ToString('o'); version = $Payload.version; executable_sha256 = (Get-FileHash -LiteralPath $installedExe).Hash.ToLowerInvariant(); expected_executable_sha256 = $Payload.executable_sha256.ToLowerInvariant(); payload_files_verified = $Payload.hashes.Count; retained_newer_files = @($retainedSeen); registration_views = @{ current_user64 = $registration; current_user32 = $user32; machine64 = $machine64; machine32 = $machine32 }; cli = $process })
 }
 function Invoke-StrictOwnedUninstall {
     Assert-NoReleaseReparsePath $installDirectory
@@ -197,6 +206,10 @@ try {
     $baselineArchive = Receive-PinnedBaseline 'DiskScope-0.3.2-windows-x64-portable.zip' $baselineArchiveHash
     $baseline = Get-ValidatedArchive $baselineArchive $baselineVersion 'baseline-portable'
     $candidate = Get-ValidatedArchive $PortableArchive $version 'candidate-portable'
+    # Only the candidate ships these. The candidate installer must itself remove
+    # every baseline-only file, but the published baseline installer cannot know
+    # a newer version's files, so the binary rollback retains exactly these.
+    $retainedNewer = @(Get-InstallerUpgradeRetainedNewerFiles $baseline $candidate)
     New-Item -ItemType Directory -Path (Join-Path $fixture 'scan') | Out-Null
     Write-QualificationNewFile (Join-Path $fixture 'scan/known.txt') 'known bytes'
     # Recheck immediately before creating profile state/starting setup.
@@ -211,15 +224,20 @@ try {
     Invoke-UpgradeSetup $Installer '/S /NoShortcuts'
     Assert-InstalledStage $candidate 'candidate-upgrade'
     Invoke-UpgradeSetup $baselineInstaller '/S /NoShortcuts'
-    Assert-InstalledStage $baseline 'baseline-binary-rollback'
+    Assert-InstalledStage $baseline 'baseline-binary-rollback' $retainedNewer
     Invoke-StrictOwnedUninstall
     $script:attemptedInstallation = $false
     Assert-True ($null -eq (Get-UpgradeRegistration)) 'Uninstall registration remains.'
     Assert-True (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $installedUninstaller)) 'Owned application/uninstaller remains after uninstall.'
-    foreach ($relative in @($baseline.hashes.Keys)) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $installDirectory $relative))) "Baseline payload remains after uninstall: $relative" }
+    foreach ($relative in @($baseline.hashes.Keys)) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $installDirectory $relative)))) "Baseline payload remains after uninstall: $relative" }
     Assert-OwnedCanaries
+    # After the baseline's uninstaller only the user's canary and the newer
+    # files it cannot know may remain: nothing of the baseline and nothing else.
+    $remaining = @(Get-ReleaseFiles -Directory $installDirectory | ForEach-Object { $_.FullName.Substring($installDirectory.Length + 1) })
+    Assert-True (@($remaining | Where-Object { $_ -ne 'unrelated user file.keep' -and $_ -notin $retainedNewer }).Count -eq 0) 'Uninstall left files other than the canary and the retained newer files.'
+    Assert-True (@($retainedNewer | Where-Object { $_ -notin $remaining }).Count -eq 0) 'A retained newer file disappeared during the baseline uninstall.'
     foreach ($path in @($guardPaths | Where-Object { $_ -notin @($localData, $roamingData) })) { Assert-True (-not (Test-Path -LiteralPath $path)) "Unexpected shortcut/default install path: $path" }
-    $script:stages.Add([pscustomobject]@{ id = 'uninstall-after-binary-rollback'; status = 'passed'; observed_at_utc = [DateTime]::UtcNow.ToString('o'); canaries_preserved = $true })
+    $script:stages.Add([pscustomobject]@{ id = 'uninstall-after-binary-rollback'; status = 'passed'; observed_at_utc = [DateTime]::UtcNow.ToString('o'); canaries_preserved = $true; retained_newer_files = @($remaining | Where-Object { $_ -in $retainedNewer } | Sort-Object) })
     $status = 'passed'
 } catch { $failure = $_.Exception.Message }
 finally {
@@ -240,8 +258,9 @@ finally {
         schema_version = 1; status = $status; started_at_utc = $started; finished_at_utc = [DateTime]::UtcNow.ToString('o'); commit = $env:GITHUB_SHA; checks_passed = $script:checks
         baseline = @{ version = $baselineVersion; installer_sha256 = $baselineInstallerHash; portable_sha256 = $baselineArchiveHash }
         candidate = @{ version = $version; installer_sha256 = (Get-FileHash -LiteralPath $Installer).Hash.ToLowerInvariant(); portable_sha256 = (Get-FileHash -LiteralPath $PortableArchive).Hash.ToLowerInvariant() }
+        retained_newer_files = @($retainedNewer)
         stages = @($script:stages); failure = $failure; cleanup_failure = $cleanupFailure
-        scope = 'Actual hosted Windows Server binary upgrade 0.3.2 to candidate, binary rollback to 0.3.2, exact required payload/CLI version, opaque file/profile canary preservation, uninstall. No runtime history/snapshot-format, client-OS, remote, UAC, publisher or fleet qualification is inferred. Fixture retained; only exact owned profile canary/empty parent cleaned.'
+        scope = 'Actual hosted Windows Server binary upgrade 0.3.2 to candidate, binary rollback to 0.3.2, exact required payload/CLI version, opaque file/profile canary preservation, uninstall. Files only the candidate ships are retained by the published baseline installer, which cannot know them, and are recorded; the candidate installer itself must remove every baseline-only file. No runtime history/snapshot-format, client-OS, remote, UAC, publisher or fleet qualification is inferred. Fixture retained; only exact owned profile canary/empty parent cleaned.'
     }
     Write-QualificationNewFile (Join-Path $output 'binary-upgrade-rollback.json') ($record | ConvertTo-Json -Depth 20)
 }

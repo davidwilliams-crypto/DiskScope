@@ -49,5 +49,14 @@ $extra = $owned.Clone(); $extra.Unexpected = 'extra'
 Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $extra $null $null } 'Extra shared-view registration value accepted.'
 Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $owned $owned $null } 'Machine Registry64 registration accepted.'
 Assert-Rejected { Assert-InstallerUpgradeRegistrationViews 'C:\fixture\install' '0.3.3' $owned $owned $null $owned } 'Machine Registry32 registration accepted.'
+$baseline = @{ hashes = @{ 'DiskScope.exe' = 'a'; 'licenses\url-2.5.8\LICENSE' = 'b' } }
+$candidate = @{ hashes = @{ 'DiskScope.exe' = 'c'; 'licenses\url-2.5.9\LICENSE' = 'd'; 'licenses\winresource-0.1.34\LICENSE' = 'e' } }
+$retained = @(Get-InstallerUpgradeRetainedNewerFiles $baseline $candidate)
+if (($retained -join '|') -cne 'licenses\url-2.5.9\LICENSE|licenses\winresource-0.1.34\LICENSE') { throw 'Retained newer files are not exactly the candidate-only set.' }
+$script:checks++
+if (@(Get-InstallerUpgradeRetainedNewerFiles $baseline $baseline).Count -ne 0) { throw 'Identical payloads retained files.' }
+$script:checks++
+if ((@(Get-InstallerUpgradeRetainedNewerFiles $candidate $baseline) -join '|') -cne 'licenses\url-2.5.8\LICENSE') { throw 'Retained newer files do not follow the baseline-then-candidate argument order.' }
+$script:checks++
 Write-Output "Installer upgrade preflight: $script:checks checks passed. Synthetic state tests only; no installer, registry write, profile write or trust mutation."
 exit 0

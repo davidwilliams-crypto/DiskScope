@@ -171,6 +171,228 @@ FunctionEnd
 !insertmacro CheckApplicationWritable ""
 !insertmacro CheckApplicationWritable "un."
 
+; An existing installation lists its own payload in SHA256SUMS.txt: a hash, two
+; spaces and a forward-slash relative path. The manifest does not list itself.
+; Those files are removed before this version writes its payload, so an update
+; never leaves files of the version it replaces behind, such as the notices of a
+; dependency that is no longer shipped. Only manifest-listed relative paths
+; inside $INSTDIR are touched: files the user added are not listed and stay.
+; Nothing is removed unless the manifest lists the application itself and every
+; listed file can be opened for deletion or carries only the read-only, hidden
+; or system attributes, so an update that cannot proceed leaves the previous
+; installation as it was.
+Var PreviousPayloadRemoved
+
+; $1 holds a manifest line. Leaves in $2 the relative path it names with
+; backslash separators, or an empty string when the line is malformed or the
+; path could leave $INSTDIR.
+Function PreviousPayloadLinePath
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  Push $R0
+  StrCpy $2 ""
+  StrLen $3 $1
+  ${If} $3 < 67
+    Goto line_path_done
+  ${EndIf}
+  StrCpy $4 $1 1 64
+  ${If} $4 != " "
+    Goto line_path_done
+  ${EndIf}
+  StrCpy $4 $1 1 65
+  ${If} $4 != " "
+    Goto line_path_done
+  ${EndIf}
+  StrCpy $2 $1 "" 66
+line_path_trim:
+  StrCpy $4 $2 1 -1
+  ${If} $4 == "$\r"
+  ${OrIf} $4 == "$\n"
+    StrCpy $2 $2 -1
+    Goto line_path_trim
+  ${EndIf}
+  StrLen $3 $2
+  ${If} $3 == 0
+    Goto line_path_done
+  ${EndIf}
+  ; A safe path has no drive, root, wildcard, alternate data stream or parent
+  ; reference, so with either separator it can only name something inside
+  ; $INSTDIR. A run of dots at the end is "." or "..": both are rejected. Each
+  ; accepted forward slash becomes a backslash, so every later file operation
+  ; sees one form.
+  StrCpy $4 0
+  StrCpy $5 ""
+  StrCpy $6 0
+  StrCpy $R0 ""
+line_path_next:
+  ; IntCmp jumps on equal, then less, then more.
+  IntCmp $4 $3 line_path_checked line_path_step line_path_checked
+line_path_step:
+  StrCpy $7 $2 1 $4
+  ${If} $7 == "\"
+  ${OrIf} $7 == "/"
+    ${If} $4 == 0
+    ${OrIf} $5 == "\"
+    ${OrIf} $6 == 2
+      Goto line_path_reject
+    ${EndIf}
+    StrCpy $6 0
+    StrCpy $7 "\"
+  ${ElseIf} $7 == ":"
+  ${OrIf} $7 == "*"
+  ${OrIf} $7 == "?"
+    Goto line_path_reject
+  ${Else}
+    ${If} $7 == "."
+      IntOp $6 $6 + 1
+    ${Else}
+      StrCpy $6 0
+    ${EndIf}
+  ${EndIf}
+  StrCpy $5 $7
+  StrCpy $R0 "$R0$7"
+  IntOp $4 $4 + 1
+  Goto line_path_next
+line_path_checked:
+  ${If} $6 != 0
+    Goto line_path_reject
+  ${EndIf}
+  StrCpy $2 $R0
+  Goto line_path_done
+line_path_reject:
+  StrCpy $2 ""
+line_path_done:
+  Pop $R0
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+FunctionEnd
+
+; Two passes over the existing installation's manifest. The first only checks
+; that every listed file can be opened for deletion; the second removes them.
+; $9 selects the pass and $8 records that the manifest is DiskScope's own.
+Function RemovePreviousPayload
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  Push $8
+  Push $9
+  StrCpy $PreviousPayloadRemoved 0
+  ClearErrors
+  IfFileExists "$INSTDIR\SHA256SUMS.txt" 0 previous_done
+  StrCpy $9 0
+previous_pass:
+  ClearErrors
+  FileOpen $0 "$INSTDIR\SHA256SUMS.txt" r
+  IfErrors previous_done
+  StrCpy $8 0
+previous_line:
+  ClearErrors
+  FileRead $0 $1
+  IfErrors previous_closed
+  Call PreviousPayloadLinePath
+  ${If} $2 == ""
+    Goto previous_line
+  ${EndIf}
+  ${If} $2 == "SHA256SUMS.txt"
+    Goto previous_line
+  ${EndIf}
+  ${If} $2 == "DiskScope.exe"
+    StrCpy $8 1
+  ${EndIf}
+  IfFileExists "$INSTDIR\$2" 0 previous_line
+  ${If} $9 == 0
+    StrCpy $5 0
+previous_probe:
+    StrCpy $7 -1
+    System::Call 'kernel32::CreateFileW(w "$INSTDIR\$2", i 0x00010000, i 7, p 0, i 3, i 0x80, p 0) p .r7'
+    ${If} $7 != -1
+      System::Call 'kernel32::CloseHandle(p r7)'
+      Goto previous_line
+    ${EndIf}
+    ; The read-only, hidden and system attributes alone refuse that open; the
+    ; removal pass clears them, as overwriting such a file always has. Anything
+    ; else is a file in use or no longer readable. A short-lived scanner or
+    ; indexer hold gets a few retries; after that nothing at all may be removed.
+    System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\$2") i .r6'
+    IntOp $4 $6 & 7
+    ${If} $6 >= 0
+    ${AndIf} $4 != 0
+      Goto previous_line
+    ${EndIf}
+    IntOp $5 $5 + 1
+    ${If} $5 < 5
+      Sleep 200
+      Goto previous_probe
+    ${EndIf}
+    FileClose $0
+    MessageBox MB_OK|MB_ICONSTOP "A file in the existing DiskScope installation is in use or can no longer be opened. Close DiskScope and any program that has its files open, then try again. Nothing has been changed." /SD IDOK
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
+  ClearErrors
+  Delete "$INSTDIR\$2"
+  IfFileExists "$INSTDIR\$2" 0 previous_removed
+  SetFileAttributes "$INSTDIR\$2" NORMAL
+  ClearErrors
+  Delete "$INSTDIR\$2"
+  IfFileExists "$INSTDIR\$2" 0 previous_removed
+  DetailPrint "Left in place because it could not be removed: $2"
+  Goto previous_line
+previous_removed:
+  IntOp $PreviousPayloadRemoved $PreviousPayloadRemoved + 1
+  ; Remove the file's own folder too when that left it empty.
+  StrLen $3 $2
+previous_parent:
+  IntOp $3 $3 - 1
+  ; IntCmp jumps on equal, then less, then more: stop at or before the first character.
+  IntCmp $3 0 previous_line previous_line previous_parent_step
+previous_parent_step:
+  StrCpy $4 $2 1 $3
+  ${If} $4 == "\"
+  ${OrIf} $4 == "/"
+    StrCpy $5 $2 $3
+    RMDir "$INSTDIR\$5"
+    Goto previous_line
+  ${EndIf}
+  Goto previous_parent
+previous_closed:
+  FileClose $0
+  ; A manifest that does not list the application is not DiskScope's own.
+  ${If} $8 == 0
+    Goto previous_done
+  ${EndIf}
+  ${If} $9 == 0
+    StrCpy $9 1
+    Goto previous_pass
+  ${EndIf}
+  ${If} $PreviousPayloadRemoved > 0
+    DetailPrint "Removed $PreviousPayloadRemoved file(s) of the previous DiskScope version."
+  ${EndIf}
+previous_done:
+  ClearErrors
+  Pop $9
+  Pop $8
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
 Function ValidateInstallDirectory
   !insertmacro NormalizeInstallPathOrAbort "" $INSTDIR
   ${If} $ExistingInstallDir != ""
@@ -193,6 +415,7 @@ Section "DiskScope application (required)" SEC_APPLICATION
   SectionIn RO
   Call ValidateInstallDirectory
   Call CheckApplicationWritable
+  Call RemovePreviousPayload
   ClearErrors
   !insertmacro InstallPayload
   IfErrors payload_copy_failed

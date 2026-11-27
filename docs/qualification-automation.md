@@ -112,6 +112,12 @@ upgrades to the exact built candidate, rolls binaries back to 0.3.2, then
 uninstalls. Each installed stage must match its complete required portable
 payload, contain no stale/unexpected files beyond the declared canary and
 installer files, and produce the expected CLI version and known-answer result.
+The candidate installer removes the payload files listed in the previous
+installation's `SHA256SUMS.txt` before writing its own, so the upgrade stage
+must leave no baseline-only file. The published 0.3.2 installer predates that
+rule and cannot remove files only the candidate ships, so the rollback stage
+retains exactly those, requires each to remain byte-identical to the
+candidate's, records them, and still fails on any other unexpected file.
 Opaque install-directory and profile canaries must survive each transition and
 uninstall. JSON records exact hashes, stage results, UTC times and failures.
 This measures binary transitions and file preservation; the opaque profile
@@ -123,7 +129,7 @@ user/machine registry views, shortcuts, default/profile directories and running
 DiskScope processes. Cleanup uses only a byte-verified uninstaller belonging to
 the exact fixture registration, plus the unchanged owned profile canary and its
 proven-empty, initially absent parent. It retains its bounded workspace fixture.
-`test-installer-upgrade-preflight.ps1` passed 31 pure/synthetic checks on both
+`test-installer-upgrade-preflight.ps1` passed 34 pure/synthetic checks on both
 PowerShell 7 and Windows PowerShell 5.1: missing hosted context, self-hosted
 execution, existing registration/path/process, and missing/unrelated/relative
 uninstaller ownership are refused; positive assertion paths also run. The shared

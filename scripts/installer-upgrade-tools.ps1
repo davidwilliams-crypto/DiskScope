@@ -31,6 +31,17 @@ function Assert-InstallerUpgradeOwnedLocation {
     }
 }
 
+# Files the candidate ships that the published baseline does not. The older
+# baseline installer cannot know them, so a binary rollback to that baseline is
+# expected to retain them: callers record them instead of mistaking them for
+# stale files. Pure: nothing here touches an installation.
+function Get-InstallerUpgradeRetainedNewerFiles {
+    param([object]$Baseline, [object]$Candidate)
+    foreach ($relative in @($Candidate.hashes.Keys | Sort-Object)) {
+        if (-not $Baseline.hashes.ContainsKey($relative)) { $relative }
+    }
+}
+
 function Assert-InstallerUpgradeRegistrationViews {
     param([string]$Expected, [string]$Version, [hashtable]$CurrentUser64, [hashtable]$CurrentUser32,
         [hashtable]$LocalMachine64, [hashtable]$LocalMachine32)
