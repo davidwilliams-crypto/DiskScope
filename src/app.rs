@@ -12,9 +12,14 @@ mod state;
 mod support;
 #[cfg(test)]
 mod test_support;
+mod toasts;
 mod ux;
 
-use crate::theme::{Palette, TextScale, Theme, load_system_font};
+use crate::theme::{
+    Palette, RADIUS_FULL, RADIUS_LG, RADIUS_MD, RADIUS_SM, SPACE_3, SPACE_5, TYPE_H1, TYPE_H2,
+    TYPE_H3, TYPE_LABEL, TYPE_METRIC, TextScale, Theme, darken, dialog_frame, install_fonts,
+    lighten, title,
+};
 use controls::{date_label, date_time_label};
 use diskscope::session::SessionPolicy;
 use diskscope::{
@@ -112,6 +117,24 @@ fn progress_explanation(progress: &Progress) -> &str {
         ""
     }
 }
+/// What the status band says once a scan is over: how the numbers were
+/// accounted, not what they are. Hard links are counted once — this line is
+/// where the app keeps that promise visible.
+fn hardlink_provenance(progress: &Progress) -> String {
+    let backend = if progress.backend.is_empty() {
+        "Normal folder scan"
+    } else {
+        &progress.backend
+    };
+    if progress.hardlinks > 0 {
+        format!(
+            "{backend} · {} hard-linked files counted once",
+            format_count(progress.hardlinks)
+        )
+    } else {
+        backend.to_string()
+    }
+}
 fn row_share(bytes: u64, view: &ViewSnapshot) -> f32 {
     share(bytes, view.row_scope_logical)
 }
@@ -149,6 +172,51 @@ fn status_detail(
 }
 const NO_ERRORS_HINT: &str =
     "No errors were reported. Skipped links and reparse points are not errors.";
+/// Live throughput derived from progress counter deltas. Rates are smoothed
+/// over a ~0.75 s horizon so a single deep directory does not make the readout
+/// lurch; a folder scan has no denominator, so this stays a rate, never a
+/// fake percentage.
+#[derive(Default)]
+struct ScanTelemetry {
+    sample: Option<(Instant, u64, u64)>,
+    files_per_sec: f64,
+    bytes_per_sec: f64,
+}
+impl ScanTelemetry {
+    fn observe(&mut self, progress: &Progress) {
+        let now = Instant::now();
+        let Some((time, files, logical)) = self.sample else {
+            self.sample = Some((now, progress.files, progress.logical));
+            return;
+        };
+        let dt = now.duration_since(time).as_secs_f64();
+        if dt < 0.25 {
+            return;
+        }
+        let files_rate = (progress.files.saturating_sub(files)) as f64 / dt;
+        let bytes_rate = (progress.logical.saturating_sub(logical)) as f64 / dt;
+        let alpha = (dt / 0.75).clamp(0.0, 1.0);
+        let smooth = |previous: &mut f64, rate: f64| {
+            *previous = if *previous <= 0.0 {
+                rate
+            } else {
+                *previous * (1.0 - alpha) + rate * alpha
+            };
+        };
+        smooth(&mut self.files_per_sec, files_rate);
+        smooth(&mut self.bytes_per_sec, bytes_rate);
+        self.sample = Some((now, progress.files, progress.logical));
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+    fn files_label(&self) -> String {
+        format!("{}/s", format_count(self.files_per_sec.max(0.0) as u64))
+    }
+    fn bytes_label(&self) -> String {
+        format!("{}/s", format_bytes(self.bytes_per_sec.max(0.0) as u64))
+    }
+}
 /// The error-count button. With nothing to list it is disabled and says why
 /// instead of opening an empty window. True when it was clicked.
 fn errors_button(ui: &mut egui::Ui, errors_total: u64) -> bool {
@@ -175,6 +243,42 @@ struct Preferences {
     stable_updates: bool,
     text_scale: TextScale,
     reduced_motion: bool,
+}
+impl Preferences {
+    /// Reads saved preferences one field at a time. A value this build does
+    /// not understand (written by a newer or older version) costs only that
+    /// one setting, never the recent locations and everything else with it.
+    fn from_saved(json: &str) -> Self {
+        fn take<T: serde::de::DeserializeOwned>(
+            saved: &serde_json::Map<String, serde_json::Value>,
+            key: &str,
+            slot: &mut T,
+        ) {
+            if let Some(value) = saved
+                .get(key)
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+            {
+                *slot = value;
+            }
+        }
+        let mut preferences = Self::default();
+        let Ok(serde_json::Value::Object(saved)) = serde_json::from_str(json) else {
+            return preferences;
+        };
+        take(
+            &saved,
+            "recent_locations",
+            &mut preferences.recent_locations,
+        );
+        take(&saved, "theme", &mut preferences.theme);
+        take(&saved, "map_focus", &mut preferences.map_focus);
+        take(&saved, "ntfs_preview", &mut preferences.ntfs_preview);
+        take(&saved, "stable_updates", &mut preferences.stable_updates);
+        take(&saved, "text_scale", &mut preferences.text_scale);
+        take(&saved, "reduced_motion", &mut preferences.reduced_motion);
+        preferences
+    }
 }
 enum NativeResult {
     Attribution {
@@ -280,6 +384,16 @@ pub struct DiskScopeApp {
     locations: Vec<native::Location>,
     show_errors: bool,
     notice: Option<String>,
+    /// Widget ids of the currently reachable search-example chips, so the
+    /// row can stay alive while keyboard focus is inside it and ↑/↓ can move
+    /// between the field and the chips.
+    search_example_ids: Vec<egui::Id>,
+    /// A one-shot request for the file table to bring a row into view: the
+    /// top after navigation, paging or a new query; the newly selected row
+    /// after an arrow key.
+    table_scroll: Option<(usize, Option<Align>)>,
+    toasts: toasts::Toasts,
+    telemetry: ScanTelemetry,
 }
 impl DiskScopeApp {
     pub fn new_session(
@@ -323,7 +437,7 @@ impl DiskScopeApp {
         let preferences = if persistence_allowed {
             cc.storage
                 .and_then(|s| s.get_string(PREFERENCES_KEY))
-                .and_then(|s| serde_json::from_str(&s).ok())
+                .map(|s| Preferences::from_saved(&s))
                 .unwrap_or_default()
         } else {
             Preferences::default()
@@ -370,6 +484,8 @@ impl DiskScopeApp {
             visible_offset: 0,
             generation: 0,
             cancellation: CancellationAcknowledgement::default(),
+            toasts: toasts::Toasts::default(),
+            telemetry: ScanTelemetry::default(),
             request: ViewRequest {
                 limit: PAGE_SIZE,
                 mode: ViewMode::Overview,
@@ -418,8 +534,10 @@ impl DiskScopeApp {
             locations: Vec::new(),
             show_errors: false,
             notice: None,
+            search_example_ids: Vec::new(),
+            table_scroll: None,
         };
-        load_system_font(&cc.egui_ctx);
+        install_fonts(&cc.egui_ctx);
         app.apply_appearance(&cc.egui_ctx);
         if let Some(path) = initial_path {
             app.begin_scan(path);
@@ -465,6 +583,9 @@ impl DiskScopeApp {
         // Absolute is lexical: resolving a junction here would bypass the
         // scanner's deliberate refusal to follow a link used as the root.
         let preserve_draft = keep.is_some() && self.path_edited;
+        // A follow-up rescan after a file action already narrates itself via
+        // the outcome card; only fresh scans announce their start.
+        let announce_start = keep.is_none();
         if let Some(review) = self.action_review.as_ref()
             && (review.presence.is_none()
                 || review.state.is_none()
@@ -526,6 +647,13 @@ impl DiskScopeApp {
         self.pending = None;
         self.changes = false;
         self.notice = None;
+        self.telemetry.reset();
+        if announce_start {
+            self.toasts.push(
+                toasts::ToastKind::Info,
+                format!("Scanning {} …", self.root_path.display()),
+            );
+        }
         self.generation = self.controller.start_limited(
             self.root_path.clone(),
             if self.preferences.ntfs_preview && !self.session_policy.helpdesk {
@@ -580,17 +708,35 @@ impl DiskScopeApp {
                 next.view.revision,
             ) && !self.settle_focus(&next)
             {
-                if hold_view(
-                    self.preferences.stable_updates,
-                    self.visible.view.revision,
-                    next.view.revision,
-                    self.visible.view.selected.as_ref().map(|row| row.id) != self.request.selected,
-                ) {
+                // Stable display holds results still while a scan is working.
+                // Once the scan reaches a terminal state there is nothing
+                // left to wait for: holding the final snapshot would leave
+                // stale rows and disabled file actions that never resolve.
+                if next.progress.state.is_active()
+                    && hold_view(
+                        self.preferences.stable_updates,
+                        self.visible.view.revision,
+                        next.view.revision,
+                        self.visible.view.selected.as_ref().map(|row| row.id)
+                            != self.request.selected,
+                    )
+                {
                     self.pending = Some(next.clone());
                 } else {
                     self.visible_offset = self.request.offset;
                     self.visible = next.clone();
                     self.pending = None;
+                    // Collapsing a folder can leave the current page past the
+                    // end of the list; return to the first page instead of
+                    // showing an empty one.
+                    if self.request.offset > 0
+                        && self.request.mode != ViewMode::Types
+                        && self.visible.view.rows.is_empty()
+                        && self.visible.view.total_rows > 0
+                    {
+                        self.request.offset = 0;
+                        self.dirty = true;
+                    }
                 }
             }
             self.snapshot = next;
@@ -627,15 +773,29 @@ impl DiskScopeApp {
                         Err(error) => format!("Evidence export failed: {error}"),
                     };
                     self.export_feedback = Some(message.clone());
-                    self.notice = Some(message);
+                    self.toasts.push(
+                        if message.starts_with("Evidence exported") {
+                            toasts::ToastKind::Success
+                        } else {
+                            toasts::ToastKind::Failure
+                        },
+                        message,
+                    );
                 }
                 NativeResult::Locations(locations) => self.locations = locations,
                 NativeResult::Folder(path) => {
                     self.picker_open = false;
                     if let Some(path) = path {
                         self.path_text = path.to_string_lossy().into_owned();
-                        self.draft_path = Some(path);
+                        self.draft_path = Some(path.clone());
                         self.path_edited = true;
+                        // Before the first scan there is nothing a draft
+                        // could be confused with, and choosing a folder is
+                        // the whole intent: start. Later picks stay drafts
+                        // so results on screen are never replaced unasked.
+                        if self.generation == 0 {
+                            self.begin_scan(path);
+                        }
                     }
                 }
                 NativeResult::Volume {
@@ -667,12 +827,19 @@ impl DiskScopeApp {
                         review.presence = Some(presence);
                     }
                 }
-                NativeResult::Reveal(Err(message)) => self.notice = Some(message),
+                NativeResult::Reveal(Err(message)) => {
+                    self.toasts.push(toasts::ToastKind::Failure, message)
+                }
                 NativeResult::Reveal(Ok(())) => {}
             }
         }
         if let Some(history) = self.history_service.poll() {
             self.history_snapshot = history;
+        }
+        if self.snapshot.progress.state.is_active() {
+            self.telemetry.observe(&self.snapshot.progress);
+        } else if self.telemetry.sample.is_some() {
+            self.telemetry.reset();
         }
         self.poll_action_review(ctx);
         if let Some(review) = self.action_review.as_ref() {
@@ -693,6 +860,15 @@ impl DiskScopeApp {
             && self.scan_finished_utc.is_none()
         {
             self.scan_finished_utc = diskscope::evidence::utc_now_epoch_ms();
+            self.scan_finished_toast();
+            // A location that could not be scanned at all is not one to
+            // offer again on the welcome page.
+            if self.snapshot.progress.state == ScanState::Failed {
+                let failed = self.root_path.clone();
+                self.preferences
+                    .recent_locations
+                    .retain(|path| path != &failed);
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(
             if self.snapshot.progress.state.is_active()
@@ -701,10 +877,31 @@ impl DiskScopeApp {
                 || self.search_changed.is_some()
                 || self.history_snapshot.busy
                 || self.management.busy()
+                // A view was requested and its answer is not on screen yet:
+                // only this tick collects it, so it must stay quick.
+                || (self.generation != 0
+                    && self.visible.view.revision != self.request.revision)
             {
                 50
-            } else {
+            } else if !self.toasts.is_empty()
+                || self.restore.is_some()
+                || self.pending_attribution.is_some()
+                || self.locations.is_empty()
+                || (self.generation != 0 && self.volume.is_none())
+                || self
+                    .action_review
+                    .as_ref()
+                    .is_some_and(|review| review.after_volume.is_none())
+            {
+                // Something is still expected: a toast counting down, or a
+                // background answer from a worker that cannot wake the
+                // window itself.
                 250
+            } else {
+                // Nothing is pending. A slow heartbeat keeps the status
+                // readouts honest without redrawing an idle window four
+                // times a second.
+                1000
             },
         ));
     }
@@ -717,7 +914,13 @@ impl DiskScopeApp {
         }
     }
     fn submit_view(&mut self) {
-        if !self.dirty || self.generation == 0 {
+        if self.generation == 0 {
+            // Nothing to query before the first scan. Leaving the flag set
+            // would keep the idle welcome page on the fast repaint cadence.
+            self.dirty = false;
+            return;
+        }
+        if !self.dirty {
             return;
         }
         self.request.revision = self.request.revision.wrapping_add(1);
@@ -728,8 +931,46 @@ impl DiskScopeApp {
         self.cancellation
             .state(self.generation, self.snapshot.progress.state)
     }
+    /// The one-time announcement that a scan reached a terminal state. The
+    /// header band keeps showing the facts; the toast frees the user to look
+    /// anywhere else while it happens.
+    fn scan_finished_toast(&mut self) {
+        let progress = &self.snapshot.progress;
+        let text = match progress.state {
+            ScanState::Complete => format!(
+                "Scan complete · {} files · {} logical · {} elapsed",
+                format_count(progress.files),
+                format_bytes(progress.logical),
+                format_duration(progress.elapsed)
+            ),
+            ScanState::Partial => format!(
+                "Scan finished partial · {} files kept · {}",
+                format_count(progress.files),
+                progress_explanation(progress)
+            ),
+            ScanState::Failed => format!(
+                "Scan failed · {}",
+                if progress.message.is_empty() {
+                    "root could not be read"
+                } else {
+                    &progress.message
+                }
+            ),
+            ScanState::Cancelled => "Scan stopped · partial results kept".into(),
+            _ => return,
+        };
+        let kind = match progress.state {
+            ScanState::Complete => toasts::ToastKind::Success,
+            ScanState::Partial => toasts::ToastKind::Warning,
+            ScanState::Failed => toasts::ToastKind::Failure,
+            _ => toasts::ToastKind::Info,
+        };
+        self.toasts.push(kind, text);
+    }
     fn mark_query_changed(&mut self) {
         self.request.offset = 0;
+        // A new listing starts at its top, not at the old scroll position.
+        self.table_scroll = Some((0, Some(Align::TOP)));
         self.search_changed = None;
         self.dirty = true;
     }
@@ -813,14 +1054,21 @@ impl DiskScopeApp {
             }
             Action::Navigate(id) => {
                 self.cancel_restore();
-                if id != self.request.root {
+                let same_folder = id == self.request.root;
+                let same_page = !self.changes && self.request.mode == ViewMode::Explorer;
+                if !same_folder || !same_page {
                     self.remember_context();
                 }
                 self.request.root = id;
-                self.request.selected = Some(id);
                 self.request.mode = ViewMode::Explorer;
                 self.changes = false;
-                self.request.expanded.clear();
+                // Opening the folder already on screen (its own breadcrumb,
+                // or the map's "Other" tile) only brings its list forward;
+                // it must not collapse the tree or drop the selection.
+                if !same_folder {
+                    self.request.selected = Some(id);
+                    self.request.expanded.clear();
+                }
                 self.mark_query_changed();
             }
             Action::Back => {
@@ -843,6 +1091,7 @@ impl DiskScopeApp {
             }
             Action::Page(offset) => {
                 self.request.offset = offset;
+                self.table_scroll = Some((0, Some(Align::TOP)));
                 self.dirty = true;
             }
         }
@@ -886,8 +1135,9 @@ impl DiskScopeApp {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(if self.changes {
+            ui.label(title(
+                ui,
+                if self.changes {
                     "Scan changes"
                 } else {
                     match self.request.mode {
@@ -896,10 +1146,9 @@ impl DiskScopeApp {
                         ViewMode::Largest => "Largest files",
                         ViewMode::Types => "File types",
                     }
-                })
-                .size(24.0)
-                .strong(),
-            );
+                },
+                TYPE_H1,
+            ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Commands  Ctrl K").clicked() {
                     self.open_palette();
@@ -908,22 +1157,17 @@ impl DiskScopeApp {
                 ui.menu_button("Access and permissions", |ui| self.access_controls(ui, p));
             });
         });
-        ui.add(
-            egui::Label::new(
-                RichText::new(self.persistence_message())
-                    .small()
-                    .color(p.muted),
-            )
-            .truncate(),
-        )
-        .on_hover_text(self.persistence_message());
+        // The persistence posture stays visible without spending a header
+        // row on it: the sidebar footer, the Changes page and Settings all
+        // carry the same message.
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             let active = self.scan_state().is_active();
             let edit_width = (ui.available_width() - 235.0).max(120.0);
             let response = ui.add_sized(
-                [edit_width, 33.0],
+                [edit_width, 32.0],
                 egui::TextEdit::singleline(&mut self.path_text)
+                    .vertical_align(Align::Center)
                     .hint_text("Folder or drive path — or use Browse"),
             );
             if response.changed() {
@@ -938,24 +1182,21 @@ impl DiskScopeApp {
             if ui
                 .add_enabled(
                     !self.picker_open,
-                    egui::Button::new("Browse…").min_size(egui::vec2(74.0, 33.0)),
+                    egui::Button::new("Browse…").min_size(egui::vec2(74.0, 32.0)),
                 )
                 .clicked()
             {
                 self.choose_folder(ui.ctx());
             }
-            let scan = ui
-                .add_enabled(
-                    !self.path_text.trim().is_empty(),
-                    egui::Button::new(
-                        RichText::new(if active { "Rescan" } else { "Scan" })
-                            .strong()
-                            .color(self.preferences.theme.on_accent()),
-                    )
-                    .fill(p.accent)
-                    .min_size(egui::vec2(63.0, 33.0)),
-                )
-                .clicked();
+            let scan = ux::primary_button(
+                ui,
+                p,
+                !self.path_text.trim().is_empty(),
+                if active { "Rescan" } else { "Scan" },
+                egui::vec2(63.0, 32.0),
+                RADIUS_SM,
+            )
+            .clicked();
             if scan || enter {
                 let path = self.requested_path();
                 if !path.as_os_str().is_empty() {
@@ -965,7 +1206,7 @@ impl DiskScopeApp {
             if ui
                 .add_enabled(
                     active && self.scan_state() != ScanState::Cancelling,
-                    egui::Button::new("Stop").min_size(egui::vec2(65.0, 33.0)),
+                    egui::Button::new("Stop").min_size(egui::vec2(65.0, 32.0)),
                 )
                 .clicked()
             {
@@ -993,9 +1234,17 @@ impl DiskScopeApp {
         let errors_total = progress.errors_total;
         let detail = status_detail(progress, state, self.restore.as_ref());
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(stop_status(state).unwrap_or(state.label())).color(p.accent))
+            let (ink, ground) = match state {
+                ScanState::Complete => (p.positive, p.positive_tint),
+                ScanState::Failed => (p.danger, p.danger_tint),
+                ScanState::Partial | ScanState::Cancelling => (p.warning, p.warning_tint),
+                ScanState::Cancelled | ScanState::Idle => (p.muted, p.sunken),
+                ScanState::Preparing | ScanState::Scanning | ScanState::Finalizing => {
+                    (p.accent_text, p.tint)
+                }
+            };
+            ux::badge(ui, stop_status(state).unwrap_or(state.label()), ink, ground)
                 .on_hover_text(&detail);
-            ui.label(RichText::new("·").color(p.faint));
             ui.label(RichText::new(format_bytes(progress.logical)).strong());
             let skipped = if progress.skipped > 0 {
                 format!(" · {} skipped", format_count(progress.skipped))
@@ -1023,15 +1272,135 @@ impl DiskScopeApp {
                 ui.label(
                     RichText::new(format!("Scanned {}", date_time_label(scan.finished_unix)))
                         .small()
-                        .color(p.faint),
+                        .color(p.muted),
                 );
             }
         });
+        ui.add_space(5.0);
+        self.scan_status_band(ui, p);
+    }
+    /// The always-present status band under the totals row: an activity strip
+    /// plus one detail line. Its height is identical in every scan state, so
+    /// the header never jumps when a scan starts, runs, or ends. A folder scan
+    /// has no denominator, so the strip shows activity, never a percentage —
+    /// the honest readouts are the live counters, rates, and the path actually
+    /// being read.
+    fn scan_status_band(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let state = self.scan_state();
+        let progress = &self.snapshot.progress;
+        let active = state.is_active();
+        let strip_height = 5.0;
+        let (strip, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), strip_height),
+            Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(strip, 2.0, p.tint);
+        let track = |color: Color32, from: f32, to: f32| {
+            let from = from.clamp(0.0, 1.0);
+            let to = to.clamp(from, 1.0);
+            let rect = Rect::from_min_max(
+                strip.min + egui::vec2(strip.width() * from, 0.0),
+                strip.min + egui::vec2(strip.width() * to, strip.height()),
+            );
+            painter.rect_filled(rect, 2.0, color);
+        };
+        match state {
+            ScanState::Preparing | ScanState::Scanning | ScanState::Finalizing => {
+                if self.preferences.reduced_motion {
+                    track(p.accent, 0.0, 1.0);
+                } else {
+                    // A segment sweeping across with a bright leading edge and
+                    // a fading tail, spending most of its time inside the
+                    // track so the motion reads as steady work.
+                    let time = ui.ctx().input(|i| i.time as f32);
+                    let span = 0.26;
+                    let phase = (time * 0.22).fract() * (1.0 + span) - span;
+                    let head = phase + span;
+                    track(
+                        crate::theme::mix(p.tint, p.accent, 0.35),
+                        phase,
+                        phase + span * 0.35,
+                    );
+                    track(
+                        crate::theme::mix(p.tint, p.accent, 0.7),
+                        phase + span * 0.35,
+                        phase + span * 0.65,
+                    );
+                    track(p.accent, phase + span * 0.65, head);
+                }
+            }
+            ScanState::Cancelling => track(p.warning, 0.0, 1.0),
+            ScanState::Complete => track(p.positive, 0.0, 1.0),
+            ScanState::Partial | ScanState::Failed => track(p.warning, 0.0, 1.0),
+            ScanState::Cancelled => track(p.muted, 0.0, 1.0),
+            ScanState::Idle => {}
+        }
+        ui.add_space(4.0);
+        // A text-only line: it should not reserve a control's height. A row
+        // takes its minimum height when it is created, so this is set first.
+        let control_height = std::mem::replace(&mut ui.spacing_mut().interact_size.y, 16.0);
+        ui.horizontal(|ui| {
+            let detail = if active {
+                status_detail(progress, state, self.restore.as_ref())
+            } else if matches!(state, ScanState::Partial | ScanState::Failed)
+                && !progress_explanation(progress).is_empty()
+            {
+                progress_explanation(progress).to_owned()
+            } else {
+                hardlink_provenance(progress)
+            };
+            // The rate is laid out first so a long path truncates into the
+            // space that is left instead of running underneath it.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if active && self.telemetry.files_per_sec >= 1.0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} files · {}",
+                            self.telemetry.files_label(),
+                            self.telemetry.bytes_label()
+                        ))
+                        .small()
+                        .color(p.accent_text),
+                    )
+                    .on_hover_text("Live read rate, measured from scan progress.");
+                } else if active {
+                    ui.label(RichText::new("starting…").small().color(p.muted));
+                }
+                if !detail.is_empty() {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        // The hover carries the same sentence in full, for
+                        // when the line is truncated.
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(detail.as_str())
+                                    .monospace()
+                                    .small()
+                                    .color(p.muted),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(detail.as_str());
+                    });
+                }
+            });
+        });
+        ui.spacing_mut().interact_size.y = control_height;
     }
     fn notice_line(&mut self, ui: &mut egui::Ui, p: Palette) {
         if let Some(notice) = self.notice.clone() {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(p.accent, notice);
+                ui.push_id("live_notice", |ui| {
+                    let response = ui.colored_label(p.accent_text, &notice);
+                    // Inline notices announce state changes; screen readers
+                    // deserve the same ping the visual change gives.
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_role(egui::accesskit::Role::Status);
+                        node.set_live(egui::accesskit::Live::Polite);
+                        node.set_live_atomic();
+                        node.set_value(notice.as_str());
+                    });
+                });
                 if ui.small_button("Dismiss").clicked() {
                     self.notice = None;
                 }
@@ -1065,11 +1434,11 @@ impl DiskScopeApp {
             } else {
                 let hidden = crumbs.len().saturating_sub(MAX_BREADCRUMBS);
                 if hidden > 0 {
-                    ui.colored_label(p.faint, "…")
+                    ui.colored_label(p.muted, "…")
                         .on_hover_text(format!("{hidden} parent folders not shown"));
                 }
                 for (id, name) in crumbs.iter().skip(hidden) {
-                    ui.colored_label(p.faint, "/");
+                    ui.colored_label(p.muted, "/");
                     if ui
                         .add(
                             egui::Button::new(RichText::new(name).color(
@@ -1088,7 +1457,7 @@ impl DiskScopeApp {
                 }
             }
             if self.visible.view.revision != self.request.revision {
-                ui.label(RichText::new("Updating…").small().color(p.accent));
+                ui.label(RichText::new("Updating…").small().color(p.accent_text));
             }
         });
         if let Some(action) = action {
@@ -1099,7 +1468,7 @@ impl DiskScopeApp {
         if investigation::compact(ui.ctx()) {
             ui.horizontal_wrapped(|ui| {
                 let width = (ui.available_width() - 350.0).max(80.0);
-                self.search_field(ui, width, 30.0);
+                self.search_field(ui, width, 32.0);
                 if ui.button("Filters").clicked() {
                     self.sync_filter_fields();
                     self.filter_open = true;
@@ -1127,9 +1496,8 @@ impl DiskScopeApp {
                             self.mark_query_changed();
                         }
                     });
-                let scope_changed = ui
-                    .checkbox(&mut self.request.search_all, "Whole scan")
-                    .changed();
+                let scope_changed =
+                    ux::checkbox(ui, &mut self.request.search_all, "Whole scan").changed();
                 if old != self.request.sort || scope_changed {
                     self.mark_query_changed();
                 }
@@ -1140,7 +1508,7 @@ impl DiskScopeApp {
         ui.horizontal_wrapped(|ui| {
             // One line of investigation controls leaves the viewport for data.
             let width = (ui.available_width() - 430.0).max(300.0);
-            self.search_field(ui, width, 30.0);
+            self.search_field(ui, width, 32.0);
             let previous = self.request.sort;
             egui::ComboBox::from_id_salt("sort")
                 .selected_text(sort_label(self.request.sort))
@@ -1163,23 +1531,33 @@ impl DiskScopeApp {
             if previous != self.request.sort {
                 self.mark_query_changed();
             }
-            if ui
+            let reverse = ui
                 .small_button(if self.request.descending {
                     "↓"
                 } else {
                     "↑"
                 })
-                .on_hover_text("Reverse sort order")
-                .clicked()
-            {
+                .on_hover_text("Reverse sort order");
+            // An arrow glyph is not a name a screen reader can use.
+            let descending = self.request.descending;
+            reverse.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    true,
+                    if descending {
+                        "Reverse sort order, now descending"
+                    } else {
+                        "Reverse sort order, now ascending"
+                    },
+                )
+            });
+            if reverse.clicked() {
                 self.request.descending = !self.request.descending;
                 self.mark_query_changed();
             }
-            let scope = ui
-                .checkbox(&mut self.request.search_all, "Whole scan")
-                .on_hover_text(
-                    "Search and filters use the whole scan; the map keeps your current folder context.",
-                );
+            let scope = ux::checkbox(ui, &mut self.request.search_all, "Whole scan").on_hover_text(
+                "Search and filters use the whole scan; the map keeps your current folder context.",
+            );
             if scope.changed() {
                 self.mark_query_changed();
             }
@@ -1188,8 +1566,7 @@ impl DiskScopeApp {
                 self.filter_open = true;
             }
             ui.menu_button("Display", |ui| {
-                if ui
-                    .checkbox(&mut self.preferences.stable_updates, "Stable display")
+                if ux::checkbox(ui, &mut self.preferences.stable_updates, "Stable display")
                     .changed()
                     && !self.preferences.stable_updates
                 {
@@ -1210,7 +1587,84 @@ impl DiskScopeApp {
                 }
             });
         });
+        self.search_examples(ui, p);
         self.search_feedback(ui, p);
+    }
+    /// One visible row of starter queries, shown while the search field is
+    /// focused — the moment they can be used. The search language is the most
+    /// powerful surface in the app and used to live only in a hover tooltip;
+    /// these chips teach it by doing.
+    fn search_examples(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if !self.request.search.is_empty() || self.generation == 0 {
+            self.search_example_ids.clear();
+            return;
+        }
+        let search_id = egui::Id::new("investigation_search");
+        let focused = ui.ctx().memory(|m| m.focused());
+        // A click on a chip takes focus from the field one frame before the
+        // click is delivered. The row therefore also stays while the pointer
+        // is over where it was drawn on the previous frame, or the click
+        // would land on a row that is no longer there.
+        let row_id = egui::Id::new("search_examples_row");
+        let frame = ui.ctx().cumulative_frame_nr();
+        let under_pointer =
+            ui.data(|d| d.get_temp::<(Rect, u64)>(row_id))
+                .is_some_and(|(rect, drawn)| {
+                    frame.saturating_sub(drawn) <= 1 && ui.rect_contains_pointer(rect)
+                });
+        // The row lives while focus is in it — the field or any chip — so
+        // the chips stay reachable once entered, instead of vanishing the
+        // instant the pointer or Tab leaves the text field.
+        if focused != Some(search_id)
+            && !under_pointer
+            && !self
+                .search_example_ids
+                .iter()
+                .any(|id| Some(*id) == focused)
+        {
+            // A hidden row has no chips to hand focus to.
+            self.search_example_ids.clear();
+            return;
+        }
+        let mut ids = Vec::new();
+        let row = ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Try:").small().color(p.muted));
+            for example in [
+                "ext:zip",
+                "size:>=1GiB",
+                "name:backup",
+                "-temp",
+                "\"exact phrase\"",
+            ] {
+                let response = ui
+                    .add(
+                        egui::Button::new(RichText::new(example).small().color(p.accent_text))
+                            .fill(p.tint)
+                            .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text("Run this example query");
+                // ArrowUp from the first chip returns to the field; the
+                // field's ArrowDown handler lands here in the first place.
+                if response.has_focus()
+                    && ids.is_empty()
+                    && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                {
+                    ui.ctx().memory_mut(|m| m.request_focus(search_id));
+                }
+                ids.push(response.id);
+                if response.clicked() {
+                    self.request.search = example.to_string();
+                    self.mark_query_changed();
+                }
+            }
+            let help = ui.small_button("Search help");
+            ids.push(help.id);
+            if help.clicked() {
+                self.help_open = true;
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(row_id, (row.response.rect, frame)));
+        self.search_example_ids = ids;
     }
     fn search_field(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
         let response = ui.add_sized(
@@ -1219,6 +1673,7 @@ impl DiskScopeApp {
                 .id(egui::Id::new("investigation_search"))
                 .desired_width(width)
                 .char_limit(diskscope::search::MAX_QUERY_CHARS)
+                .vertical_align(Align::Center)
                 .hint_text("Search names…"),
         );
         if response.changed() {
@@ -1227,15 +1682,26 @@ impl DiskScopeApp {
         if response.gained_focus() {
             response.scroll_to_me(None);
         }
-        response.on_hover_text(format!(
-            "Ctrl+F to focus search. F1 for examples.\n{}",
-            diskscope::search::SEARCH_HELP
-        ));
+        // ArrowDown from the field steps into the example chips when the
+        // row is live; a hidden row cannot be tabbed into, so this is the
+        // keyboard's way in.
+        if response.has_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+            && let Some(first) = self.search_example_ids.first().copied()
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(first));
+        }
+        response.on_hover_ui(|ui| {
+            ui.label(format!(
+                "Ctrl+F to focus search. F1 for examples.\n{}",
+                diskscope::search::SEARCH_HELP
+            ));
+        });
     }
     fn search_feedback(&mut self, ui: &mut egui::Ui, p: Palette) {
         if let Err(error) = diskscope::search::SearchQuery::parse(&self.request.search) {
             ui.add(
-                egui::Label::new(RichText::new(format!("Search error: {error}")).color(p.accent))
+                egui::Label::new(RichText::new(format!("Search error: {error}")).color(p.danger))
                     .wrap(),
             );
             if ui.small_button("Search help").clicked() {
@@ -1274,12 +1740,15 @@ impl DiskScopeApp {
             controls::take_table_keyboard_widths(ui, "file_table").filter(|_| !width_changed);
         let mut table = TableBuilder::new(ui)
             .id_salt("file_table")
-            .striped(true)
+            .striped(false)
             .resizable(true)
             .cell_layout(Layout::left_to_right(Align::Center))
             .sense(Sense::CLICK)
             .min_scrolled_height(50.0)
             .max_scroll_height((height - 87.0).max(65.0));
+        if let Some((row, align)) = self.table_scroll.take() {
+            table = table.scroll_to_row(row, align);
+        }
         for (index, minimum) in controls::FILE_COLUMN_MIN_WIDTHS.iter().enumerate() {
             let column = if let Some(widths) = &keyboard_widths {
                 Column::initial(widths[index])
@@ -1298,20 +1767,20 @@ impl DiskScopeApp {
         table
             .header(27.0, |mut header| {
                 for (index, label) in [
-                    "NAME",
-                    "LOGICAL SIZE",
+                    "Name",
+                    "Logical size",
                     if view.row_scope_root != view.root {
-                        "SCAN SHARE"
+                        "Scan share"
                     } else {
-                        "FOLDER SHARE"
+                        "Folder share"
                     },
-                    "FILES",
+                    "Files",
                 ]
                 .into_iter()
                 .enumerate()
                 {
                     let (used, _) = header.col(|ui| {
-                        ui.label(RichText::new(label).small().color(p.faint));
+                        ui.label(RichText::new(label).size(TYPE_LABEL).color(p.muted));
                     });
                     column_minimums[index] = column_minimums[index].max(used.width());
                 }
@@ -1351,12 +1820,12 @@ impl DiskScopeApp {
                             ui,
                             row.is_dir,
                             12.0,
-                            if row.is_dir { p.accent } else { p.faint },
+                            if row.is_dir { p.accent_text } else { p.muted },
                         );
                         ui.add(
                             egui::Label::new(RichText::new(&row.name).color(
                                 if selected == Some(row.id) {
-                                    p.accent
+                                    p.accent_text
                                 } else {
                                     p.text
                                 },
@@ -1367,13 +1836,13 @@ impl DiskScopeApp {
                         .on_hover_text(row.path.to_string_lossy());
                         if row.reparse {
                             ui.add(
-                                egui::Label::new(RichText::new("link").small().color(p.faint))
+                                egui::Label::new(RichText::new("link").small().color(p.muted))
                                     .selectable(false),
                             );
                         }
                         if row.hard_link {
                             ui.add(
-                                egui::Label::new(RichText::new("hard link").small().color(p.faint))
+                                egui::Label::new(RichText::new("hard link").small().color(p.muted))
                                     .selectable(false),
                             );
                         }
@@ -1386,15 +1855,15 @@ impl DiskScopeApp {
                         let fraction = row_share(row.logical, view);
                         let (bar, _) =
                             ui.allocate_exact_size(egui::vec2(28.0, 3.0), Sense::hover());
-                        ui.painter().rect_filled(bar, 1.0, p.line);
+                        // On a selected row the track sits on `tint`, so it
+                        // steps to the hairline colour to stay visible.
+                        let chosen = selected == Some(row.id);
+                        ui.painter()
+                            .rect_filled(bar, 1.0, if chosen { p.border } else { p.tint });
                         ui.painter().rect_filled(
                             Rect::from_min_size(bar.min, egui::vec2(28.0 * fraction, 3.0)),
                             1.0,
-                            if selected == Some(row.id) {
-                                p.accent
-                            } else {
-                                p.faint
-                            },
+                            if chosen { p.accent } else { p.border_strong },
                         );
                         ui.add(
                             egui::Label::new(
@@ -1427,8 +1896,8 @@ impl DiskScopeApp {
                             .with_clip_rect(response.interact_rect)
                             .rect_stroke(
                                 response.rect,
-                                2.0,
-                                Stroke::new(1.0_f32, p.accent),
+                                RADIUS_SM,
+                                Stroke::new(2.0_f32, p.focus),
                                 egui::StrokeKind::Inside,
                             );
                     }
@@ -1523,7 +1992,19 @@ impl DiskScopeApp {
             });
             if let Some(next) = next {
                 let (id, node, _) = row_focus[next];
-                ui.memory_mut(|m| m.request_focus(id));
+                // egui has already latched this arrow as a focus move of its
+                // own; cancel it so focus lands on the row chosen here and
+                // not one further on.
+                ui.memory_mut(|m| {
+                    m.move_focus(egui::FocusDirection::None);
+                    m.request_focus(id);
+                });
+                // Follow the selection: only rendered rows can be reached in
+                // one step, so the list scrolls along and the next key press
+                // finds the next row rendered.
+                if let Some(position) = view.rows.iter().position(|row| row.id == node) {
+                    self.table_scroll = Some((position, None));
+                }
                 action = Some(Action::Select(node));
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 && is_dir
@@ -1532,12 +2013,14 @@ impl DiskScopeApp {
             } else if is_dir
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight))
             {
+                ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
                 if !self.request.expanded.contains(&node) {
                     action = Some(Action::Toggle(node));
                 }
             } else if is_dir
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft))
             {
+                ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
                 if self.request.expanded.contains(&node) {
                     action = Some(Action::Toggle(node));
                 }
@@ -1554,7 +2037,6 @@ impl DiskScopeApp {
                 .visible_offset
                 .saturating_add(view.rows.len())
                 .min(view.total_rows);
-            let ready = view.revision == self.request.revision && !self.dirty;
             ui.label(
                 RichText::new(if view.total_rows == 0 {
                     "0 items".into()
@@ -1567,32 +2049,69 @@ impl DiskScopeApp {
                     )
                 })
                 .small()
-                .color(p.faint),
+                .color(p.muted),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        ready && end < view.total_rows,
-                        egui::Button::new("Next ›").small(),
-                    )
-                    .clicked()
-                {
-                    action = Some(Action::Page(self.visible_offset.saturating_add(PAGE_SIZE)));
-                }
-                if ui
-                    .add_enabled(
-                        ready && self.visible_offset > 0,
-                        egui::Button::new("‹ Previous").small(),
-                    )
-                    .clicked()
-                {
-                    action = Some(Action::Page(self.visible_offset.saturating_sub(PAGE_SIZE)));
-                }
-            });
+            let ready = view.revision == self.request.revision && !self.dirty;
+            if let Some(paged) = self.pager_controls(ui, view.total_rows, view.rows.len(), ready, p)
+            {
+                action = Some(paged);
+            }
         });
         if let Some(action) = action {
             self.action(action);
         }
+    }
+    /// Prev/Next with a page position and first/last jumps. Reading a long
+    /// folder should not take one click per 256 rows.
+    fn pager_controls(
+        &self,
+        ui: &mut egui::Ui,
+        total_rows: usize,
+        shown: usize,
+        ready: bool,
+        p: Palette,
+    ) -> Option<Action> {
+        let mut action = None;
+        let pages = total_rows.div_ceil(PAGE_SIZE).max(1);
+        // During a live scan the total can shrink while the offset does not;
+        // reporting "Page 7 of 6" would be a lie, so the page clamps.
+        let page = (self.visible_offset / PAGE_SIZE + 1).min(pages);
+        let more = ready && self.visible_offset.saturating_add(shown) < total_rows;
+        let earlier = ready && self.visible_offset > 0;
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add_enabled(more, egui::Button::new("Last »").small())
+                .clicked()
+            {
+                action = Some(Action::Page((pages - 1) * PAGE_SIZE));
+            }
+            if ui
+                .add_enabled(more, egui::Button::new("Next ›").small())
+                .clicked()
+            {
+                action = Some(Action::Page(self.visible_offset.saturating_add(PAGE_SIZE)));
+            }
+            if total_rows > 0 {
+                ui.label(
+                    RichText::new(format!("Page {page} of {pages}"))
+                        .small()
+                        .color(p.muted),
+                );
+            }
+            if ui
+                .add_enabled(earlier, egui::Button::new("‹ Previous").small())
+                .clicked()
+            {
+                action = Some(Action::Page(self.visible_offset.saturating_sub(PAGE_SIZE)));
+            }
+            if ui
+                .add_enabled(earlier, egui::Button::new("« First").small())
+                .clicked()
+            {
+                action = Some(Action::Page(0));
+            }
+        });
+        action
     }
     fn types_table(&mut self, ui: &mut egui::Ui, height: f32, p: Palette) {
         let snapshot = self.visible.clone();
@@ -1601,16 +2120,16 @@ impl DiskScopeApp {
         TableBuilder::new(ui)
             .id_salt("types_table")
             .sense(Sense::CLICK)
-            .striped(true)
+            .striped(false)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder())
             .column(Column::initial(110.0))
             .column(Column::initial(90.0))
             .max_scroll_height((height - 70.0).max(65.0))
             .header(27.0, |mut header| {
-                for label in ["EXTENSION", "LOGICAL SIZE", "FILES"] {
+                for label in ["Extension", "Logical size", "Files"] {
                     header.col(|ui| {
-                        ui.label(RichText::new(label).small().color(p.faint));
+                        ui.label(RichText::new(label).size(TYPE_LABEL).color(p.muted));
                     });
                 }
             })
@@ -1644,8 +2163,8 @@ impl DiskScopeApp {
                             .with_clip_rect(response.interact_rect)
                             .rect_stroke(
                                 response.rect,
-                                2.0,
-                                Stroke::new(1.0_f32, p.accent),
+                                RADIUS_SM,
+                                Stroke::new(2.0_f32, p.focus),
                                 egui::StrokeKind::Inside,
                             );
                     }
@@ -1678,39 +2197,20 @@ impl DiskScopeApp {
             self.empty_results(ui, p);
         }
         ui.horizontal(|ui| {
-            let end = self
-                .visible_offset
-                .saturating_add(view.types.len())
-                .min(view.total_rows);
-            let ready = view.revision == self.request.revision && !self.dirty;
             ui.label(
                 RichText::new(format!(
                     "{} file types · logical bytes",
                     format_count(view.total_rows as u64)
                 ))
                 .small()
-                .color(p.faint),
+                .color(p.muted),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        ready && end < view.total_rows,
-                        egui::Button::new("Next ›").small(),
-                    )
-                    .clicked()
-                {
-                    self.action(Action::Page(self.visible_offset.saturating_add(PAGE_SIZE)));
-                }
-                if ui
-                    .add_enabled(
-                        ready && self.visible_offset > 0,
-                        egui::Button::new("‹ Previous").small(),
-                    )
-                    .clicked()
-                {
-                    self.action(Action::Page(self.visible_offset.saturating_sub(PAGE_SIZE)));
-                }
-            });
+            let ready = view.revision == self.request.revision && !self.dirty;
+            if let Some(paged) =
+                self.pager_controls(ui, view.total_rows, view.types.len(), ready, p)
+            {
+                self.action(paged);
+            }
         });
     }
     fn treemap(&mut self, ui: &mut egui::Ui, height: f32, p: Palette) {
@@ -1722,27 +2222,91 @@ impl DiskScopeApp {
             if previous != self.request.map_layout {
                 self.mark_query_changed();
             }
-            ui.label(RichText::new("Area = logical size").small().color(p.faint))
+            ui.label(RichText::new("Area = logical size").small().color(p.muted))
                 .on_hover_text(
-                    "Folder colors distinguish items. Click to inspect; double-click a folder to open it.",
+                    "Folder colors distinguish items. Click to inspect; double-click a folder to open it; right-click a tile for actions.",
                 );
             if ui.available_width() > 260.0 {
                 ui.label(
-                    RichText::new("Click to inspect · double-click to open")
+                    RichText::new("Click to inspect · double-click to open · right-click for actions")
                         .small()
-                        .color(p.faint),
+                        .color(p.muted),
                 );
             }
         });
+        // The map keeps its own one-line location context so it never loses
+        // its bearings when the file table's navigation scrolls away: the
+        // same ancestor trail, plus an Up control, drawn as map chrome rather
+        // than a card.
+        let mut context = None;
+        let bar_height = if self.generation > 0 {
+            let top = ui.cursor().top();
+            ui.horizontal(|ui| {
+                // A quiet, slim row: small faint crumbs, no frame.
+                ui.spacing_mut().interact_size.y = 16.0;
+                ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+                let crumbs = &self.visible.view.breadcrumbs;
+                let hidden = crumbs.len().saturating_sub(MAX_BREADCRUMBS);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            self.request.root != 0,
+                            egui::Button::new(RichText::new("↑ Up").small().color(p.muted))
+                                .frame(false)
+                                .truncate(),
+                        )
+                        .on_hover_text("Open the parent folder")
+                        .clicked()
+                    {
+                        context = Some(Action::Up);
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if hidden > 0 {
+                            ui.label(RichText::new("…").small().color(p.muted))
+                                .on_hover_text(format!("{hidden} parent folders not shown"));
+                        }
+                        for (position, (id, name)) in crumbs.iter().skip(hidden).enumerate() {
+                            if position > 0 {
+                                ui.label(RichText::new("›").small().color(p.muted));
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(name).small().color(
+                                        if *id == self.request.root {
+                                            p.text
+                                        } else {
+                                            p.muted
+                                        },
+                                    ))
+                                    .frame(false)
+                                    .truncate(),
+                                )
+                                .clicked()
+                            {
+                                context = Some(Action::Navigate(*id));
+                            }
+                        }
+                    });
+                });
+            });
+            ui.cursor().top() - top
+        } else {
+            0.0
+        };
+        if let Some(action) = context {
+            self.action(action);
+        }
         let width = ui.available_width();
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(width, (height - 70.0).max(70.0)), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(width, (height - 70.0 - bar_height).max(70.0)),
+            Sense::hover(),
+        );
         let aspect = (rect.width() / rect.height()).clamp(0.25, 10.0);
         if self.generation > 0 && ((aspect / self.request.map_aspect).ln()).abs() > 0.12 {
             self.request.map_aspect = aspect;
             self.dirty = true;
         }
-        ui.painter().rect_filled(rect, 5.0, p.side);
+        ui.painter().rect_filled(rect, RADIUS_SM, p.sunken);
         let snapshot = self.visible.clone();
         let mut action = None;
         for item in &snapshot.view.map {
@@ -1787,16 +2351,76 @@ impl DiskScopeApp {
                 ui.painter().rect_stroke(
                     tile,
                     3.0,
-                    Stroke::new(3.0_f32, p.accent),
+                    Stroke::new(3.0_f32, p.focus),
                     egui::StrokeKind::Outside,
                 );
             }
-            ui.painter().rect_filled(tile, 3.0, color);
+            // A raised block: the face plus a light catch on the top and left
+            // edges and shade below and right, as if lit from above. Hover or
+            // selection lifts the tile a step (brighter bevel, one pixel of
+            // growth into the gutter). Only tiles that can carry 1.5 px edges
+            // pay for the bevel, so dense maps stay cheap; high contrast
+            // stays flat by design.
+            let lifted = response.hovered() || selected;
+            let block = if lifted
+                && self.preferences.theme != Theme::HighContrast
+                && tile.width() >= 18.0
+                && tile.height() >= 18.0
+            {
+                tile.expand(1.0)
+            } else {
+                tile
+            };
+            ui.painter().rect_filled(block, 3.0, color);
+            let bevelable = block.width() >= 10.0
+                && block.height() >= 10.0
+                && self.preferences.theme != Theme::HighContrast;
+            if bevelable {
+                let (light, shade) = if lifted {
+                    (lighten(color, 0.32), darken(color, 0.42))
+                } else {
+                    (lighten(color, 0.14), darken(color, 0.24))
+                };
+                let s = 1.5_f32;
+                let painter = ui.painter();
+                painter.rect_filled(
+                    Rect::from_min_max(egui::pos2(block.min.x, block.max.y - s), block.max),
+                    3.0,
+                    shade,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(egui::pos2(block.max.x - s, block.min.y), block.max),
+                    3.0,
+                    shade,
+                );
+                painter.rect_filled(
+                    Rect::from_min_size(block.min, egui::vec2(block.width(), s)),
+                    3.0,
+                    light,
+                );
+                painter.rect_filled(
+                    Rect::from_min_size(block.min, egui::vec2(s, block.height())),
+                    3.0,
+                    light,
+                );
+            } else if response.hovered() && !selected && !response.has_focus() {
+                // A quiet outline so the pointer's target is obvious even on
+                // tiles too dark or too small for the bevel to read.
+                ui.painter().rect_stroke(
+                    tile,
+                    3.0,
+                    Stroke::new(1.5_f32, p.border_strong),
+                    egui::StrokeKind::Inside,
+                );
+            }
             if selected {
+                // Tiles are always filled dark enough for white labels, so a
+                // white inner stroke stays the clearest selection mark in
+                // every theme; focus keeps its accent outline outside.
                 ui.painter().rect_stroke(
                     tile.shrink(1.0),
                     3.0,
-                    Stroke::new(2.0_f32, Color32::from_rgb(222, 255, 247)),
+                    Stroke::new(2.0_f32, Color32::WHITE),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -1813,7 +2437,7 @@ impl DiskScopeApp {
                     tile.left_bottom() + egui::vec2(8.0, -8.0),
                     egui::Align2::LEFT_BOTTOM,
                     format_bytes(item.logical),
-                    FontId::proportional(10.0),
+                    FontId::proportional(TYPE_LABEL),
                     Color32::from_rgb(221, 234, 241),
                 );
             }
@@ -1822,22 +2446,66 @@ impl DiskScopeApp {
                     tile.left_top() + egui::vec2(8.0, 7.0),
                     egui::Align2::LEFT_TOP,
                     "Selected",
-                    FontId::proportional(10.0),
+                    FontId::proportional(TYPE_LABEL),
                     Color32::WHITE,
                 );
             }
             let double = response.double_clicked();
             let click = response.clicked();
-            response.clone().on_hover_text(format!(
-                "{}\n{}{}",
-                item.name,
-                format_bytes(item.logical),
-                if item.others {
-                    "\nOpen the list to inspect these items"
-                } else {
-                    ""
-                }
-            ));
+            // Built only for the tile under the pointer: a dense map has up
+            // to 2000 tiles, and this ran for every one of them every frame.
+            if response.hovered() {
+                response.clone().on_hover_text(format!(
+                    "{}\n{}{}",
+                    item.name,
+                    format_bytes(item.logical),
+                    if item.others {
+                        "\nOpen the list to inspect these items"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            // Registering a context menu costs a Memory write-lock per call,
+            // and dense maps carry up to 2000 tiles: only the tile actually
+            // right-clicked (or whose menu is open) registers one.
+            if !item.others && (response.secondary_clicked() || response.context_menu_opened()) {
+                let pinned = self.request.pinned.contains(&item.id);
+                response.context_menu(|ui| {
+                    if item.is_dir && ui.button("Open folder").clicked() {
+                        action = Some(Action::Navigate(item.id));
+                        ui.close();
+                    }
+                    if ui.button("Inspect").clicked() {
+                        action = Some(Action::Select(item.id));
+                        ui.close();
+                    }
+                    // Paths are only offered where the current rows know this
+                    // tile; the map alone carries no filesystem path.
+                    if let Some(row) = snapshot.view.rows.iter().find(|row| row.id == item.id) {
+                        if ui.button("Reveal in Explorer").clicked() {
+                            self.reveal(row.path.clone(), row.is_dir, ui.ctx());
+                            ui.close();
+                        }
+                        if ui.button("Copy path").clicked() {
+                            ui.ctx().copy_text(row.path.to_string_lossy().into_owned());
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .button(if pinned {
+                            "Unpin from comparison"
+                        } else {
+                            "Pin for comparison"
+                        })
+                        .clicked()
+                    {
+                        self.pin(item.id);
+                        ui.close();
+                    }
+                });
+            }
             let activate = click
                 || response.has_focus()
                     && ui.input(|i| {
@@ -1854,12 +2522,12 @@ impl DiskScopeApp {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 self.empty_message(true),
-                FontId::proportional(13.0),
-                p.faint,
+                FontId::proportional(14.0),
+                p.muted,
             );
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Files:").small().color(p.faint));
+            ui.label(RichText::new("Files:").small().color(p.muted));
             for (label, color) in FILE_CATEGORIES
                 .iter()
                 .map(|category| (category.label, category.color))
@@ -1875,7 +2543,7 @@ impl DiskScopeApp {
     }
     fn inspector(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.spacing_mut().interact_size.y = 16.0;
-        overline(ui, "SELECTION", p);
+        overline(ui, "Selection", p);
         let snapshot = self.visible.clone();
         let Some(row) = snapshot
             .view
@@ -1884,14 +2552,15 @@ impl DiskScopeApp {
             .filter(|row| self.request.selected == Some(row.id))
         else {
             ui.add_space(6.0);
-            ui.label(
-                RichText::new(if self.request.selected.is_some() {
+            ui.label(title(
+                ui,
+                if self.request.selected.is_some() {
                     "Updating selection…"
                 } else {
                     "Select a folder or file"
-                })
-                .size(18.0),
-            );
+                },
+                TYPE_H3,
+            ));
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Inspect sizes and open the location in Explorer.")
@@ -1900,12 +2569,12 @@ impl DiskScopeApp {
             );
             ui.add_space(16.0);
             ui.separator();
-            overline(ui, "CURRENT FOLDER", p);
-            ui.label(
-                RichText::new(format_bytes(snapshot.view.total_logical))
-                    .size(26.0)
-                    .strong(),
-            );
+            overline(ui, "Current folder", p);
+            ui.label(title(
+                ui,
+                format_bytes(snapshot.view.total_logical),
+                TYPE_H1,
+            ));
             ui.label(
                 RichText::new("logical size in this folder")
                     .small()
@@ -1921,26 +2590,28 @@ impl DiskScopeApp {
             ui.label(
                 RichText::new("Allocated size is not necessarily reclaimable space.")
                     .small()
-                    .color(p.faint),
+                    .color(p.muted),
             );
             ui.add_space(10.0);
-            ui.collapsing("How sizes are counted", |ui| self.accounting_note(ui, p));
+            // This branch already shows the "Unique allocated" figure above,
+            // so only the collapsed caveats are needed here.
+            measurement_caveats(ui, p);
             return;
         };
         ui.horizontal(|ui| {
-            entry_icon(ui, row.is_dir, 23.0, p.accent);
-            ui.add(egui::Label::new(RichText::new(&row.name).size(18.0).strong()).wrap());
+            entry_icon(ui, row.is_dir, 23.0, p.accent_text);
+            ui.add(egui::Label::new(title(ui, &row.name, TYPE_H3)).wrap());
         });
         ui.add(
             egui::Label::new(
                 RichText::new(row.path.to_string_lossy())
                     .small()
-                    .color(p.faint),
+                    .color(p.muted),
             )
             .wrap(),
         );
         ui.add_space(8.0);
-        ui.label(RichText::new(format_bytes(row.logical)).size(27.0).strong());
+        ui.label(title(ui, format_bytes(row.logical), TYPE_H1));
         ui.label(
             RichText::new(format!(
                 "{:.1}% of {}",
@@ -1965,9 +2636,9 @@ impl DiskScopeApp {
         });
         if ui
             .button(if self.request.pinned.contains(&row.id) {
-                "Unpin comparison"
+                "Unpin from comparison"
             } else {
-                "Pin to compare"
+                "Pin for comparison"
             })
             .clicked()
         {
@@ -2008,7 +2679,7 @@ impl DiskScopeApp {
         if row.is_dir
             && ui
                 .add_sized(
-                    [ui.available_width(), 29.0],
+                    [ui.available_width(), 32.0],
                     egui::Button::new("Explore this folder"),
                 )
                 .clicked()
@@ -2032,20 +2703,14 @@ impl DiskScopeApp {
             ui.label(
                 RichText::new("Partial results · sizes can change as files are discovered.")
                     .small()
-                    .color(p.faint),
+                    .color(p.muted),
             );
         }
     }
     fn accounting_note(&self, ui: &mut egui::Ui, p: Palette) {
-        ui.label(RichText::new("SIZE ACCOUNTING").small().color(p.faint));
-        ui.label(
-            RichText::new(
-                "Logical sizes are additive. Hard links can appear more than once in this total.",
-            )
-            .small()
-            .color(p.muted),
-        );
-        ui.add_space(6.0);
+        // Leads with the one figure; the measurement caveats stay available
+        // behind a collapsed affordance instead of as permanent text.
+        overline(ui, "Unique allocation", p);
         ui.label(
             RichText::new(format!(
                 "Current folder unique allocated: {}",
@@ -2058,25 +2723,7 @@ impl DiskScopeApp {
             "Folder: {}",
             self.visible.view.root_path.to_string_lossy()
         ));
-        ui.label(
-            RichText::new(
-                "Sibling folder unique totals can overlap when hard links cross folders.",
-            )
-            .small()
-            .color(p.faint),
-        );
-        ui.label(
-            RichText::new("Alternate data streams and filesystem metadata are excluded.")
-                .small()
-                .color(p.faint),
-        );
-        ui.label(
-            RichText::new(
-                "Allocated sums are not reclaimable space. Unknown metadata stays unknown.",
-            )
-            .small()
-            .color(p.faint),
-        );
+        measurement_caveats(ui, p);
     }
     fn error_window(&mut self, ctx: &egui::Context, p: Palette) {
         if !self.show_errors {
@@ -2136,6 +2783,9 @@ impl eframe::App for DiskScopeApp {
         // ui() runs. Windows parents its own prompts to it during Recycle.
         if self.management.owner.is_none() {
             self.management.owner = management::native_window_id(frame);
+            if let Some(window) = self.management.owner {
+                native::apply_window_icon(window);
+            }
         }
         let ctx = ui.ctx().clone();
         if !self.management.busy() {
@@ -2161,6 +2811,10 @@ impl eframe::App for DiskScopeApp {
             ui.disable();
         }
         if investigation::compact(&ctx) {
+            // Narrow and heavily scaled windows keep Meridian's control
+            // height but step the gap between rows down to `space-1`, so the
+            // file list stays on screen.
+            ui.spacing_mut().item_spacing.y = 4.0;
             self.compact_navigation(ui, p);
         } else {
             self.sidebar(ui, p);
@@ -2168,7 +2822,7 @@ impl eframe::App for DiskScopeApp {
         egui::Panel::bottom("status")
             .frame(
                 egui::Frame::new()
-                    .fill(p.side)
+                    .fill(p.sunken)
                     .inner_margin(egui::Margin::symmetric(18, 6)),
             )
             .show_inside(ui, |ui| {
@@ -2181,14 +2835,14 @@ impl eframe::App for DiskScopeApp {
                             &self.snapshot.progress.backend
                         })
                         .small()
-                        .color(p.faint),
+                        .color(p.muted),
                     );
                 });
             });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(p.surface)
+                    .fill(p.canvas)
                     .inner_margin(egui::Margin::symmetric(22, 17)),
             )
             .show_inside(ui, |ui| {
@@ -2207,6 +2861,8 @@ impl eframe::App for DiskScopeApp {
             self.export_window(&ctx);
         }
         self.management_dialog(&ctx, p);
+        let dialog_open = self.transient_dialog_open() || self.management.busy();
+        self.toasts.render(&ctx, p, dialog_open);
         controls::finish_dialog_frame(&ctx);
         self.submit_view();
     }
@@ -2222,9 +2878,38 @@ impl eframe::App for DiskScopeApp {
         self.persistence_allowed()
     }
 }
+/// Meridian's `label` style: the eyebrow above a card or group. Sentence
+/// case, never all caps.
 fn overline(ui: &mut egui::Ui, text: &str, p: Palette) {
-    ui.label(RichText::new(text).small().color(p.faint));
+    ui.label(
+        RichText::new(text)
+            .size(TYPE_LABEL)
+            .extra_letter_spacing(0.44)
+            .color(p.muted),
+    );
     ui.add_space(4.0);
+}
+/// The size-accounting caveats, verbatim, behind one default-closed affordance
+/// so the inspector shows data first. Nothing is removed; collapsed body
+/// content simply does not render until the header is opened.
+fn measurement_caveats(ui: &mut egui::Ui, p: Palette) {
+    egui::CollapsingHeader::new(
+        RichText::new("How sizes are measured")
+            .small()
+            .color(p.muted),
+    )
+    .id_salt("measurement_caveats")
+    .default_open(false)
+    .show(ui, |ui| {
+        for caveat in [
+            "Logical sizes are additive. Hard links can appear more than once in this total.",
+            "Sibling folder unique totals can overlap when hard links cross folders.",
+            "Alternate data streams and filesystem metadata are excluded.",
+            "Allocated sums are not reclaimable space. Unknown metadata stays unknown.",
+        ] {
+            ui.label(RichText::new(caveat).small().color(p.muted));
+        }
+    });
 }
 fn entry_icon(ui: &mut egui::Ui, is_dir: bool, size: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
@@ -2262,7 +2947,7 @@ fn metric(ui: &mut egui::Ui, value: &str, label: &str, p: Palette, width: f32) {
         ui.horizontal(|ui| {
             ui.separator();
             ui.vertical(|ui| {
-                ui.label(RichText::new(value).size(22.0));
+                ui.label(title(ui, value, TYPE_H2));
                 ui.label(RichText::new(label).small().color(p.muted));
             });
         });
@@ -2610,7 +3295,7 @@ mod tests {
                     |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
                 );
             }
-            for label in ["NAME", "LOGICAL SIZE", "demo.mp4"] {
+            for label in ["Name", "Logical size", "demo.mp4"] {
                 assert!(
                     rendered_texts(&output.shapes).iter().any(|s| s == label),
                     "Missing {label} at {factor}: {:?}",
@@ -2625,7 +3310,7 @@ mod tests {
             assert!(
                 !rendered_texts(&output.shapes)
                     .iter()
-                    .any(|s| s == "CURRENT SCAN")
+                    .any(|s| s == "Current scan")
             );
         }
     }
@@ -2984,7 +3669,7 @@ mod tests {
                 screen.contains(action),
                 "Primary action outside window at {scale:?}"
             );
-            assert!(action.y > text_center(&output.shapes, "See where your space goes.").y);
+            assert!(action.y > text_center(&output.shapes, "Know where every byte lives.").y);
         }
     }
 
@@ -3038,7 +3723,7 @@ mod tests {
             for _ in 0..3 {
                 output = table_frame_at_width(&mut app, &ctx, vec![], width);
             }
-            for expected in ["LOGICAL SIZE", "FOLDER SHARE", "FILES"] {
+            for expected in ["Logical size", "Folder share", "Files"] {
                 assert!(
                     output.shapes.iter().any(|shape| {
                         matches!(&shape.shape, egui::epaint::Shape::Text(text)
@@ -3076,7 +3761,7 @@ mod tests {
         for _ in 0..3 {
             output = table_frame_at_width(&mut app, &context, vec![], 900.0);
         }
-        for expected in ["LOGICAL SIZE", "FOLDER SHARE", "FILES"] {
+        for expected in ["Logical size", "Folder share", "Files"] {
             assert!(
                 output.shapes.iter().any(|shape| {
                     matches!(&shape.shape, egui::epaint::Shape::Text(text)
@@ -3097,7 +3782,10 @@ mod tests {
             .send(NativeResult::Reveal(Err("fixture reveal failed".into())))
             .unwrap();
         app.logic(&ctx, &mut eframe::Frame::_new_kittest());
-        assert_eq!(app.notice.as_deref(), Some("fixture reveal failed"));
+        // The scan-completion toast may share the stack; the reveal error
+        // must still be there rather than silently swallowed.
+        assert!(app.toasts.any_text_contains("fixture reveal failed"));
+        assert!(app.notice.is_none());
     }
 
     fn primary_click(app: &mut DiskScopeApp, ctx: &egui::Context, position: egui::Pos2) {
@@ -3216,8 +3904,8 @@ mod tests {
         }
         let splitter = splitter.expect("logical-size splitter must be reachable by Tab");
         let before = table_frame(&mut app, &ctx, vec![]);
-        let share_before = text_center(&before.shapes, "FOLDER SHARE").x;
-        let files_before = text_center(&before.shapes, "FILES").x;
+        let share_before = text_center(&before.shapes, "Folder share").x;
+        let files_before = text_center(&before.shapes, "Files").x;
         table_frame(
             &mut app,
             &ctx,
@@ -3231,11 +3919,11 @@ mod tests {
         );
         let after = table_frame(&mut app, &ctx, vec![]);
         assert!(
-            text_center(&after.shapes, "FOLDER SHARE").x > share_before + 4.0,
+            text_center(&after.shapes, "Folder share").x > share_before + 4.0,
             "Right must enlarge the real rendered logical-size column"
         );
         assert!(
-            (text_center(&after.shapes, "FILES").x - files_before).abs() < 1.0,
+            (text_center(&after.shapes, "Files").x - files_before).abs() < 1.0,
             "an interior resize transfers adjacent width without overflowing the table"
         );
         assert_eq!(ctx.memory(|m| m.focused()), Some(splitter));
@@ -3268,8 +3956,8 @@ mod tests {
         );
         let restored = table_frame(&mut app, &ctx, vec![]);
         assert!(
-            text_center(&restored.shapes, "FOLDER SHARE").x
-                < text_center(&after.shapes, "FOLDER SHARE").x - 4.0
+            text_center(&restored.shapes, "Folder share").x
+                < text_center(&after.shapes, "Folder share").x - 4.0
         );
         for direction in [egui::Key::ArrowLeft, egui::Key::ArrowRight] {
             for _ in 0..80 {
@@ -3297,7 +3985,7 @@ mod tests {
                 );
                 assert!(node.numeric_value().unwrap() <= node.max_numeric_value().unwrap() + 0.1);
                 assert!(
-                    (text_center(&output.shapes, "FILES").x - files_before).abs() < 1.0,
+                    (text_center(&output.shapes, "Files").x - files_before).abs() < 1.0,
                     "repeated resizing cannot push the last column out of the table"
                 );
                 assert_eq!(ctx.memory(|m| m.focused()), Some(splitter));
@@ -3322,7 +4010,7 @@ mod tests {
             table_frame_at_width(&mut fresh_app, &fresh_ctx, vec![], 900.0);
         }
         let fresh = table_frame_at_width(&mut fresh_app, &fresh_ctx, vec![], 900.0);
-        for label in ["LOGICAL SIZE", "FOLDER SHARE", "FILES"] {
+        for label in ["Logical size", "Folder share", "Files"] {
             assert!(
                 (text_center(&resized.shapes, label).x - text_center(&fresh.shapes, label).x).abs()
                     < 1.0,
@@ -3371,8 +4059,8 @@ mod tests {
         );
         let pointer_resized = table_frame_at_width(&mut app, &ctx, vec![], 900.0);
         assert!(
-            text_center(&pointer_resized.shapes, "FOLDER SHARE").x
-                > text_center(&resized.shapes, "FOLDER SHARE").x + 4.0,
+            text_center(&pointer_resized.shapes, "Folder share").x
+                > text_center(&resized.shapes, "Folder share").x + 4.0,
             "pointer drag must still resize the real column after keyboard resizing"
         );
     }
@@ -3645,6 +4333,44 @@ mod tests {
     }
 
     #[test]
+    fn space_map_keeps_its_own_location_bar() {
+        // The trail a scan of C:\fixture publishes while inside "folder".
+        fn nested(app: &mut DiskScopeApp) {
+            app.request.root = 2;
+            app.request.selected = Some(2);
+            let snapshot = Arc::make_mut(&mut app.snapshot);
+            snapshot.view.breadcrumbs = vec![(0, "fixture".into()), (2, "folder".into())];
+            app.visible = app.snapshot.clone();
+        }
+        let (mut app, ctx) = table_fixture();
+        nested(&mut app);
+        panel_frame(&mut app, &ctx, vec![], true);
+        let output = panel_frame(&mut app, &ctx, vec![], true);
+        // The bar names the current folder and separates it from the root.
+        text_center(&output.shapes, "folder");
+        text_center(&output.shapes, "›");
+        // The Up control opens the parent folder.
+        let up = text_center(&output.shapes, "↑ Up");
+        panel_click(&mut app, &ctx, up, true);
+        assert_eq!(app.request.root, 0);
+        assert_eq!(app.request.selected, Some(0));
+        assert_eq!(app.request.mode, ViewMode::Explorer);
+        // A crumb jumps straight to that ancestor.
+        let (mut app, ctx) = table_fixture();
+        nested(&mut app);
+        panel_frame(&mut app, &ctx, vec![], true);
+        let output = panel_frame(&mut app, &ctx, vec![], true);
+        panel_click(&mut app, &ctx, text_center(&output.shapes, "fixture"), true);
+        assert_eq!(app.request.root, 0);
+        // Before any scan the map carries no location bar.
+        let (mut app, ctx) = table_fixture();
+        app.generation = 0;
+        panel_frame(&mut app, &ctx, vec![], true);
+        let output = panel_frame(&mut app, &ctx, vec![], true);
+        assert!(!rendered_texts(&output.shapes).iter().any(|s| s == "↑ Up"));
+    }
+
+    #[test]
     fn largest_sort_and_search_controls_stay_above_the_table_in_the_explore_page() {
         let (mut app, ctx) = table_fixture();
         app.request.mode = ViewMode::Largest;
@@ -3669,7 +4395,7 @@ mod tests {
         let sort = text_center(&output.shapes, "Logical size");
         let search = text_center(&output.shapes, "Search names…");
         let scope = text_center(&output.shapes, "Whole scan");
-        let header = text_center(&output.shapes, "NAME");
+        let header = text_center(&output.shapes, "Name");
         eprintln!(
             "control positions sort={sort:?} search={search:?} scope={scope:?} table={header:?}"
         );
@@ -3768,7 +4494,7 @@ mod tests {
         for _ in 0..3 {
             output = physical_app_frame(&mut app, &ctx, egui::vec2(1440.0, 820.0), 1.0, vec![]);
         }
-        let table = text_center(&output.shapes, "NAME");
+        let table = text_center(&output.shapes, "Name");
         let map = text_center(&output.shapes, "Space map");
         assert!(table.y < 350.0, "file list starts too far down: {table:?}");
         assert!(
@@ -3805,6 +4531,29 @@ mod tests {
                 .find_map(|s| find(&s.shape, expected))
                 .unwrap_or_else(|| panic!("missing text {expected}"))
         }
+        // The sort control can show the same words as a column header. The
+        // header is the one set in Meridian's small `label` size.
+        fn header_rect(shapes: &[egui::epaint::ClippedShape], expected: &str) -> Rect {
+            fn collect(shape: &egui::epaint::Shape, expected: &str, found: &mut Vec<Rect>) {
+                match shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == expected => {
+                        found.push(text.visual_bounding_rect());
+                    }
+                    egui::epaint::Shape::Vec(shapes) => {
+                        shapes.iter().for_each(|s| collect(s, expected, found));
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = Vec::new();
+            shapes
+                .iter()
+                .for_each(|s| collect(&s.shape, expected, &mut found));
+            found
+                .into_iter()
+                .min_by(|a, b| a.height().total_cmp(&b.height()))
+                .unwrap_or_else(|| panic!("missing header {expected}"))
+        }
         for (physical, scale) in [
             (egui::vec2(1440.0, 923.0), TextScale::Largest),
             (egui::vec2(900.0, 640.0), TextScale::Normal),
@@ -3829,9 +4578,9 @@ mod tests {
             for _ in 0..3 {
                 output = physical_app_frame(&mut app, &ctx, physical, 1.0, vec![]);
             }
-            let name = text_rect(&output.shapes, "NAME");
+            let name = text_rect(&output.shapes, "Name");
             let file = text_rect(&output.shapes, "demo.mp4");
-            let size_header = text_rect(&output.shapes, "LOGICAL SIZE");
+            let size_header = header_rect(&output.shapes, "Logical size");
             let size = text_rect(&output.shapes, &format_bytes(first.logical));
             assert!(
                 name.left() < 60.0,
@@ -4433,5 +5182,180 @@ mod tests {
         assert!(!admits_snapshot(4, 7, 4, 6));
         assert!(!admits_snapshot(4, 7, 4, 8));
         assert!(admits_snapshot(4, 7, 4, 7));
+    }
+    #[test]
+    fn accounting_note_leads_with_data_and_keeps_caveats_collapsed() {
+        let (app, ctx) = table_fixture();
+        let output = settle_frames(&ctx, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                app.accounting_note(ui, app.preferences.theme.palette());
+            });
+        });
+        let texts = rendered_texts(&output.shapes);
+        assert!(
+            texts.iter().any(|text| text == "Unique allocation"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("Current folder unique allocated:")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "How sizes are measured"),
+            "{texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("Hard links can appear")),
+            "collapsed caveat sentences must not render until opened: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn one_unreadable_saved_preference_does_not_reset_the_rest() {
+        let saved = r#"{"theme":"Neon","map_focus":true,"recent_locations":["C:/kept"],"text_scale":"Large"}"#;
+        let preferences = Preferences::from_saved(saved);
+        assert_eq!(preferences.theme, Theme::default());
+        assert!(preferences.map_focus);
+        assert_eq!(preferences.text_scale, TextScale::Large);
+        assert_eq!(preferences.recent_locations, [PathBuf::from("C:/kept")]);
+        // Anything that is not an object falls back to defaults entirely.
+        assert!(!Preferences::from_saved("not json").map_focus);
+    }
+
+    #[test]
+    fn opening_the_folder_already_open_keeps_selection_and_expansion() {
+        let (mut app, _ctx) = table_fixture();
+        app.request.mode = ViewMode::Explorer;
+        app.changes = false;
+        let root = app.request.root;
+        app.request.selected = Some(root + 7);
+        app.request.expanded.insert(root + 5);
+        app.action(Action::Navigate(root));
+        assert_eq!(app.request.selected, Some(root + 7));
+        assert!(app.request.expanded.contains(&(root + 5)));
+        assert!(
+            !app.history.can_back(),
+            "nothing changed, so nothing to go back to"
+        );
+    }
+
+    #[test]
+    fn typed_paths_lose_stray_spaces_and_explorer_quotes() {
+        let (mut app, _ctx) = table_fixture();
+        app.path_edited = true;
+        app.draft_path = None;
+        app.path_text = r#"  "C:\Program Files"  "#.into();
+        assert_eq!(app.requested_path(), PathBuf::from(r"C:\Program Files"));
+        app.path_text = "   ".into();
+        assert!(app.requested_path().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn paging_and_new_queries_return_the_file_list_to_its_top() {
+        let (mut app, _ctx) = table_fixture();
+        app.table_scroll = None;
+        app.action(Action::Page(PAGE_SIZE));
+        assert_eq!(app.table_scroll, Some((0, Some(Align::TOP))));
+        app.table_scroll = None;
+        app.mark_query_changed();
+        assert_eq!(app.table_scroll, Some((0, Some(Align::TOP))));
+    }
+
+    fn click_events(point: egui::Pos2) -> [Vec<egui::Event>; 2] {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        [
+            vec![egui::Event::PointerMoved(point), button(true)],
+            vec![button(false)],
+        ]
+    }
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn two_arrow_presses_move_the_selection_exactly_two_rows() {
+        let (mut app, ctx) = table_fixture();
+        let first = app.visible.view.rows[0].clone();
+        let view = &mut Arc::make_mut(&mut app.visible).view;
+        view.rows = (0..6)
+            .map(|index| {
+                let mut row = first.clone();
+                row.id = 100 + index;
+                if index > 0 {
+                    row.name = format!("file-{index}.bin");
+                }
+                row
+            })
+            .collect();
+        view.total_rows = 6;
+        let output = table_frame(&mut app, &ctx, vec![]);
+        let point = text_center(&output.shapes, &first.name);
+        for events in click_events(point) {
+            table_frame(&mut app, &ctx, events);
+        }
+        assert_eq!(app.request.selected, Some(100));
+        table_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown)]);
+        assert_eq!(app.request.selected, Some(101));
+        table_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown)]);
+        assert_eq!(
+            app.request.selected,
+            Some(102),
+            "focus must follow the selection, not run one row ahead of it"
+        );
+    }
+
+    #[test]
+    fn delete_answers_after_a_table_row_was_clicked() {
+        use super::test_support::physical_app_frame;
+        let (mut app, ctx) = table_fixture();
+        app.request.mode = ViewMode::Largest;
+        let size = egui::vec2(1440.0, 820.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = physical_app_frame(&mut app, &ctx, size, 1.0, vec![]);
+        }
+        let point = text_center(&output.shapes, "demo.mp4");
+        for events in click_events(point) {
+            physical_app_frame(&mut app, &ctx, size, 1.0, events);
+        }
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "the click focuses the row"
+        );
+        // The worker would echo the selection back; this fixture has none.
+        let clicked = app
+            .visible
+            .view
+            .rows
+            .iter()
+            .find(|row| row.name == "demo.mp4")
+            .cloned();
+        Arc::make_mut(&mut app.visible).view.selected = clicked;
+        app.notice = None;
+        physical_app_frame(
+            &mut app,
+            &ctx,
+            size,
+            1.0,
+            vec![key_event(egui::Key::Delete)],
+        );
+        // A focused row used to swallow the key. Now it either opens the
+        // confirmation or says why it cannot.
+        assert!(app.management.busy() || app.notice.is_some());
     }
 }

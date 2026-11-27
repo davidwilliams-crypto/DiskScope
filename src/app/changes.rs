@@ -9,14 +9,22 @@ impl DiskScopeApp {
         self.changes = false;
         self.mark_query_changed();
     }
+    /// One message, one place, for every history request the worker turned
+    /// away: a click must never do nothing visible.
+    pub(super) fn history_busy_toast(&mut self) {
+        self.toasts.push(
+            toasts::ToastKind::Warning,
+            "Scan history is busy. Try again when it finishes.",
+        );
+    }
     pub(super) fn changes_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         if !self.persistence_allowed() {
             ui.add_space(18.0);
-            ui.label(
-                RichText::new("Scan history is unavailable in this window")
-                    .size(22.0)
-                    .strong(),
-            );
+            ui.label(title(
+                ui,
+                "Scan history is unavailable in this window",
+                TYPE_H2,
+            ));
             ui.label(RichText::new(self.persistence_message()).color(p.muted));
             return;
         }
@@ -34,6 +42,7 @@ impl DiskScopeApp {
                 );
                 ui.add_space(12.0);
                 self.comparison_picker(ui, &history, p);
+                self.saved_scans_card(ui, &history, p);
                 if !history.message.is_empty() {
                     ui.label(RichText::new(&history.message).color(p.muted));
                 }
@@ -44,14 +53,17 @@ impl DiskScopeApp {
                     self.comparison_results(ui, comparison, p);
                 } else {
                     ui.add_space(30.0);
-                    ui.label(
-                        RichText::new(if history.scans.is_empty() {
+                    ui.label(title(
+                        ui,
+                        if history.busy {
+                            "Working on scan history…"
+                        } else if history.scans.is_empty() {
                             "No saved complete scans yet."
                         } else {
                             "Choose compatible Before and After scans, then compare."
-                        })
-                        .size(24.0),
-                    );
+                        },
+                        TYPE_H2,
+                    ));
                     ui.label(
                         RichText::new(
                             "Finish a scan, make changes to your files, then scan the same folder again. Only complete scans without errors become baselines.",
@@ -63,15 +75,15 @@ impl DiskScopeApp {
                 self.history_storage_section(ui, p);
             });
     }
-    fn comparison_picker(&mut self, ui: &mut egui::Ui, history: &HistorySnapshot, p: Palette) {
+    /// The picker root is the last manually chosen one, but Navigation and
+    /// Overview can explicitly choose a pair for another root. Those IDs are
+    /// authoritative over the cached picker root. A manual root change in the
+    /// picker still clears the pair in the same frame.
+    fn history_root(&self, history: &HistorySnapshot, ctx: &egui::Context) -> PathBuf {
         let root_key = egui::Id::new("history_selected_root");
-        let mut root = ui
-            .ctx()
+        let mut root = ctx
             .data_mut(|d| d.get_temp::<PathBuf>(root_key))
             .unwrap_or_else(|| self.snapshot.progress.root.clone());
-        // Navigation and Overview can explicitly choose a pair for another
-        // root. Those IDs are authoritative over the last picker root. A manual
-        // root change below still clears the pair in the same frame.
         if let Some(selected) = history.scans.iter().find(|s| Some(s.id) == self.older_scan)
             && state::comparison_pair(
                 &history.scans,
@@ -88,8 +100,13 @@ impl DiskScopeApp {
         {
             root = scan.root.clone();
         }
+        root
+    }
+    fn comparison_picker(&mut self, ui: &mut egui::Ui, history: &HistorySnapshot, p: Palette) {
+        let root_key = egui::Id::new("history_selected_root");
+        let mut root = self.history_root(history, ui.ctx());
         ux::card(p).show(ui, |ui| {
-            ui.label(RichText::new("History by scanned root").strong());
+            ui.label(RichText::new("Compare two scans").strong());
             let previous_root = root.clone();
             egui::ComboBox::from_label("Scanned root")
                 .selected_text(root.to_string_lossy())
@@ -99,13 +116,20 @@ impl DiskScopeApp {
                     roots.sort();
                     roots.dedup();
                     for candidate in roots {
-                        ui.selectable_value(&mut root, candidate.clone(), candidate.to_string_lossy());
+                        ui.selectable_value(
+                            &mut root,
+                            candidate.clone(),
+                            candidate.to_string_lossy(),
+                        );
                     }
                 });
             ui.label(root.to_string_lossy());
             ui.ctx().data_mut(|d| d.insert_temp(root_key, root.clone()));
-            if previous_root != root || [self.older_scan, self.newer_scan].into_iter().flatten()
-                .any(|id| !history.scans.iter().any(|s| s.id == id && s.root == root))
+            if previous_root != root
+                || [self.older_scan, self.newer_scan]
+                    .into_iter()
+                    .flatten()
+                    .any(|id| !history.scans.iter().any(|s| s.id == id && s.root == root))
             {
                 self.older_scan = None;
                 self.newer_scan = None;
@@ -120,14 +144,35 @@ impl DiskScopeApp {
             }
             let before_after = self.newer_scan;
             ui.horizontal_wrapped(|ui| {
-                scan_picker(ui, "After", &mut self.newer_scan, &history.scans, &root, None);
+                scan_picker(
+                    ui,
+                    "After",
+                    &mut self.newer_scan,
+                    &history.scans,
+                    &root,
+                    None,
+                );
                 if before_after != self.newer_scan
-                    && state::comparison_pair(&history.scans, &root, self.older_scan, self.newer_scan).is_err()
+                    && state::comparison_pair(
+                        &history.scans,
+                        &root,
+                        self.older_scan,
+                        self.newer_scan,
+                    )
+                    .is_err()
                 {
                     self.older_scan = None;
                 }
-                scan_picker(ui, "Before", &mut self.older_scan, &history.scans, &root, self.newer_scan);
-                let pair = state::comparison_pair(&history.scans, &root, self.older_scan, self.newer_scan);
+                scan_picker(
+                    ui,
+                    "Before",
+                    &mut self.older_scan,
+                    &history.scans,
+                    &root,
+                    self.newer_scan,
+                );
+                let pair =
+                    state::comparison_pair(&history.scans, &root, self.older_scan, self.newer_scan);
                 let compare = ui.add_enabled(
                     !history.busy && pair.is_ok(),
                     egui::Button::new("Compare scans →"),
@@ -140,41 +185,91 @@ impl DiskScopeApp {
                         Some("History worker is busy. Try Compare again when it finishes.".into());
                 }
                 if history.busy {
-                    ui.label(RichText::new("Working in background…").color(p.accent));
+                    ui.label(RichText::new("Working in background…").color(p.muted));
                 }
                 if let Err(reason) = pair {
                     ui.label(RichText::new(reason).color(p.muted));
                 }
             });
-            ui.label(RichText::new("Timeline · complete, error-free saved baselines").strong());
+            if let Ok((older, newer)) =
+                state::comparison_pair(&history.scans, &root, self.older_scan, self.newer_scan)
+            {
+                let a = history.scans.iter().find(|s| s.id == older).unwrap();
+                let b = history.scans.iter().find(|s| s.id == newer).unwrap();
+                let line = if a.finished_unix > b.finished_unix {
+                    "After is earlier than Before · change is After minus Before in logical bytes"
+                } else {
+                    "Compatible backend family · change is After minus Before in logical bytes"
+                };
+                ui.label(RichText::new(line).small().color(p.muted))
+                    .on_hover_text(
+                        "Only complete, error-free scans within storage limits become baselines. \
+                     Cancelled, partial, failed and oversized scans are excluded. Normal and raw \
+                     NTFS preview scans are separate families. View filters do not change saved \
+                     baselines.",
+                    );
+            }
+        });
+    }
+    fn saved_scans_card(&mut self, ui: &mut egui::Ui, history: &HistorySnapshot, p: Palette) {
+        let root = self.history_root(history, ui.ctx());
+        if !history.scans.iter().any(|s| s.root == root) && history.protected_baseline.is_none() {
+            return;
+        }
+        ui.add_space(12.0);
+        ux::card(p).show(ui, |ui| {
+            ui.label(RichText::new("Saved scans of this root").strong());
             for scan in history.scans.iter().filter(|s| s.root == root) {
-                let role = match (Some(scan.id) == self.older_scan, Some(scan.id) == self.newer_scan) {
+                let role = match (
+                    Some(scan.id) == self.older_scan,
+                    Some(scan.id) == self.newer_scan,
+                ) {
                     (true, _) => "Before",
                     (_, true) => "After",
                     _ => "Saved",
                 };
-                ui.label(format!("{role} · {} · {} · {}", date_time_label(scan.finished_unix), format_bytes(scan.logical), scan.backend));
+                let protected = if history.protected_baseline == Some(scan.id) {
+                    " · protected"
+                } else {
+                    ""
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{role} · {} · {} · {}{protected}",
+                        date_time_label(scan.finished_unix),
+                        format_bytes(scan.logical),
+                        scan.backend,
+                    ))
+                    .small(),
+                );
             }
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if let Some(id) = history.protected_baseline {
-                    ui.label(format!("Protected incident baseline: {id}"));
-                    if ui.add_enabled(!history.busy, egui::Button::new("Release baseline protection")).clicked() {
-                        self.history_service.unprotect_baseline();
+                    ui.label(
+                        RichText::new(format!("Protected incident baseline: {id}"))
+                            .small()
+                            .color(p.muted),
+                    );
+                    if ui
+                        .add_enabled(!history.busy, egui::Button::new("Release protection"))
+                        .clicked()
+                        && !self.history_service.unprotect_baseline()
+                    {
+                        self.history_busy_toast();
                     }
-                } else if ui.add_enabled(!history.busy && self.older_scan.is_some(), egui::Button::new("Protect Before baseline from retention")).clicked()
+                } else if ui
+                    .add_enabled(
+                        !history.busy && self.older_scan.is_some(),
+                        egui::Button::new("Protect Before baseline"),
+                    )
+                    .clicked()
                     && let Some(id) = self.older_scan
-                { self.history_service.protect_baseline(id); }
+                    && !self.history_service.protect_baseline(id)
+                {
+                    self.history_busy_toast();
+                }
             });
-            if let Ok((older, newer)) = state::comparison_pair(&history.scans, &root, self.older_scan, self.newer_scan) {
-                let a = history.scans.iter().find(|s| s.id == older).unwrap();
-                let b = history.scans.iter().find(|s| s.id == newer).unwrap();
-                ui.label(if a.finished_unix > b.finished_unix {
-                    "Reverse chronological comparison: After is earlier than Before. Change is After minus Before."
-                } else {
-                    "Compatible backend family · change is After minus Before in logical bytes."
-                });
-            }
-            ui.label(RichText::new("Only complete, error-free scans within storage limits become baselines. Cancelled, partial, failed and oversized scans are excluded. Normal and raw NTFS preview scans are separate families. View filters do not change saved baselines.").small().color(p.muted));
         });
     }
     fn comparison_results(
@@ -186,12 +281,12 @@ impl DiskScopeApp {
         ui.add_space(16.0);
         ui.label(RichText::new(comparison.root.to_string_lossy()).color(p.muted));
         ui.horizontal_wrapped(|ui| {
-            metric(ui, &format_bytes(comparison.before), "BEFORE", p, 170.0);
-            metric(ui, &format_bytes(comparison.after), "AFTER", p, 170.0);
+            metric(ui, &format_bytes(comparison.before), "Before", p, 170.0);
+            metric(ui, &format_bytes(comparison.after), "After", p, 170.0);
             metric(
                 ui,
                 &delta_label(comparison.delta),
-                "NET LOGICAL CHANGE",
+                "Net logical change",
                 p,
                 210.0,
             );
@@ -204,13 +299,14 @@ impl DiskScopeApp {
                 (comparison.modified, "modified"),
                 (comparison.moved, "moved"),
             ] {
-                ui.label(RichText::new(format!("{} {label}", format_count(count))).color(p.accent));
+                ui.label(RichText::new(format!("{} {label}", format_count(count))).strong());
                 ui.add_space(12.0);
             }
         });
         ui.add_space(16.0);
         ux::card(p).show(ui, |ui| {
-            ui.label(RichText::new("Folder changes").size(17.0).strong());
+            ui.set_min_width(ui.available_width());
+            ui.label(title(ui, "Folder changes", TYPE_H3));
             for folder in &comparison.folder_changes {
                 ui.horizontal_wrapped(|ui| {
                     let relative = folder
@@ -223,13 +319,13 @@ impl DiskScopeApp {
                         relative.to_string_lossy()
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(delta_label(folder.delta)).color(p.accent));
+                        ui.label(RichText::new(delta_label(folder.delta)).strong());
                     });
                 });
             }
         });
         ui.add_space(16.0);
-        ui.label(RichText::new("Changed items").size(17.0).strong());
+        ui.label(title(ui, "Changed items", TYPE_H3));
         ui.label(
             RichText::new(format!(
                 "Showing {} of {} changes · path and size metadata; no content hashes",
@@ -244,11 +340,17 @@ impl DiskScopeApp {
         for (index, row) in comparison.rows.iter().enumerate() {
             ui.push_id(index, |ui| {
                 ui.add_space(4.0);
+                // Meridian list rows: one quiet ground for every row, no
+                // zebra striping.
                 egui::Frame::new()
-                    .fill(if index % 2 == 0 { p.side } else { p.surface })
-                    .inner_margin(9.0)
-                    .corner_radius(4)
-                    .show(ui, |ui| self.change_row(ui, comparison, row, live, p));
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0_f32, p.card_outline))
+                    .inner_margin(SPACE_3)
+                    .corner_radius(RADIUS_MD)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        self.change_row(ui, comparison, row, live, p)
+                    });
             });
         }
         ui.add_space(10.0);
@@ -269,18 +371,10 @@ impl DiskScopeApp {
         p: Palette,
     ) {
         let removed = row.kind == scan_history::ChangeKind::Removed;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(change_kind_label(row.kind)).color(p.accent));
-            ui.add(
-                egui::Label::new(
-                    row.path
-                        .strip_prefix(&comparison.root)
-                        .unwrap_or(&row.path)
-                        .to_string_lossy(),
-                )
-                .truncate(),
-            )
-            .on_hover_text(row.path.to_string_lossy());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(change_kind_label(row.kind)).color(p.accent_text));
+            // The trailing actions are laid out first; the path truncates
+            // into whatever is left instead of running underneath them.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let reveal = ui
                     .add_enabled(!removed, egui::Button::new("Reveal").small())
@@ -292,6 +386,18 @@ impl DiskScopeApp {
                     self.focus_changed_item(row.path.clone());
                 }
                 ui.label(delta_label(row.delta));
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            row.path
+                                .strip_prefix(&comparison.root)
+                                .unwrap_or(&row.path)
+                                .to_string_lossy(),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(row.path.to_string_lossy());
+                });
             });
         });
         ui.label(
@@ -313,43 +419,108 @@ impl DiskScopeApp {
     }
     fn history_storage_section(&mut self, ui: &mut egui::Ui, p: Palette) {
         // Catalog load can fail before a protected id is known. Recovery must
-        // stay reachable then, without making Clear the only available route.
-        if ui
-            .add_enabled(
-                !self.history_snapshot.busy,
-                egui::Button::new("Release or repair baseline protection"),
-            )
-            .clicked()
-        {
-            self.history_service.unprotect_baseline();
-        }
-        ui.label("Repair releases protection and reloads history without clearing saved scans. Use it when protection metadata cannot be read. Explicit Clear below removes saved history.");
-        ui.collapsing("Local history & storage", |ui| {
-            ui.label(format!(
-                "{} most recent complete scans across all roots · oldest saved scans are removed automatically · metadata only · stored at the location below",
-                scan_history::MAX_SNAPSHOTS
-            ));
-            ui.label(self.history_directory.to_string_lossy());
-            ui.label("History is for focused folder investigations: at most 1,000,000 nodes per snapshot. Whole-drive scans may be too large to save. Export evidence before closing; export is a bounded summary, not a restorable full inventory. One protected baseline survives automatic retention; explicit Clear removes it.");
+        // stay reachable then, without making Clear the only available route,
+        // so this repair row stays outside the collapsed maintenance header.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.history_snapshot.busy,
+                    egui::Button::new("Release or repair baseline protection"),
+                )
+                .clicked()
+                && !self.history_service.unprotect_baseline() {
+                    self.history_busy_toast();
+                }
             ui.label(
-                RichText::new(format!(
-                    "Up to {} and {} items per snapshot; {} disk budget including staging. Oversized scans are skipped with an explanation.",
-                    format_bytes(scan_history::MAX_SNAPSHOT_BYTES as u64),
-                    format_count(scan_history::MAX_NODES as u64),
-                    format_bytes(scan_history::MAX_DISK_BYTES)
-                ))
+                RichText::new(
+                    "Repair releases protection and reloads history without clearing saved scans. Use it when protection metadata cannot be read.",
+                )
                 .small()
                 .color(p.muted),
             );
-            if ui.button("Clear saved scan history").clicked() {
-                if self.history_service.forget_all() {
-                    self.older_scan = None;
-                    self.newer_scan = None;
-                } else {
-                    self.notice = Some("History is busy. Try clearing again when it finishes.".into());
-                }
-            }
         });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!(
+                "{} saved scans · at most {} kept · oldest removed automatically",
+                self.history_snapshot.scans.len(),
+                scan_history::MAX_SNAPSHOTS
+            ))
+            .small()
+            .color(p.muted),
+        );
+        egui::CollapsingHeader::new("History storage & maintenance")
+            .id_salt("history_storage_maintenance")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(format!(
+                    "{} most recent complete scans across all roots · metadata only · stored at the location below",
+                    scan_history::MAX_SNAPSHOTS
+                ));
+                ui.label(self.history_directory.to_string_lossy());
+                ui.label("History is for focused folder investigations: at most 1,000,000 nodes per snapshot. Whole-drive scans may be too large to save. Export evidence before closing; export is a bounded summary, not a restorable full inventory. One protected baseline survives automatic retention; explicit Clear removes it.");
+                ui.label(
+                    RichText::new(format!(
+                        "Up to {} and {} items per snapshot; {} disk budget including staging. Oversized scans are skipped with an explanation.",
+                        format_bytes(scan_history::MAX_SNAPSHOT_BYTES as u64),
+                        format_count(scan_history::MAX_NODES as u64),
+                        format_bytes(scan_history::MAX_DISK_BYTES)
+                    ))
+                    .small()
+                    .color(p.muted),
+                );
+                ui.separator();
+                // Clearing removes every saved scan, the protected baseline
+                // included, and cannot be undone: it takes two deliberate
+                // clicks, and the second one is never under the first.
+                let armed_id = egui::Id::new("clear_saved_history_armed");
+                let armed = ui.data(|d| d.get_temp::<bool>(armed_id).unwrap_or(false));
+                let busy = self.history_snapshot.busy;
+                if !armed {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Clear saved scan history…"))
+                        .clicked()
+                    {
+                        ui.data_mut(|d| d.insert_temp(armed_id, true));
+                    }
+                } else {
+                    ui.label(format!(
+                        "Clear all {} saved scans? This cannot be undone.",
+                        self.history_snapshot.scans.len()
+                    ));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Keep saved scans").clicked() {
+                            ui.data_mut(|d| d.insert_temp(armed_id, false));
+                        }
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(
+                                    RichText::new("Clear all saved scans").color(p.danger),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            ui.data_mut(|d| d.insert_temp(armed_id, false));
+                            if self.history_service.forget_all() {
+                                self.older_scan = None;
+                                self.newer_scan = None;
+                            } else {
+                                self.notice = Some(
+                                    "History is busy. Try clearing again when it finishes.".into(),
+                                );
+                            }
+                        }
+                    });
+                }
+                ui.label(
+                    RichText::new(
+                        "Clear removes every saved scan across all roots, including the protected baseline.",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+            });
     }
 }
 fn change_kind_label(kind: scan_history::ChangeKind) -> &'static str {

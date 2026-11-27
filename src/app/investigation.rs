@@ -8,9 +8,16 @@ pub(super) fn compact(ctx: &egui::Context) -> bool {
 impl DiskScopeApp {
     pub(super) fn requested_path(&self) -> PathBuf {
         if self.path_edited {
-            self.draft_path
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(&self.path_text))
+            // Typed and pasted paths arrive with stray whitespace, and
+            // Explorer's "Copy as path" wraps them in quotes.
+            self.draft_path.clone().unwrap_or_else(|| {
+                let typed = self.path_text.trim();
+                let typed = typed
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map_or(typed, str::trim);
+                PathBuf::from(typed)
+            })
         } else {
             self.root_path.clone()
         }
@@ -31,7 +38,7 @@ impl DiskScopeApp {
                 |ui| {
                     ui.set_min_size(egui::vec2(name_width, 20.0));
                     ui.add(
-                        egui::Label::new(RichText::new("NAME").small().color(p.faint))
+                        egui::Label::new(RichText::new("Name").size(TYPE_LABEL).color(p.muted))
                             .selectable(false),
                     );
                 },
@@ -42,8 +49,12 @@ impl DiskScopeApp {
                 |ui| {
                     ui.set_min_size(egui::vec2(SIZE_WIDTH, 20.0));
                     ui.add(
-                        egui::Label::new(RichText::new("LOGICAL SIZE").small().color(p.faint))
-                            .selectable(false),
+                        egui::Label::new(
+                            RichText::new("Logical size")
+                                .size(TYPE_LABEL)
+                                .color(p.muted),
+                        )
+                        .selectable(false),
                     );
                 },
             );
@@ -145,7 +156,19 @@ impl DiskScopeApp {
             {
                 action = Some(Action::Page(self.visible_offset.saturating_sub(PAGE_SIZE)));
             }
-            ui.label(format!("{} items", snapshot.view.total_rows));
+            // The same position readout as the wide table: with more than
+            // one page, a bare total does not say where you are.
+            let total = snapshot.view.total_rows;
+            ui.label(if total == 0 {
+                "0 items".to_owned()
+            } else {
+                format!(
+                    "{}–{} of {} items",
+                    format_count(self.visible_offset as u64 + 1),
+                    format_count((self.visible_offset + rows.len()).min(total) as u64),
+                    format_count(total as u64)
+                )
+            });
             if ui
                 .add_enabled(
                     self.visible_offset + rows.len() < snapshot.view.total_rows,
@@ -238,8 +261,12 @@ impl DiskScopeApp {
             {
                 self.choose_folder(ui.ctx());
             }
+            let active = self.scan_state().is_active();
             let scan = ui
-                .add_enabled(!self.path_text.trim().is_empty(), egui::Button::new("Scan"))
+                .add_enabled(
+                    !self.path_text.trim().is_empty(),
+                    egui::Button::new(if active { "Rescan" } else { "Scan" }),
+                )
                 .clicked();
             if scan || enter {
                 let path = self.requested_path();
@@ -248,7 +275,10 @@ impl DiskScopeApp {
                 }
             }
             if ui
-                .add_enabled(self.scan_state().is_active(), egui::Button::new("Stop"))
+                .add_enabled(
+                    active && self.scan_state() != ScanState::Cancelling,
+                    egui::Button::new("Stop"),
+                )
                 .clicked()
             {
                 self.cancellation
@@ -256,6 +286,9 @@ impl DiskScopeApp {
                 self.controller.cancel();
             }
         });
+        if self.generation > 0 {
+            self.scan_status_band(ui, p);
+        }
         self.notice_line(ui, p);
     }
 
@@ -323,6 +356,8 @@ impl DiskScopeApp {
                     });
                 });
             } else {
+                // A text-only line: it should not reserve a control's height.
+                let control_height = std::mem::replace(&mut ui.spacing_mut().interact_size.y, 16.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Scanned location").strong());
                     ui.label(self.root_path.to_string_lossy());
@@ -336,8 +371,9 @@ impl DiskScopeApp {
                         }
                         _ => "Discovery in progress · totals are provisional",
                     };
-                    ui.label(RichText::new(label).small().color(p.accent));
+                    ui.label(RichText::new(label).small().color(p.muted));
                 });
+                ui.spacing_mut().interact_size.y = control_height;
             }
             if self.path_edited && std::path::Path::new(&self.path_text) != self.root_path {
                 ui.label(RichText::new("The path above is a draft. These results belong to the scanned location until you select Scan.").small().color(p.muted));
@@ -367,14 +403,14 @@ impl DiskScopeApp {
     }
 
     pub(super) fn compact_navigation(&mut self, ui: &mut egui::Ui, p: Palette) {
-        egui::Panel::top("compact_navigation")
-            .frame(egui::Frame::new().fill(p.side).inner_margin(8.0))
+        let panel = egui::Panel::top("compact_navigation")
+            .frame(egui::Frame::new().fill(p.surface).inner_margin(8.0))
             .show_inside(ui, |ui| {
                 if self.management.busy() {
                     ui.disable();
                 }
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("DiskScope").strong().color(p.accent));
+                    ui.label(RichText::new("DiskScope").strong());
                     ui.menu_button(
                         if self.changes {
                             "Changes"
@@ -418,5 +454,13 @@ impl DiskScopeApp {
                     }
                 });
             });
+        // The compact bar is a plane above the workspace; a hairline makes
+        // the step readable at any width.
+        let edge = panel.response.rect;
+        ui.painter().hline(
+            edge.left()..=edge.right(),
+            edge.bottom(),
+            Stroke::new(1.0_f32, p.border),
+        );
     }
 }

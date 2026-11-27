@@ -28,10 +28,16 @@ impl ScanFeedback {
                 "Ready to explore".into()
             } else {
                 format!(
-                    "{} · {} files · {} errors",
+                    "{} · {} {} · {} {}",
                     state.label(),
                     format_count(progress.files),
-                    format_count(progress.errors_total)
+                    if progress.files == 1 { "file" } else { "files" },
+                    format_count(progress.errors_total),
+                    if progress.errors_total == 1 {
+                        "error"
+                    } else {
+                        "errors"
+                    }
                 )
             };
             self.key = Some(key);

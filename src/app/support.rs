@@ -91,7 +91,8 @@ impl DiskScopeApp {
                         .desired_width(f32::INFINITY),
                 )
                 .labelled_by(label.id);
-                ui.checkbox(
+                ux::checkbox(
+                    ui,
                     &mut self.export_redacted,
                     "Redact paths, incident labels and action details",
                 );
@@ -148,10 +149,12 @@ impl DiskScopeApp {
                     {
                         self.export_busy = true;
                         self.export_feedback = Some("Saving evidence…".into());
-                        let path = self
-                            .export_native_path
-                            .clone()
-                            .unwrap_or_else(|| PathBuf::from(&self.export_path));
+                        let path = self.export_native_path.clone().unwrap_or_else(|| {
+                            // A typed destination may carry stray spaces
+                            // or be relative; say exactly where it goes.
+                            let typed = PathBuf::from(self.export_path.trim());
+                            std::path::absolute(&typed).unwrap_or(typed)
+                        });
                         let snapshot = self.evidence_snapshot();
                         let evidence_context = self.evidence_context();
                         let tx = self.native_tx.clone();
@@ -201,6 +204,16 @@ impl DiskScopeApp {
                     "{} action requests retained · bounded visible rows · new files only",
                     self.action_journal.len()
                 ));
+                // One quiet line states what the file is; the full caveat list
+                // stays collapsed below it. `ui.collapsing` is default-closed.
+                let p = self.preferences.theme.palette();
+                ui.label(
+                    RichText::new(
+                        "Redacted by default · sizes and metadata only, never file contents",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
                 ui.collapsing("Report contents & limits", |ui| {
                     ui.label("Save a bounded JSON summary for the correct incident ticket, using an approved ticket location. Existing files are never overwritten.");
                     ui.label("It includes scan coverage, errors, visible rows and any current action review. It is not a full inventory or restorable comparison baseline.");
@@ -270,14 +283,21 @@ mod tests {
             app.logic(&ctx, &mut eframe::Frame::_new_kittest());
             let output = export_app_frame(&mut app, &ctx, vec![]);
             let update = output.platform_output.accesskit_update.unwrap();
+            // The toast carries the same sentence as a live region for when
+            // no dialog is open; behind this dialog it is the disabled one.
             let (_, status) = update.nodes.iter().find(|(_, node)| node.role() == egui::accesskit::Role::Status
+                && !node.is_disabled()
                 && node.value().is_some_and(|value| value.contains(expected)))
                 .expect("export result must appear in its dialog's status instead of only the disabled background");
             assert!(!status.is_disabled());
             assert_eq!(status.live(), Some(egui::accesskit::Live::Polite));
             assert!(status.is_live_atomic());
             assert!(app.export_open && !app.export_busy);
-            assert!(app.notice.as_ref().unwrap().contains(expected));
+            assert!(
+                app.toasts
+                    .last_text()
+                    .is_some_and(|text| text.contains(expected))
+            );
         }
     }
 
@@ -583,6 +603,9 @@ mod tests {
                 );
                 let texts = test_support::rendered_texts(&output.shapes).join(" ");
                 assert!(texts.contains("Report contents & limits"));
+                assert!(texts.contains(
+                    "Redacted by default · sizes and metadata only, never file contents"
+                ));
                 assert!(!texts.contains("not a full inventory or restorable comparison baseline"));
             }
         }

@@ -364,7 +364,8 @@ pub(super) fn apply_extensions(filter: &mut QueryFilter, text: &str) {
             (NO_EXTENSION.to_string(), tail)
         } else {
             let end = rest.find(is_separator).unwrap_or(rest.len());
-            let token = rest[..end].trim_start_matches('.');
+            // `*.log` is how people write an extension; accept it as `.log`.
+            let token = rest[..end].trim_start_matches(['*', '.']);
             let extension = if token.is_empty() {
                 String::new()
             } else {
@@ -380,7 +381,13 @@ pub(super) fn apply_extensions(filter: &mut QueryFilter, text: &str) {
 }
 
 pub(super) fn apply_type_lens(request: &mut ViewRequest, extension: &str) {
-    apply_extensions(&mut request.filters, extension);
+    // A type bucket is exactly one extension, even when its name holds a
+    // space or a comma that the typed-filter syntax would split on.
+    let extension = extension.trim().to_lowercase();
+    request.filters.extensions.clear();
+    if !extension.is_empty() {
+        request.filters.extensions.push(extension);
+    }
     request.mode = ViewMode::Explorer;
 }
 
@@ -471,13 +478,20 @@ pub(super) enum Command {
     Back,
     Forward,
     Root,
+    Parent,
     Stop,
+    Rescan,
     Pin,
     Filters,
     Theme,
+    MapLayout,
+    StableDisplay,
+    ExportEvidence,
+    KeyboardHelp,
+    Settings,
 }
 impl Command {
-    const ALL: [Command; 12] = [
+    pub(super) const ALL: [Command; 19] = [
         Command::Overview,
         Command::Explorer,
         Command::Largest,
@@ -486,10 +500,17 @@ impl Command {
         Command::Back,
         Command::Forward,
         Command::Root,
+        Command::Parent,
         Command::Stop,
+        Command::Rescan,
         Command::Pin,
         Command::Filters,
         Command::Theme,
+        Command::MapLayout,
+        Command::StableDisplay,
+        Command::ExportEvidence,
+        Command::KeyboardHelp,
+        Command::Settings,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -501,10 +522,48 @@ impl Command {
             Self::Back => "Back",
             Self::Forward => "Forward",
             Self::Root => "Go to scan root",
+            Self::Parent => "Open parent folder",
             Self::Stop => "Stop scan · keep results",
+            Self::Rescan => "Rescan whole location",
             Self::Pin => "Pin / unpin selection",
             Self::Filters => "Edit filters",
             Self::Theme => "Switch theme",
+            Self::MapLayout => "Space map layout",
+            Self::StableDisplay => "Stable display",
+            Self::ExportEvidence => "Export investigation evidence",
+            Self::KeyboardHelp => "Keyboard help",
+            Self::Settings => "Appearance & settings",
+        }
+    }
+    /// The label the palette shows. Toggles say what they will do, computed
+    /// from the state in `facts`; every other command shows [`Self::label`].
+    pub fn label_for(self, facts: &PaletteFacts) -> &'static str {
+        match self {
+            Self::MapLayout => match facts.map_layout {
+                MapLayout::Treemap => "Space map: switch to icicle",
+                MapLayout::Icicle => "Space map: switch to treemap",
+            },
+            Self::StableDisplay => {
+                if facts.stable_updates {
+                    "Stable display: turn off"
+                } else {
+                    "Stable display: turn on"
+                }
+            }
+            _ => self.label(),
+        }
+    }
+    /// Extra texts a query may also match against: both outcomes of a
+    /// toggle, so "icicle" and "treemap" both find the layout command
+    /// whichever way it currently points. Empty for fixed-label commands.
+    fn alt_search_labels(self) -> &'static [&'static str] {
+        match self {
+            Self::MapLayout => &[
+                "space map: switch to icicle",
+                "space map: switch to treemap",
+            ],
+            Self::StableDisplay => &["stable display: turn on", "stable display: turn off"],
+            _ => &[],
         }
     }
 }
@@ -521,6 +580,14 @@ pub(super) struct PaletteFacts {
     pub pins_full: bool,
     pub history_saved: bool,
     pub on_changes_page: bool,
+    /// A native window operation (elevation, a folder picker) is holding the
+    /// UI, so commands that must not interleave with it wait.
+    pub management_busy: bool,
+    /// The visible folder sits below the scan root, so `Parent` can climb.
+    pub can_go_up: bool,
+    /// Current preference and map settings the palette's toggle labels read.
+    pub stable_updates: bool,
+    pub map_layout: MapLayout,
 }
 
 impl Command {
@@ -536,6 +603,26 @@ impl Command {
             Self::Back => (!facts.can_back).then_some("Nothing earlier to go back to."),
             Self::Forward => (!facts.can_forward).then_some("Nothing later to go forward to."),
             Self::Root => (!facts.scan_loaded).then_some("Scan a folder first."),
+            Self::Parent => {
+                if !facts.scan_loaded {
+                    Some("Scan a folder first.")
+                } else {
+                    (!facts.can_go_up).then_some("This folder is the scan root.")
+                }
+            }
+            Self::Rescan => {
+                if !facts.scan_loaded {
+                    Some("Scan a folder first.")
+                } else {
+                    facts
+                        .management_busy
+                        .then_some("Wait for the current window operation to finish.")
+                }
+            }
+            Self::MapLayout => (!facts.scan_loaded).then_some("Scan a folder first."),
+            Self::ExportEvidence => facts
+                .management_busy
+                .then_some("Wait for the current window operation to finish."),
             Self::Pin => {
                 if !facts.has_selection {
                     Some("Select a folder or file first.")
@@ -559,16 +646,99 @@ impl Command {
             | Self::Largest
             | Self::Types
             | Self::Filters
-            | Self::Theme => None,
+            | Self::Theme
+            | Self::StableDisplay
+            | Self::KeyboardHelp
+            | Self::Settings => None,
         }
     }
 }
+
+/// The best tier at which `query` matches `command`, or `None` when it does
+/// not match at all. Smaller is better: `0` exact label, `1` the query starts
+/// a word of the label, `2` substring anywhere, `3` subsequence of the label
+/// characters.
+///
+/// The primary label supports every tier; alternate texts (the other outcome
+/// of a toggle) only exact, word-start and substring matches, so distant
+/// subsequence hits do not pull in unrelated commands.
+pub(super) fn command_rank(query: &str, command: Command) -> Option<u8> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let exact_or_plain = |label: &str| {
+        let label = label.to_lowercase();
+        if label == query {
+            Some(0)
+        } else if starts_a_word(&query, &label) {
+            Some(1)
+        } else if label.contains(query.as_str()) {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let primary = exact_or_plain(command.label()).or_else(|| {
+        let label = command.label().to_lowercase();
+        is_subsequence(&query, &label).then_some(3)
+    });
+    let alternate = command
+        .alt_search_labels()
+        .iter()
+        .filter_map(|label| exact_or_plain(label))
+        .min();
+    [primary, alternate].into_iter().flatten().min()
+}
+
+/// `query` is a prefix of a word of `label` (both pre-lowercased). A word
+/// starts at the label start or after a non-alphanumeric character, so
+/// "scan" starts a word of "stop scan · keep results" but only
+/// substring-matches "rescan this folder".
+fn starts_a_word(query: &str, label: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.starts_with(query))
+}
+
+/// Every character of `query` appears in `label`, in order (both pre-lowercased).
+fn is_subsequence(query: &str, label: &str) -> bool {
+    let mut rest = query;
+    for c in label.chars() {
+        if rest.starts_with(c) {
+            rest = &rest[c.len_utf8()..];
+            if rest.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The commands matching `query`, best matches first. Commands that match at
+/// the same tier keep palette order.
 pub(super) fn command_matches(query: &str) -> Vec<Command> {
     let query = query.trim().to_lowercase();
-    Command::ALL
+    let mut ranked: Vec<(u8, Command)> = Command::ALL
         .into_iter()
-        .filter(|c| c.label().to_lowercase().contains(&query))
-        .collect()
+        .filter_map(|command| Some((command_rank(&query, command)?, command)))
+        .collect();
+    ranked.sort_by_key(|&(rank, _)| rank);
+    ranked.into_iter().map(|(_, command)| command).collect()
+}
+
+/// How many commands the palette remembers having been run.
+pub(super) const PALETTE_RECENTS_LIMIT: usize = 5;
+
+/// Records `command` as the most recently run: moved to the front, deduplicated,
+/// and kept within [`PALETTE_RECENTS_LIMIT`].
+pub(super) fn remember_recent(recents: &mut Vec<Command>, command: Command) {
+    recents.retain(|seen| *seen != command);
+    recents.insert(0, command);
+    recents.truncate(PALETTE_RECENTS_LIMIT);
 }
 
 #[cfg(test)]
@@ -728,6 +898,119 @@ mod tests {
         assert_eq!(command_matches("stop"), [Command::Stop]);
         assert!(command_matches("nonsense").is_empty());
         assert_eq!(command_matches("  ").len(), Command::ALL.len());
+        assert_eq!(
+            command_matches(""),
+            Command::ALL.to_vec(),
+            "an empty query lists every command in palette order"
+        );
+    }
+
+    #[test]
+    fn palette_ranking_prefers_exact_then_word_start_then_substring() {
+        // Exact label, case-insensitive.
+        assert_eq!(command_rank("back", Command::Back), Some(0));
+        assert_eq!(command_rank("LARGEST FILES", Command::Largest), Some(0));
+        // Word-start prefix.
+        assert_eq!(command_rank("largest", Command::Largest), Some(1));
+        assert_eq!(command_rank("scan", Command::Stop), Some(1));
+        // "scan" only cuts into "rescan", not a word start of it.
+        assert_eq!(command_rank("scan", Command::Rescan), Some(2));
+        // Substring that no word starts with.
+        assert_eq!(command_rank("t files", Command::Largest), Some(2));
+        assert_eq!(command_rank("rgest", Command::Largest), Some(2));
+        // No match at all.
+        assert_eq!(command_rank("zzz", Command::Largest), None);
+        // The same query mixing tiers orders word starts before substrings.
+        assert_eq!(
+            command_matches("scan"),
+            [
+                Command::Changes,
+                Command::Root,
+                Command::Stop,
+                Command::Rescan
+            ]
+        );
+        // Ranking only ever reorders; every tier still matches on its own.
+        assert_eq!(command_matches("rescan"), [Command::Rescan]);
+    }
+
+    #[test]
+    fn palette_matches_subsequences_over_the_label_characters() {
+        // l…g…t in order through "largest files".
+        assert_eq!(command_rank("lgt", Command::Largest), Some(3));
+        assert_eq!(command_rank("lgt", Command::Back), None);
+        // Out of order characters never match.
+        assert_eq!(command_rank("tgl", Command::Largest), None);
+        // A subsequence ranks below a substring for the same command.
+        assert!(command_rank("est", Command::Largest) < command_rank("lst", Command::Largest));
+        // The new commands stay findable by their keywords.
+        assert_eq!(command_matches("icicle"), [Command::MapLayout]);
+        assert_eq!(command_matches("treemap"), [Command::MapLayout]);
+        assert_eq!(command_matches("export"), [Command::ExportEvidence]);
+        assert_eq!(command_matches("settings"), [Command::Settings]);
+    }
+
+    #[test]
+    fn toggle_commands_say_what_they_will_do() {
+        let mut facts = facts();
+        facts.map_layout = MapLayout::Treemap;
+        assert_eq!(
+            Command::MapLayout.label_for(&facts),
+            "Space map: switch to icicle"
+        );
+        facts.map_layout = MapLayout::Icicle;
+        assert_eq!(
+            Command::MapLayout.label_for(&facts),
+            "Space map: switch to treemap"
+        );
+        facts.stable_updates = false;
+        assert_eq!(
+            Command::StableDisplay.label_for(&facts),
+            "Stable display: turn on"
+        );
+        facts.stable_updates = true;
+        assert_eq!(
+            Command::StableDisplay.label_for(&facts),
+            "Stable display: turn off"
+        );
+        // Fixed-label commands are unaffected by the facts.
+        assert_eq!(Command::Back.label_for(&facts), Command::Back.label());
+    }
+
+    #[test]
+    fn recents_move_to_the_front_dedupe_and_cap_at_five() {
+        let mut recents = vec![
+            Command::Overview,
+            Command::Explorer,
+            Command::Largest,
+            Command::Types,
+            Command::Changes,
+        ];
+        // A fresh command goes to the front and drops the oldest.
+        remember_recent(&mut recents, Command::Back);
+        assert_eq!(
+            recents,
+            [
+                Command::Back,
+                Command::Overview,
+                Command::Explorer,
+                Command::Largest,
+                Command::Types,
+            ]
+        );
+        // Running an already-recent command moves it up without duplicating.
+        remember_recent(&mut recents, Command::Largest);
+        assert_eq!(
+            recents,
+            [
+                Command::Largest,
+                Command::Back,
+                Command::Overview,
+                Command::Explorer,
+                Command::Types,
+            ]
+        );
+        assert_eq!(recents.len(), PALETTE_RECENTS_LIMIT);
     }
 
     #[test]
@@ -1234,6 +1517,10 @@ mod tests {
             pins_full: false,
             history_saved: true,
             on_changes_page: false,
+            management_busy: false,
+            can_go_up: true,
+            stable_updates: false,
+            map_layout: MapLayout::Treemap,
         }
     }
 
@@ -1317,6 +1604,48 @@ mod tests {
                     ..facts()
                 },
             ),
+            (
+                Command::Rescan,
+                PaletteFacts {
+                    scan_loaded: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Rescan,
+                PaletteFacts {
+                    management_busy: true,
+                    ..facts()
+                },
+            ),
+            (
+                Command::ExportEvidence,
+                PaletteFacts {
+                    management_busy: true,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Parent,
+                PaletteFacts {
+                    scan_loaded: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::Parent,
+                PaletteFacts {
+                    can_go_up: false,
+                    ..facts()
+                },
+            ),
+            (
+                Command::MapLayout,
+                PaletteFacts {
+                    scan_loaded: false,
+                    ..facts()
+                },
+            ),
         ];
         for (command, facts) in blocked {
             let reason = command.unavailable(&facts);
@@ -1368,5 +1697,28 @@ mod tests {
         );
         assert_eq!(forward.selected, Some(8));
         assert_eq!(forward.filters.extensions, [".rs"]);
+    }
+
+    #[test]
+    fn extension_filter_accepts_the_glob_form_people_type() {
+        let mut filter = QueryFilter::default();
+        apply_extensions(&mut filter, "*.log, .tmp");
+        assert_eq!(filter.extensions, [".log", ".tmp"]);
+    }
+
+    #[test]
+    fn palette_finds_the_layout_toggle_by_its_visible_label() {
+        assert!(command_matches("space map: switch to icicle").contains(&Command::MapLayout));
+        assert!(command_matches("space map: switch").contains(&Command::MapLayout));
+    }
+
+    #[test]
+    fn a_type_lens_is_one_extension_even_with_a_space_or_comma() {
+        let mut request = ViewRequest::default();
+        apply_type_lens(&mut request, ".tar gz");
+        assert_eq!(request.filters.extensions, [".tar gz"]);
+        apply_type_lens(&mut request, ".a,b");
+        assert_eq!(request.filters.extensions, [".a,b"]);
+        assert_eq!(request.mode, ViewMode::Explorer);
     }
 }

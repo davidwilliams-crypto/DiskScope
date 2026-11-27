@@ -102,6 +102,10 @@ fn main() {
         let mut options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_title(format!("DiskScope {}", env!("CARGO_PKG_VERSION")))
+                // An empty icon stops eframe from installing its own default
+                // mark. DiskScope's icon comes from the executable's embedded
+                // resource once the window exists (app::native).
+                .with_icon(std::sync::Arc::new(eframe::egui::IconData::default()))
                 .with_inner_size([1440.0, 900.0])
                 .with_min_inner_size([900.0, 640.0]),
             renderer: eframe::Renderer::Glow,

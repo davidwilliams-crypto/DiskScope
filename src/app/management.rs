@@ -437,7 +437,7 @@ impl DiskScopeApp {
 
     pub(super) fn access_controls(&mut self, ui: &mut egui::Ui, p: Palette) {
         let (label, explanation) = self.access_mode.indicator();
-        ui.label(RichText::new(label).small().color(p.accent))
+        ui.label(RichText::new(label).small().color(p.muted))
             .on_hover_text(explanation);
         // An elevated window cannot be elevated again, and an always-elevated
         // account has no ordinary window to return to either.
@@ -449,6 +449,11 @@ impl DiskScopeApp {
                         && self.session_policy == SessionPolicy::default(),
                     egui::Button::new("Restart as administrator…").small(),
                 )
+                .on_disabled_hover_text(if self.session_policy != SessionPolicy::default() {
+                    "To keep this session's restrictions, launch DiskScope as administrator with the same --helpdesk or --no-history switch."
+                } else {
+                    "Wait for the current operation to finish."
+                })
                 .clicked()
         {
             self.restart_as_administrator(ui.ctx());
@@ -464,6 +469,22 @@ impl DiskScopeApp {
             if self.session_policy != SessionPolicy::default() {
                 self.notice = Some("To retain this session's restrictions, launch DiskScope as administrator with the same --helpdesk or --no-history switch. Elevated windows never save profile data.".into());
             }
+            return;
+        }
+        // Restarting closes this window. Whatever lives only in this
+        // session goes with it, so say so once before doing it.
+        let session_data = self.action_journal.len() > 0
+            || !self.incident_ticket.trim().is_empty()
+            || !self.endpoint_label.trim().is_empty();
+        let warned_id = egui::Id::new("administrator_restart_warned");
+        if session_data && !ctx.data(|d| d.get_temp::<bool>(warned_id).unwrap_or(false)) {
+            ctx.data_mut(|d| d.insert_temp(warned_id, true));
+            // A toast, because this button also lives in Settings, where
+            // the header's notice line is dimmed behind the dialog.
+            self.toasts.push(
+                toasts::ToastKind::Warning,
+                "Restarting closes this window and discards this session's action journal and incident details. Export evidence first, or choose Restart as administrator again to continue.",
+            );
             return;
         }
         self.management.elevating = true;
@@ -488,7 +509,7 @@ impl DiskScopeApp {
             return;
         }
         ui.add_space(12.0);
-        overline(ui, "FILE ACTIONS", p);
+        overline(ui, "File actions", p);
         self.file_action_buttons(ui, row);
         if let Some(reason) = self.action_unavailable(row, FileAction::Recycle) {
             ui.label(RichText::new(reason).small().color(p.muted));
@@ -516,8 +537,14 @@ impl DiskScopeApp {
     }
 
     pub(super) fn file_action_keyboard(&mut self, ctx: &egui::Context) {
+        // Only a focused text field owns Delete. A focused table row or
+        // button must not swallow it: clicking a file focuses its row, and
+        // Delete is then exactly the key the user means.
+        // The selection must also be on screen: the Changes page does not
+        // show it, so Delete there would act on a file the user cannot see.
         if self.management.busy()
-            || ctx.egui_wants_keyboard_input()
+            || ctx.text_edit_focused()
+            || self.changes
             || self.palette_open
             || self.settings_open
             || self.filter_open
@@ -559,9 +586,10 @@ impl DiskScopeApp {
         } else {
             None
         };
+        // An unavailable action still answers the key: `prepare_file_action`
+        // states the reason in the notice line instead of doing nothing.
         if let Some(action) = action
             && let Some(row) = self.visible.view.selected.clone()
-            && self.action_unavailable(&row, action).is_none()
         {
             self.prepare_file_action(row, action, ctx);
         }
@@ -575,6 +603,11 @@ impl DiskScopeApp {
         let Some(identity) = row.identity else {
             return;
         };
+        // Measure free space now, while the confirmation is being read, so
+        // the outcome compares against a sample from just before the action.
+        let _ = self
+            .volume_tx
+            .try_send((self.generation, self.root_path.clone()));
         self.management.sequence = self.management.sequence.wrapping_add(1);
         let binding = Binding {
             sequence: self.management.sequence,
@@ -716,7 +749,23 @@ impl DiskScopeApp {
                     );
                     let before_logical = (self.snapshot.progress.state == ScanState::Complete)
                         .then_some(self.snapshot.progress.logical);
-                    let before_volume = self.volume.zip(self.volume_observed_at);
+                    // Only a sample taken shortly before this action can be
+                    // its "before": an older one would charge hours of other
+                    // drive activity to this file. Without one the card says
+                    // the change is unknown instead of reporting a wrong one.
+                    let action_started = timing
+                        .started
+                        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms));
+                    let before_volume =
+                        self.volume
+                            .zip(self.volume_observed_at)
+                            .filter(|(_, observed)| {
+                                action_started.is_some_and(|started| {
+                                    started
+                                        .duration_since(*observed)
+                                        .is_ok_and(|age| age <= Duration::from_secs(600))
+                                })
+                            });
                     let before_backend = self.snapshot.progress.backend.clone();
                     // begin_scan ignores requests while an operation is active,
                     // so it runs after the operation is cleared and before the
@@ -855,7 +904,7 @@ impl DiskScopeApp {
 
     pub(super) fn management_dialog(&mut self, ctx: &egui::Context, p: Palette) {
         if self.management.elevating {
-            egui::Modal::new(egui::Id::new("administrator_restart")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::new("administrator_restart")).frame(dialog_frame(p)).show(ctx, |ui| {
                 ui.set_max_width(440.0);
                 ui.heading("Restarting as administrator");
                 ui.label("Respond to the Windows permission prompt. Cancelling it keeps this window open.");
@@ -879,8 +928,10 @@ impl DiskScopeApp {
             .running_since
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let modal = egui::Modal::new(egui::Id::new("confirmed_file_action")).show(ctx, |ui| {
-            ui.set_width(470.0);
+        let modal = egui::Modal::new(egui::Id::new("confirmed_file_action")).frame(dialog_frame(p)).show(ctx, |ui| {
+            // Narrow, scaled clients are real: never ask for more width than
+            // the window has.
+            ui.set_width(470.0_f32.min(ctx.content_rect().width() - 72.0).max(200.0));
             match &mut operation {
                 Operation::Preparing(binding) => {
                     ui.heading("Checking the selected file");
@@ -919,7 +970,7 @@ impl DiskScopeApp {
                     ui.add_space(12.0);
                     if permanent {
                         ui.label("This bypasses Recycle Bin. The file cannot be restored from Recycle Bin.");
-                        ui.checkbox(&mut confirmation.acknowledged, "I understand this is permanent");
+                        ux::checkbox(ui, &mut confirmation.acknowledged, "I understand this is permanent");
                         let label = ui.label("Type DELETE to enable permanent deletion:");
                         ui.add(egui::TextEdit::singleline(&mut confirmation.typed).char_limit(6).desired_width(240.0)).labelled_by(label.id);
                     } else {
@@ -934,7 +985,14 @@ impl DiskScopeApp {
                         }
                         cancel = button.clicked();
                         let enabled = !permanent || confirms_permanent(confirmation.acknowledged, &confirmation.typed);
-                        let button = ui.add_enabled(enabled, egui::Button::new(if permanent { "Delete permanently" } else { "Move to Recycle Bin" }));
+                        // The irreversible action reads in the danger colour;
+                        // its words already say what it does.
+                        let label = if permanent {
+                            RichText::new("Delete permanently").color(p.danger)
+                        } else {
+                            RichText::new("Move to Recycle Bin")
+                        };
+                        let button = ui.add_enabled(enabled, egui::Button::new(label));
                         // Enter can arrive as a text-edit completion or carried-over
                         // shortcut. Only an intentional click or Space may confirm.
                         confirm = button.clicked() && !ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -943,7 +1001,12 @@ impl DiskScopeApp {
                 }
             }
         });
-        if cancellable && (cancel || modal.should_close()) {
+        // Only the dialog's own Cancel/OK or Escape (consumed above) closes
+        // it. A click on the backdrop must not: a double-click on a file
+        // action would land there and silently cancel what it just opened,
+        // and a report that needs reading would vanish to a stray click.
+        let _ = modal;
+        if cancellable && cancel {
             self.record_action_cancellation(&operation);
             return;
         }

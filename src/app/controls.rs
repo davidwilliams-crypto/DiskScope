@@ -1,3 +1,4 @@
+use super::state::remember_recent;
 use super::*;
 
 #[derive(Clone, Default)]
@@ -14,6 +15,11 @@ struct PendingDialogRestore {
 
 fn dialog_focus_key(title: &str) -> egui::Id {
     egui::Id::new(("dialog_invoker", title))
+}
+
+/// Where the palette remembers the last [`PALETTE_RECENTS_LIMIT`] commands run.
+fn palette_recents_id() -> egui::Id {
+    egui::Id::new("palette_recents")
 }
 
 /// Call when an invoking control is available, before opening its window.
@@ -129,9 +135,12 @@ pub(super) fn show_dialog<R>(
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<egui::InnerResponse<Option<R>>> {
     let viewport = ctx.content_rect();
+    // Reserve the window's own chrome (its margins and title bar) so the
+    // whole dialog, not just its content, fits the client.
+    let margin = ctx.global_style().spacing.window_margin;
     window
-        .max_width((viewport.width() - 40.0).max(1.0))
-        .max_height((viewport.height() - 80.0).max(1.0))
+        .max_width((viewport.width() - 16.0 - margin.sum().x).max(1.0))
+        .max_height((viewport.height() - 84.0 - margin.sum().y).max(1.0))
         .constrain_to(viewport.shrink(8.0))
         .vscroll(true)
         .show(ctx, |ui| {
@@ -233,7 +242,7 @@ pub(super) fn describe_table_resize_handles(
             ui.painter().vline(
                 response.rect.center().x,
                 response.rect.y_range(),
-                Stroke::new(2.0_f32, p.accent),
+                Stroke::new(2.0_f32, p.focus),
             );
             let delta = ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
@@ -306,15 +315,19 @@ impl DiskScopeApp {
                     )
                     .color(p.muted),
                 );
-                ui.add_space(10.0);
+                ui.add_space(SPACE_3);
                 let label = ui.label("File extensions (comma separated)");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter_extensions)
-                        .hint_text(".mp4, .mkv")
-                        .char_limit(1024)
-                        .desired_width(f32::INFINITY),
-                )
-                .labelled_by(label.id);
+                let extensions = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.filter_extensions)
+                            .hint_text(".mp4, .mkv")
+                            .char_limit(1024)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .labelled_by(label.id);
+                // Enter in any field applies, as a form should.
+                let mut submit =
+                    extensions.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal_wrapped(|ui| {
                     for category in &FILE_CATEGORIES {
                         if ui.small_button(category.label).clicked() {
@@ -337,12 +350,15 @@ impl DiskScopeApp {
                             ),
                         ] {
                             let label = ui.label(label);
-                            ui.add(
-                                egui::TextEdit::singleline(field)
-                                    .desired_width(190.0)
-                                    .hint_text(hint),
-                            )
-                            .labelled_by(label.id);
+                            let edit = ui
+                                .add(
+                                    egui::TextEdit::singleline(field)
+                                        .desired_width(190.0)
+                                        .hint_text(hint),
+                                )
+                                .labelled_by(label.id);
+                            submit |=
+                                edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             ui.end_row();
                         }
                     });
@@ -354,9 +370,9 @@ impl DiskScopeApp {
                     .color(p.muted),
                 );
                 ui.add_space(8.0);
-                if ui.button("Apply filters").clicked() {
+                if ui.button("Apply filters").clicked() || submit {
                     match self.parsed_filter_fields() {
-                        Some((min, max, after, before)) => {
+                        Ok((min, max, after, before)) => {
                             self.remember_context();
                             apply_extensions(&mut self.request.filters, &self.filter_extensions);
                             let f = &mut self.request.filters;
@@ -368,15 +384,11 @@ impl DiskScopeApp {
                             self.mark_query_changed();
                             self.filter_open = false;
                         }
-                        None => {
-                            self.filter_error = Some(
-                                "Check filter values: use positive MiB, valid YYYY-MM-DD dates, and a minimum no greater than the maximum.",
-                            );
-                        }
+                        Err(problem) => self.filter_error = Some(problem),
                     }
                 }
                 if let Some(error) = self.filter_error {
-                    ui.colored_label(p.accent, error);
+                    ui.colored_label(p.danger, error);
                 }
             },
         );
@@ -388,14 +400,24 @@ impl DiskScopeApp {
     }
     /// The size and date fields as filter bounds, or `None` when any field is
     /// invalid or a minimum exceeds its maximum.
-    fn parsed_filter_fields(&self) -> Option<FilterBounds> {
-        let min = parse_mib(&self.filter_min).ok()?;
-        let max = parse_mib(&self.filter_max).ok()?;
-        let after = parse_date(&self.filter_after, false).ok()?;
-        let before = parse_date(&self.filter_before, true).ok()?;
+    fn parsed_filter_fields(&self) -> Result<FilterBounds, &'static str> {
+        let min = parse_mib(&self.filter_min)
+            .map_err(|_| "Minimum size: enter a positive number of MiB, or leave it empty.")?;
+        let max = parse_mib(&self.filter_max)
+            .map_err(|_| "Maximum size: enter a positive number of MiB, or leave it empty.")?;
+        let after = parse_date(&self.filter_after, false)
+            .map_err(|_| "Modified since: enter a date as YYYY-MM-DD, or leave it empty.")?;
+        let before = parse_date(&self.filter_before, true)
+            .map_err(|_| "Modified through: enter a date as YYYY-MM-DD, or leave it empty.")?;
         let ordered =
             |low: Option<u64>, high: Option<u64>| low.zip(high).is_none_or(|(a, b)| a <= b);
-        (ordered(min, max) && ordered(after, before)).then_some((min, max, after, before))
+        if !ordered(min, max) {
+            return Err("Minimum size cannot be greater than maximum size.");
+        }
+        if !ordered(after, before) {
+            return Err("Modified since cannot be later than Modified through.");
+        }
+        Ok((min, max, after, before))
     }
     pub(super) fn pin(&mut self, id: NodeId) {
         if toggle_pin(&mut self.request.pinned, id) {
@@ -411,6 +433,7 @@ impl DiskScopeApp {
             return;
         }
         remember_dialog_focus(ctx, "Pinned comparison");
+        let had_pins = !self.request.pinned.is_empty();
         let mut open = true;
         show_dialog(
             egui::Window::new("Pinned comparison")
@@ -419,8 +442,10 @@ impl DiskScopeApp {
             ctx,
             |ui| self.comparison_tray(ui, p),
         );
-        self.comparison_open = open;
-        if !open {
+        // With the last pin gone there is nothing left to show; an empty
+        // modal window would only wait to be closed.
+        self.comparison_open = open && !(had_pins && self.request.pinned.is_empty());
+        if !self.comparison_open {
             restore_dialog_focus(ctx, "Pinned comparison");
         }
     }
@@ -462,21 +487,27 @@ impl DiskScopeApp {
                 });
                 ux::size_bar(ui, share(row.logical, max), p.accent, p);
             }
-            ui.label(
-                RichText::new(if snapshot.view.pinned_overlap {
-                    "Overlapping folders selected. Individual values overlap; do not add them."
-                } else {
-                    "Individual logical sizes · allocation may include shared hardlinks. These are not reclaimable-space totals."
-                })
-                .small()
-                .color(p.muted),
-            );
+            // The tray shows the short form; the full sentence survives on the
+            // hover so the caveat is still available without permanent text.
+            let (summary, detail) = if snapshot.view.pinned_overlap {
+                (
+                    "Overlapping folders · values overlap, do not add them.",
+                    "Overlapping folders selected. Individual values overlap; do not add them.",
+                )
+            } else {
+                (
+                    "Logical sizes · not reclaimable-space totals.",
+                    "Individual logical sizes · allocation may include shared hardlinks. These are not reclaimable-space totals.",
+                )
+            };
+            ui.label(RichText::new(summary).small().color(p.muted))
+                .on_hover_text(detail);
         });
     }
     pub(super) fn breakdown(&mut self, ui: &mut egui::Ui, p: Palette) {
         let snapshot = self.visible.clone();
         let view = &snapshot.view;
-        overline(ui, "WHY THIS FOLDER IS LARGE", p);
+        overline(ui, "Why this folder is large", p);
         let max = view.breakdown.iter().map(|r| r.logical).max().unwrap_or(1);
         for item in &view.breakdown {
             ui.horizontal_wrapped(|ui| {
@@ -515,6 +546,10 @@ impl DiskScopeApp {
             pins_full: self.request.pinned.len() >= MAX_PINS,
             history_saved: self.persistence_allowed(),
             on_changes_page: self.changes,
+            management_busy: self.management.busy(),
+            can_go_up: self.visible.view.breadcrumbs.len() >= 2,
+            stable_updates: self.preferences.stable_updates,
+            map_layout: self.request.map_layout,
         }
     }
     fn run_command(&mut self, command: Command, ctx: &egui::Context) {
@@ -523,6 +558,16 @@ impl DiskScopeApp {
         if command.unavailable(&self.palette_facts()).is_some() {
             return;
         }
+        // A command that runs is a command the palette should offer first
+        // next time. Recents live in the egui context, not on the app, so
+        // they never outlive the session.
+        ctx.data_mut(|d| {
+            let mut recents: Vec<Command> = d
+                .get_temp::<Vec<Command>>(palette_recents_id())
+                .unwrap_or_default();
+            remember_recent(&mut recents, command);
+            d.insert_temp(palette_recents_id(), recents);
+        });
         self.palette_open = false;
         restore_dialog_focus(ctx, "Commands");
         match command {
@@ -534,12 +579,14 @@ impl DiskScopeApp {
             Command::Back => self.action(Action::Back),
             Command::Forward => self.action(Action::Forward),
             Command::Root => self.action(Action::Navigate(0)),
+            Command::Parent => self.action(Action::Up),
             Command::Stop => {
                 self.cancellation
                     .request(self.generation, self.snapshot.progress.state);
                 self.controller.cancel();
                 ctx.request_repaint();
             }
+            Command::Rescan => self.begin_scan(self.root_path.clone()),
             Command::Pin => {
                 if let Some(id) = self.request.selected {
                     self.pin(id);
@@ -553,6 +600,27 @@ impl DiskScopeApp {
                 self.preferences.theme = self.preferences.theme.next();
                 self.apply_appearance(ctx);
             }
+            Command::MapLayout => {
+                self.request.map_layout = match self.request.map_layout {
+                    MapLayout::Treemap => MapLayout::Icicle,
+                    MapLayout::Icicle => MapLayout::Treemap,
+                };
+                self.mark_query_changed();
+            }
+            Command::StableDisplay => {
+                // Mirror the Display menu: releasing the hold admits the
+                // update that was held back immediately.
+                self.preferences.stable_updates = !self.preferences.stable_updates;
+                if !self.preferences.stable_updates {
+                    self.apply_pending();
+                }
+            }
+            Command::ExportEvidence => {
+                self.export_open = true;
+                self.export_feedback = None;
+            }
+            Command::KeyboardHelp => self.help_open = true,
+            Command::Settings => self.settings_open = true,
         }
     }
     pub(super) fn keyboard(&mut self, ctx: &egui::Context) {
@@ -562,6 +630,12 @@ impl DiskScopeApp {
             {
                 if self.changes || self.request.mode == ViewMode::Overview {
                     self.destination(ViewMode::Largest);
+                    // The switch used to be silent; a search shortcut that
+                    // also changes pages should say so.
+                    self.toasts.push(
+                        toasts::ToastKind::Info,
+                        "Switched to Largest files to search. Tick Whole scan to search every folder.",
+                    );
                 }
                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("investigation_search")));
             }
@@ -574,10 +648,8 @@ impl DiskScopeApp {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)) {
                 self.action(Action::Forward);
             }
-            if (!ctx.egui_wants_keyboard_input()
-                || ctx.memory(|m| m.focused() == Some(egui::Id::new("investigation_search"))))
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1))
-            {
+            // F1 is not a text-editing key, so it opens help from anywhere.
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
                 self.help_open = true;
             }
         }
@@ -645,6 +717,10 @@ impl DiskScopeApp {
                             .desired_width(f32::INFINITY),
                     )
                     .labelled_by(label.id);
+                // The Enter that activated the Commands button is still in
+                // this frame's input; it opened the palette and must not
+                // also run the first command.
+                let opening = self.palette_focus;
                 if self.palette_focus {
                     response.request_focus();
                     self.palette_focus = false;
@@ -652,8 +728,26 @@ impl DiskScopeApp {
                 if response.changed() {
                     self.palette_index = 0;
                 }
-                let commands = command_matches(&self.palette_query);
                 let facts = self.palette_facts();
+                // An empty query offers recently run commands first, then the
+                // rest; a typed query ranks matches and drops the recents so
+                // relevance beats habit.
+                let query_empty = self.palette_query.trim().is_empty();
+                let recents: Vec<Command> = if query_empty {
+                    ctx.data(|d| {
+                        d.get_temp::<Vec<Command>>(palette_recents_id())
+                            .unwrap_or_default()
+                    })
+                } else {
+                    Vec::new()
+                };
+                let commands: Vec<Command> = if recents.is_empty() {
+                    command_matches(&self.palette_query)
+                } else {
+                    let mut listed = recents.clone();
+                    listed.extend(Command::ALL.into_iter().filter(|c| !recents.contains(c)));
+                    listed
+                };
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                     self.palette_index =
                         (self.palette_index + 1).min(commands.len().saturating_sub(1));
@@ -661,7 +755,13 @@ impl DiskScopeApp {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                     self.palette_index = self.palette_index.saturating_sub(1);
                 }
-                if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Enter belongs to the query field. With focus on the title
+                // bar's close button it must only close the palette, not also
+                // run whichever command happens to be highlighted.
+                if !opening
+                    && (response.has_focus() || response.lost_focus())
+                    && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                {
                     // Enter on a command that cannot run does nothing, and the
                     // palette stays open so its reason stays readable.
                     chosen = commands
@@ -670,22 +770,40 @@ impl DiskScopeApp {
                         .filter(|command| command.unavailable(&facts).is_none());
                 }
                 for (index, command) in commands.iter().enumerate() {
+                    if index == 0 && !recents.is_empty() {
+                        overline(ui, "Recent", p);
+                    }
                     let reason = command.unavailable(&facts);
-                    let mut button = egui::Button::new(command.label())
+                    let mut button = egui::Button::new(command.label_for(&facts))
                         .selected(index == self.palette_index)
                         .fill(if index == self.palette_index {
-                            p.wash
+                            p.tint
                         } else {
-                            p.surface
-                        });
+                            Color32::TRANSPARENT
+                        })
+                        .stroke(Stroke::NONE);
                     if let Some(reason) = reason {
                         button = button.shortcut_text(RichText::new(reason).small().color(p.muted));
                     }
                     let response = ui
                         .add_enabled_ui(reason.is_none(), |ui| {
-                            ui.add_sized([ui.available_width(), 32.0], button)
+                            // Every row reads from the same left edge, whether
+                            // or not it carries a reason on the right.
+                            let width = ui.available_width();
+                            ui.add(button.min_size(egui::vec2(width, 32.0)))
                         })
                         .inner;
+                    if index == self.palette_index
+                        && ctx.input(|i| {
+                            i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowUp)
+                        })
+                    {
+                        // The palette window scrolls its own content when
+                        // the list outgrows short viewports; only a real
+                        // keyboard move asks it to reveal the selection, so
+                        // an already-fitting list never scrolls.
+                        response.scroll_to_me(Some(egui::Align::Min));
+                    }
                     if response.clicked() {
                         chosen = Some(*command);
                     }
@@ -726,35 +844,41 @@ impl DiskScopeApp {
                 .default_width(370.0),
             ctx,
             |ui| {
-                overline(ui, "COLOR THEME", p);
+                overline(ui, "Color theme", p);
                 ui.horizontal_wrapped(|ui| {
                     for theme in Theme::ALL {
                         ui.selectable_value(&mut self.preferences.theme, theme, theme.label());
                     }
                 });
                 ui.add_space(12.0);
-                overline(ui, "TEXT & COMFORT", p);
+                overline(ui, "Text and comfort", p);
                 ui.horizontal_wrapped(|ui| {
                     for scale in TextScale::ALL {
                         ui.selectable_value(&mut self.preferences.text_scale, scale, scale.label());
                     }
                 });
-                ui.checkbox(&mut self.preferences.reduced_motion, "Reduced motion");
-                ui.checkbox(&mut self.preferences.map_focus, "Give the map more room");
-                ui.add_space(12.0);
-                overline(ui, "SCANNING", p);
-                ui.add_enabled(
-                    !self.session_policy.helpdesk,
-                    egui::Checkbox::new(
-                        &mut self.preferences.ntfs_preview,
-                        "NTFS preview acceleration",
-                    ),
-                )
-                .on_hover_text(
-                    "Experimental. Unsupported cases fall back to the normal folder scan.",
+                ux::checkbox(ui, &mut self.preferences.reduced_motion, "Reduced motion");
+                ux::checkbox(
+                    ui,
+                    &mut self.preferences.map_focus,
+                    "Give the map more room",
                 );
                 ui.add_space(12.0);
-                overline(ui, "WINDOWS ACCESS", p);
+                overline(ui, "Scanning", p);
+                ui.add_enabled_ui(!self.session_policy.helpdesk, |ui| {
+                    ux::checkbox(
+                        ui,
+                        &mut self.preferences.ntfs_preview,
+                        "NTFS preview acceleration",
+                    )
+                })
+                .inner
+                .on_hover_text(
+                    "Experimental. Unsupported cases fall back to the normal folder scan.",
+                )
+                .on_disabled_hover_text("Helpdesk sessions always use the normal folder scan.");
+                ui.add_space(12.0);
+                overline(ui, "Windows access", p);
                 self.access_controls(ui, p);
                 ui.label(
                     RichText::new(self.persistence_message())
@@ -844,9 +968,9 @@ impl DiskScopeApp {
                 help_detail(ui, "Exclude drafts", "\"annual report\" -draft", p);
                 ui.separator();
                 ui.label(FILE_ACTION_HELP);
-                ui.add_space(10.0);
+                ui.add_space(SPACE_3);
                 ui.label(
-                    "Map items have names and logical sizes. The table offers the same objects and paths.",
+                    "Map items have names and logical sizes. Click to inspect, double-click a folder to open it, right-click a tile to open it in Explorer, copy its path, or pin it for comparison.",
                 );
             },
         );
@@ -1902,6 +2026,31 @@ mod tests {
         assert_eq!(parse_mib("1.5"), Ok(Some(1572864)));
     }
 
+    #[test]
+    fn filter_errors_name_the_field_that_is_wrong() {
+        let (mut app, _ctx) = idle_app();
+        assert!(app.parsed_filter_fields().is_ok(), "empty fields are valid");
+        app.filter_min = "abc".into();
+        assert!(
+            app.parsed_filter_fields()
+                .unwrap_err()
+                .starts_with("Minimum size")
+        );
+        app.filter_min = "5".into();
+        app.filter_max = "1".into();
+        assert_eq!(
+            app.parsed_filter_fields().unwrap_err(),
+            "Minimum size cannot be greater than maximum size."
+        );
+        app.filter_max.clear();
+        app.filter_before = "2024-13-40".into();
+        assert!(
+            app.parsed_filter_fields()
+                .unwrap_err()
+                .starts_with("Modified through")
+        );
+    }
+
     /// An app with no scan and no history, as at startup.
     fn idle_app() -> (DiskScopeApp, egui::Context) {
         let ctx = egui::Context::default();
@@ -2039,6 +2188,147 @@ mod tests {
     }
 
     #[test]
+    fn palette_runs_the_new_window_and_toggle_commands() {
+        let (mut app, ctx) = idle_app();
+        app.run_command(Command::KeyboardHelp, &ctx);
+        assert!(app.help_open);
+        app.run_command(Command::Settings, &ctx);
+        assert!(app.settings_open);
+        app.run_command(Command::ExportEvidence, &ctx);
+        assert!(app.export_open);
+        // Stable display mirrors the Display menu: turning it off admits the
+        // update that was held back.
+        assert!(!app.preferences.stable_updates);
+        app.run_command(Command::StableDisplay, &ctx);
+        assert!(app.preferences.stable_updates);
+        app.run_command(Command::StableDisplay, &ctx);
+        assert!(!app.preferences.stable_updates);
+        // The map layout toggle needs a scan, then flips and re-queries.
+        app.generation = 1;
+        app.request.map_layout = MapLayout::Treemap;
+        app.request.offset = 8;
+        app.dirty = false;
+        app.run_command(Command::MapLayout, &ctx);
+        assert_eq!(app.request.map_layout, MapLayout::Icicle);
+        assert_eq!((app.request.offset, app.dirty), (0, true));
+        app.run_command(Command::MapLayout, &ctx);
+        assert_eq!(app.request.map_layout, MapLayout::Treemap);
+    }
+
+    #[test]
+    fn palette_rescan_reruns_the_current_root_only_after_a_scan() {
+        let (mut app, ctx) = idle_app();
+        // Without a scan root there is nothing to rescan.
+        app.palette_open = true;
+        app.run_command(Command::Rescan, &ctx);
+        assert!(app.palette_open, "an unavailable command is not run");
+        let scanned = PathBuf::from(r"C:\palette-fixture");
+        app.begin_scan(scanned.clone());
+        let generation = app.generation;
+        app.palette_open = true;
+        app.run_command(Command::Rescan, &ctx);
+        assert!(!app.palette_open);
+        assert_eq!(app.root_path, scanned);
+        assert_ne!(app.generation, generation);
+    }
+
+    #[test]
+    fn palette_parent_opens_the_folder_above_the_current_one() {
+        let (mut app, ctx) = idle_app();
+        // At the scan root there is no parent, and no scan means no folder.
+        app.run_command(Command::Parent, &ctx);
+        assert_eq!(app.request.mode, ViewMode::Overview);
+        app.generation = 1;
+        assert!(Command::Parent.unavailable(&app.palette_facts()).is_some());
+        // One level below the root: the crumbs name the parent, and the
+        // palette command follows them like the toolbar does.
+        let mut snapshot = UiSnapshot::default();
+        snapshot.view.breadcrumbs = vec![
+            (0, "root".into()),
+            (2, "middle".into()),
+            (5, "inside".into()),
+        ];
+        snapshot.view.generation = 1;
+        app.visible = Arc::new(snapshot);
+        assert!(Command::Parent.unavailable(&app.palette_facts()).is_none());
+        app.run_command(Command::Parent, &ctx);
+        assert_eq!(app.request.root, 2);
+        assert_eq!(app.request.mode, ViewMode::Explorer);
+    }
+
+    #[test]
+    fn palette_remembers_recently_run_commands_capped_deduplicated() {
+        let (mut app, ctx) = idle_app();
+        // A refused command is not remembered.
+        app.palette_open = true;
+        app.run_command(Command::Back, &ctx);
+        assert!(
+            ctx.data(|d| d.get_temp::<Vec<Command>>(palette_recents_id()))
+                .is_none()
+        );
+        app.palette_open = false;
+        app.run_command(Command::Theme, &ctx);
+        app.run_command(Command::Settings, &ctx);
+        app.run_command(Command::KeyboardHelp, &ctx);
+        // Running a recent command again moves it to the front, no duplicate.
+        app.run_command(Command::Theme, &ctx);
+        let recents: Vec<Command> = ctx
+            .data(|d| d.get_temp(palette_recents_id()))
+            .unwrap_or_default();
+        assert_eq!(
+            recents,
+            [Command::Theme, Command::KeyboardHelp, Command::Settings]
+        );
+        // The list is capped: the oldest commands fall off the end.
+        for command in [
+            Command::Filters,
+            Command::StableDisplay,
+            Command::Overview,
+            Command::Explorer,
+        ] {
+            app.run_command(command, &ctx);
+        }
+        let recents: Vec<Command> = ctx
+            .data(|d| d.get_temp(palette_recents_id()))
+            .unwrap_or_default();
+        assert_eq!(
+            recents,
+            [
+                Command::Explorer,
+                Command::Overview,
+                Command::StableDisplay,
+                Command::Filters,
+                Command::Theme,
+            ]
+        );
+    }
+
+    #[test]
+    fn palette_offers_recents_first_until_a_query_is_typed() {
+        let (mut app, ctx) = idle_app();
+        app.run_command(Command::Theme, &ctx);
+        app.run_command(Command::Filters, &ctx);
+        app.open_palette();
+        let texts = palette_texts(&mut app, &ctx);
+        assert!(texts.iter().any(|text| text == "Recent"), "{texts:?}");
+        let filters = texts
+            .iter()
+            .position(|text| text == "Edit filters")
+            .expect("the recent command stays listed");
+        let overview = texts
+            .iter()
+            .position(|text| text == "Overview")
+            .expect("every other command is still listed");
+        assert!(filters < overview, "recents precede the rest: {texts:?}");
+        // A typed query drops the group and ranks matches instead.
+        app.palette_open = true;
+        app.palette_query = "over".into();
+        let texts = palette_texts(&mut app, &ctx);
+        assert!(!texts.iter().any(|text| text == "Recent"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Overview"), "{texts:?}");
+    }
+
+    #[test]
     fn comparison_tray_uses_binary_units_and_keeps_exact_bytes_for_hover() {
         let figures = comparison_figures(1_234_567, Some(4096));
         assert_eq!(figures.summary, "1.2 MiB logical · 4.0 KiB allocated");
@@ -2086,6 +2376,16 @@ mod tests {
         assert!(
             !texts.iter().any(|text| text.contains("1,234,567")),
             "raw byte counts belong in the hover text only: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Logical sizes · not reclaimable-space totals."),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("shared hardlinks")),
+            "the long footnote sentence belongs on the hover only: {texts:?}"
         );
     }
 }

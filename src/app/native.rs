@@ -256,3 +256,45 @@ fn read_volume(path: &std::path::Path) -> Option<VolumeSpace> {
 fn read_volume(_path: &std::path::Path) -> Option<VolumeSpace> {
     None
 }
+
+/// Gives the window, and with it the taskbar button and Alt+Tab entry,
+/// DiskScope's own icon. The icon is the multi-size resource that `build.rs`
+/// embeds in the executable, so each surface gets a size drawn for it rather
+/// than a scaled bitmap. Failure leaves whatever icon Windows chose.
+#[cfg(windows)]
+pub(super) fn apply_window_icon(window: std::num::NonZeroIsize) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON, SM_CYICON,
+        SM_CYSMICON, SendMessageW, WM_SETICON,
+    };
+    /// `winresource` stores the application icon under this resource id.
+    const APPLICATION_ICON: usize = 1;
+    let handle = window.get() as *mut core::ffi::c_void;
+    // SAFETY: `handle` is the live main window on its own thread. The module
+    // handle of the running executable is always valid, the resource id is an
+    // integer atom, and LR_SHARED icons are owned and freed by the system.
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        let dpi = GetDpiForWindow(handle).max(96);
+        for (slot, width, height) in [
+            (ICON_BIG, SM_CXICON, SM_CYICON),
+            (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+        ] {
+            let icon = LoadImageW(
+                module,
+                APPLICATION_ICON as *const u16,
+                IMAGE_ICON,
+                GetSystemMetricsForDpi(width, dpi),
+                GetSystemMetricsForDpi(height, dpi),
+                LR_SHARED,
+            );
+            if !icon.is_null() {
+                SendMessageW(handle, WM_SETICON, slot as usize, icon as isize);
+            }
+        }
+    }
+}
+#[cfg(not(windows))]
+pub(super) fn apply_window_icon(_window: std::num::NonZeroIsize) {}
