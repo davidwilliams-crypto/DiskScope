@@ -1,10 +1,12 @@
 name: Hosted Windows candidate installer qualification
 on:
-  # Bootstrap a new workflow without changing the default branch. After this
-  # first run it is also available for explicit workflow_dispatch on a ref.
+  # Every push to the default branch, and explicit workflow_dispatch on a ref.
+  # The Release workflow also calls this, so a release is created only after
+  # the release commit has passed here.
   push:
-    branches: ['codex/helpdesk-assurance-0.3.3']
+    branches: ['main']
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 jobs:

@@ -140,8 +140,19 @@ jobs:
           path: target/release-build/
           if-no-files-found: error
           retention-days: 14
+  validation:
+    # The release commit passes the same gate as a push to main: locked tests
+    # and clippy across the feature matrix, formatting, tooling, native
+    # fixtures, supply chain and compiler floor.
+    uses: ./.github/workflows/windows.yml
+  qualification:
+    # Installer lifecycle, upgrade/rollback and helpdesk tooling on a disposable
+    # hosted Windows Server, built from the release commit.
+    uses: ./.github/workflows/installer-qualification.yml
   publish:
-    needs: build
+    # A release is created only after the attested build and both gates pass
+    # on the release commit.
+    needs: [build, validation, qualification]
     # Publishing only follows a version tag on the project's own repository;
     # workflow_dispatch runs stop after the attested build.
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'davidwilliams-crypto/DiskScope'
@@ -159,7 +170,7 @@ jobs:
         run: |
           cd release/packages
           sha256sum --check --strict SHA256SUMS.txt
-      - name: Create the release
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           # No checkout in this job: name the repository explicitly so gh does
@@ -176,6 +187,9 @@ jobs:
             else
               echo 'The packages are unsigned; Windows may show an unknown-publisher or SmartScreen prompt. Publisher authentication is provided by build provenance attestations:'
             fi
+            echo
+            echo 'Windows validation and hosted installer lifecycle qualification passed on this commit before this release was created. Still pending manual qualification: runtime history-format compatibility, client Windows builds, ScreenConnect/UAC, Narrator and remote sessions, hardware, fleet EDR and publisher signing.'
+            echo
             echo 'Verify a download against its CI build provenance with:'
             echo '```'
             echo "gh attestation verify <file> --repo ${GITHUB_REPOSITORY}"
@@ -186,7 +200,9 @@ jobs:
             cat release/packages/SHA256SUMS.txt
             echo '```'
           } > notes.md
-          gh release create "$TAG" --title "DiskScope ${TAG#v}" --notes-file notes.md \
+          # The draft waits for the repository owner, who owns release
+          # integration and the manual gates listed in the notes.
+          gh release create "$TAG" --draft --title "DiskScope ${TAG#v}" --notes-file notes.md \
             release/packages/DiskScope-*-windows-x64-setup.exe \
             release/packages/DiskScope-*-windows-x64-portable.zip \
             release/packages/INSTALLER_NOTICES.txt \

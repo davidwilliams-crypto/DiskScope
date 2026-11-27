@@ -49,6 +49,9 @@ license results, feature-matrix logs, actual payload parity, hashes and applicab
 installer/deployment qualification. Never overwrite or retag an existing release.
 Run qualification on the exact candidate; a signature and checksum have different
 trust meanings. Record pending gates and supported scope in release notes.
+`release.yml` enforces the hosted part: its `publish` job requires the release
+commit to pass `windows.yml` and `installer-qualification.yml`, creates the release
+as a draft, and leaves promotion to the repository owner.
 
 For a production incident, preserve the exact binary hash, token/session/context,
 coverage, limits and report/privacy mode. Reproduce with disposable fixtures, fix

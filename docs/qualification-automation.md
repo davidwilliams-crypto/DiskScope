@@ -61,10 +61,10 @@ candidate integration run, checks pending/nonpromotion and rejects output reuse.
 Fake/unavailable children and synthetic gate matrices test only the harness's
 failure handling; they are never candidate qualification evidence.
 
-The `installer-qualification.yml` workflow runs on pushes only to the explicit
-test branch `codex/helpdesk-assurance-0.3.3`, or on manual dispatch once registered
-by GitHub. This permits its first run without a default-branch merge. It builds
-the exact checked-out source using Rust 1.92.0 and packages from that payload. Both
+The `installer-qualification.yml` workflow runs on every push to `main`, on manual
+dispatch, and as a required job of `release.yml`; a release is therefore not created
+from a commit that has not passed it. It builds the exact checked-out source using
+Rust 1.92.0 and packages from that payload. Both
 PowerShell hosts must pass the helper suite with junction capability required;
 an unavailable junction test fails this hosted gate. It downloads
 the [official portable NSIS 3.12 ZIP](https://sourceforge.net/projects/nsis/files/NSIS%203/3.12/),
@@ -145,3 +145,8 @@ until it actually passes there. Runtime data-format compatibility, actual client
 builds, ScreenConnect, UAC, Narrator, hardware, fleet EDR and approved publisher
 signing still need their evidence and named review. Do not relabel a green CI
 status as full installer/fleet qualification.
+
+`release.yml` calls both `windows.yml` and `installer-qualification.yml` for the
+release commit. Its `publish` job needs the attested build and both gates, and it
+creates the GitHub release as a draft. The repository owner promotes the draft
+after reviewing the pending manual gates listed in the release notes.

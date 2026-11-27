@@ -2,6 +2,8 @@ name: Windows validation
 on:
   push:
   pull_request:
+  # The Release workflow calls this on the release commit with the same checks.
+  workflow_call:
 permissions:
   contents: read
 jobs:
