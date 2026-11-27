@@ -6,7 +6,7 @@ on:
     inputs:
       validation_file:
         description: 'Validation record shipped inside the packages'
-        default: 'docs/validation-helpdesk-assurance-2026-10-30.md'
+        default: 'docs/validation-preview-0.3.5.md'
 permissions:
   contents: read
 jobs:
@@ -90,7 +90,7 @@ jobs:
           "DISKSCOPE_NSIS=$compiler" >> $env:GITHUB_ENV
       - name: Build the exact checked-out payload
         env:
-          VALIDATION_FILE: ${{ inputs.validation_file || 'docs/validation-helpdesk-assurance-2026-10-30.md' }}
+          VALIDATION_FILE: ${{ inputs.validation_file || 'docs/validation-preview-0.3.5.md' }}
         run: |
           if (-not (Test-Path -LiteralPath $env:VALIDATION_FILE -PathType Leaf)) { throw "Validation record not found: $env:VALIDATION_FILE" }
           ./scripts/build.ps1 -PackageDirectory target/release-build/payload -ValidationFile $env:VALIDATION_FILE

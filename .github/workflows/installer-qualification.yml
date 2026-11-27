@@ -86,7 +86,7 @@ jobs:
             ConvertTo-Json | Set-Content target/hosted-qualification/nsis.json -Encoding utf8
       - name: Build exact checked-out candidate payload and package
         run: |
-          ./scripts/build.ps1 -PackageDirectory target/hosted-qualification/payload -ValidationFile docs/validation-helpdesk-assurance-2026-10-30.md
+          ./scripts/build.ps1 -PackageDirectory target/hosted-qualification/payload -ValidationFile docs/validation-preview-0.3.5.md
           ./scripts/package-release.ps1 -SkipBuild -PackageDirectory target/hosted-qualification/payload -OutputDirectory target/hosted-qualification/packages -NsisCompiler $env:DISKSCOPE_NSIS
       - name: Qualification harness on PowerShell 7 and Windows PowerShell 5.1
         run: |
