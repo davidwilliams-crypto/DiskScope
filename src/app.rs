@@ -1,6 +1,7 @@
 mod accessibility;
 mod changes;
 mod controls;
+pub(crate) mod graphics;
 mod investigation;
 mod journal;
 mod management;
@@ -394,6 +395,8 @@ pub struct DiskScopeApp {
     table_scroll: Option<(usize, Option<Align>)>,
     toasts: toasts::Toasts,
     telemetry: ScanTelemetry,
+    /// The graphics backend rendering this session, shown in Settings.
+    graphics_backend: String,
 }
 impl DiskScopeApp {
     pub fn new_session(
@@ -463,6 +466,7 @@ impl DiskScopeApp {
         };
         let mut app = Self {
             session_policy,
+            graphics_backend: graphics::active(cc),
             scan_started_utc: None,
             scan_finished_utc: None,
             export_open: false,

@@ -31,6 +31,23 @@ commit, archive and per-file SHA-256) live in `assets/fonts/`. The collector
 verifies those hashes and packages `OFL.txt` and `SOURCES.json` under
 `licenses/geist-font-<version>/`; the font binaries are not copied there.
 
+Four supplements required by the Direct3D 12 (`wgpu`) backend are not plain
+upstream files, and `SOURCES.json` says so for each:
+
+- `egui-wgpu-0.34.3/` and `spirv-0.4.0+sdk-1.4.341.0/` hold the repositories'
+  own licence files at each crate's recorded commit.
+- `gpu-descriptor-0.3.2/` and `gpu-descriptor-types-0.2.0/` publish only a short
+  dual-licence `COPYING` whose referred licence files are absent from their
+  repository. The notice is kept exactly as upstream wrote it; the Apache-2.0
+  text is the standard text from apache.org and the MIT notice is assembled from
+  upstream's copyright line and the standard permission text.
+- `hexf-parse-0.2.1/` is CC0-1.0 and declares that only through the `license`
+  field of its manifest; it publishes no licence file. The supplement holds the
+  standard CC0 1.0 legal code and the crate's own manifest.
+
+CC0-1.0 was added to the technical allowlist in `scripts/helpdesk-deny.toml`
+for that crate, with the owner's approval on 27 November 2026.
+
 To verify coverage without building or changing `dist`, capture the same Cargo
 metadata the release script uses and run the collector into the ignored
 `target` directory. `target` does not exist in a checkout that was never built,

@@ -17,7 +17,7 @@ crossbeam-channel = "0.5.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"], optional = true }
+eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wgpu", "persistence"], optional = true }
 egui_extras = { version = "0.34.3", optional = true }
 rfd = { version = "0.15.4", optional = true }
 # Names the HasWindowHandle trait so the main window can own Shell dialogs.

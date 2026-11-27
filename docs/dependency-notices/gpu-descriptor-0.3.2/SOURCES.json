@@ -1,0 +1,28 @@
+{
+  "package": "gpu-descriptor-0.3.2",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/zakarumych/gpu-descriptor",
+  "crate_archive": "https://static.crates.io/crates/gpu-descriptor/gpu-descriptor-0.3.2.crate",
+  "crate_vcs_commit": "bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a",
+  "crate_path_in_vcs": "gpu-descriptor",
+  "files": [
+    {
+      "file": "COPYING",
+      "sha256": "f72143f7e9d9fb8bd336b139fa22f825a299591c29f2f7338c5566347b137613",
+      "source_url": "https://raw.githubusercontent.com/zakarumych/gpu-descriptor/bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a/COPYING",
+      "source_type": "upstream file, unmodified"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "source_type": "standard Apache-2.0 licence text from apache.org; upstream's COPYING refers to license/LICENSE-APACHE, which its repository does not contain"
+    },
+    {
+      "file": "LICENSE-MIT",
+      "sha256": "159a38dd120a38f75c7f7c1f04b120c5b892d4efb8d12071cd81ce0208da7e7f",
+      "source_url": "https://raw.githubusercontent.com/zakarumych/gpu-descriptor/bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a/COPYING",
+      "source_type": "MIT licence notice assembled for this supplement: the copyright line of the upstream COPYING followed by the standard MIT permission text (the text of emilk/egui LICENSE-MIT at commit 65cb282a198d2dd72b6ca2346cc73eba45b7a830); upstream's COPYING refers to license/LICENSE-MIT, which its repository does not contain"
+    }
+  ]
+}

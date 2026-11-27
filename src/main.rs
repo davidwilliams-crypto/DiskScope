@@ -99,34 +99,73 @@ fn main() {
     {
         let root = initial_path;
         let access_mode = app::AccessMode::from_probe(diskscope::admin::is_elevated());
-        let mut options = eframe::NativeOptions {
-            viewport: eframe::egui::ViewportBuilder::default()
-                .with_title(format!("DiskScope {}", env!("CARGO_PKG_VERSION")))
-                // An empty icon stops eframe from installing its own default
-                // mark. DiskScope's icon comes from the executable's embedded
-                // resource once the window exists (app::native).
-                .with_icon(std::sync::Arc::new(eframe::egui::IconData::default()))
-                .with_inner_size([1440.0, 900.0])
-                .with_min_inner_size([900.0, 640.0]),
-            renderer: eframe::Renderer::Glow,
-            ..Default::default()
-        };
-        access_mode.configure_native_options(&mut options);
-        app::configure_session_options(policy, &mut options);
-        if let Err(error) = eframe::run_native(
-            "DiskScope",
-            options,
-            Box::new(move |cc| {
-                Ok(Box::new(app::DiskScopeApp::new_session(
-                    cc,
-                    root,
-                    access_mode,
-                    policy,
-                )))
-            }),
+        let backends = match app::graphics::backends(
+            std::env::var_os(app::graphics::RENDERER_VARIABLE).as_deref(),
         ) {
+            Ok(backends) => backends,
+            Err(error) => startup_error(&error, gui_command, cli::EXIT_ARGUMENT_ERROR),
+        };
+        // The first backend to open a window renders the session. A backend that
+        // cannot start hands over to the next; any other failure is final,
+        // because it would repeat. See src/app/graphics.rs.
+        let mut started = false;
+        let mut failures = Vec::new();
+        for renderer in backends {
+            let mut options = eframe::NativeOptions {
+                viewport: eframe::egui::ViewportBuilder::default()
+                    .with_title(format!("DiskScope {}", env!("CARGO_PKG_VERSION")))
+                    // An empty icon stops eframe from installing its own default
+                    // mark. DiskScope's icon comes from the executable's embedded
+                    // resource once the window exists (app::native).
+                    .with_icon(std::sync::Arc::new(eframe::egui::IconData::default()))
+                    .with_inner_size([1440.0, 900.0])
+                    .with_min_inner_size([900.0, 640.0]),
+                renderer,
+                ..Default::default()
+            };
+            access_mode.configure_native_options(&mut options);
+            app::configure_session_options(policy, &mut options);
+            app::graphics::configure(renderer, &mut options);
+            let root = root.clone();
+            let access_mode = access_mode.clone();
+            let result = eframe::run_native(
+                "DiskScope",
+                options,
+                Box::new(move |cc| {
+                    Ok(Box::new(app::DiskScopeApp::new_session(
+                        cc,
+                        root,
+                        access_mode,
+                        policy,
+                    )))
+                }),
+            );
+            match result {
+                Ok(()) => {
+                    started = true;
+                    break;
+                }
+                Err(error) => {
+                    let try_another = app::graphics::failure_belongs_to_backend(&error);
+                    eprintln!(
+                        "DiskScope: the {} graphics backend could not start: {error}{}",
+                        app::graphics::describes(renderer),
+                        if try_another {
+                            ""
+                        } else {
+                            " (not a backend failure, so no other backend is tried)"
+                        }
+                    );
+                    failures.push((renderer, error));
+                    if !try_another {
+                        break;
+                    }
+                }
+            }
+        }
+        if !started {
             startup_error(
-                &format!("DiskScope could not start: {error}"),
+                &app::graphics::startup_failure(&failures),
                 true,
                 cli::EXIT_FAILURE,
             );

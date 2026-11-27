@@ -1,7 +1,8 @@
 DiskScope 0.3.5 preview - Windows x64
 
-Requires Windows 10 or later on an Intel/AMD x64 PC and an OpenGL 2.0-capable
-graphics driver. The Visual C++ runtime is linked into the executable.
+Requires Windows 10 or later on an Intel/AMD x64 PC and a working graphics driver
+(Direct3D 12 or OpenGL 2.0). DiskScope tries Direct3D 12 first and falls back to
+OpenGL 2.0. The Visual C++ runtime is linked into the executable.
 Extract the entire ZIP before running; no installation is required. Preferences
 and scan history are still stored in your Windows user profile, not beside the EXE.
 A separate setup installer is also available for this release.

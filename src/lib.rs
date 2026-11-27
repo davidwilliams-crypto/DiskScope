@@ -7,6 +7,8 @@ pub mod file_actions;
 pub mod history;
 pub mod icicle;
 pub mod identity;
+#[cfg(test)]
+mod lockfile_tests;
 pub mod model;
 pub mod ntfs;
 pub mod platform;

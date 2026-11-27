@@ -1,0 +1,16 @@
+{
+  "package": "spirv-0.4.0+sdk-1.4.341.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/gfx-rs/rspirv",
+  "crate_archive": "https://static.crates.io/crates/spirv/spirv-0.4.0+sdk-1.4.341.0.crate",
+  "crate_vcs_commit": "8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4",
+  "crate_path_in_vcs": "spirv",
+  "files": [
+    {
+      "file": "LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_url": "https://raw.githubusercontent.com/gfx-rs/rspirv/8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4/LICENSE",
+      "source_type": "upstream file, unmodified"
+    }
+  ]
+}

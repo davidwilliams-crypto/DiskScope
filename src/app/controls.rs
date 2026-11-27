@@ -906,6 +906,20 @@ impl DiskScopeApp {
                     .small()
                     .color(p.muted),
                 );
+                ui.add_space(12.0);
+                overline(ui, "About", p);
+                ui.label(
+                    RichText::new(format!(
+                        "DiskScope {} · Graphics: {}",
+                        env!("CARGO_PKG_VERSION"),
+                        self.graphics_backend
+                    ))
+                    .small()
+                    .color(p.muted),
+                )
+                .on_hover_text(
+                    "DiskScope renders with Direct3D 12 and falls back to OpenGL 2.0 when that backend cannot start. To force one, set the DISKSCOPE_RENDERER environment variable to wgpu or glow before starting.",
+                );
             },
         );
         self.settings_open = open;

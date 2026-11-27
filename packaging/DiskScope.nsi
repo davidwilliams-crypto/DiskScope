@@ -65,7 +65,7 @@ Var NoShortcuts
 !define MUI_ICON "${SETUP_ICON}"
 !define MUI_UNICON "${SETUP_ICON}"
 !define MUI_WELCOMEPAGE_TITLE "Install DiskScope ${APP_VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "DiskScope will be installed for your Windows account.$\r$\n$\r$\nRequires Windows 10 or later on an Intel or AMD 64-bit PC and graphics support for OpenGL 2.0 or later.$\r$\n$\r$\nClose DiskScope before installing or updating. Your scan history and preferences are preserved."
+!define MUI_WELCOMEPAGE_TEXT "DiskScope will be installed for your Windows account.$\r$\n$\r$\nRequires Windows 10 or later on an Intel or AMD 64-bit PC and a graphics driver with Direct3D 12 or OpenGL 2.0 support.$\r$\n$\r$\nClose DiskScope before installing or updating. Your scan history and preferences are preserved."
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
 !define MUI_PAGE_CUSTOMFUNCTION_LEAVE ValidateInstallDirectory
