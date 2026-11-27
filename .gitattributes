@@ -1,2 +1,4 @@
 # Keep upstream notice bytes unchanged so recorded provenance hashes survive checkout.
 docs/dependency-notices/** -text -whitespace
+# Bundled font files and their licence are upstream bytes with recorded hashes.
+assets/fonts/** -text -whitespace

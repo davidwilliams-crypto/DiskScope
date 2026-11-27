@@ -25,6 +25,12 @@ Rust commit, owning installer component, pinned distribution archive URL/hash,
 and notice hash. The compiler binary is excluded. The build script supplies its
 actual compiler release/commit to the notice collector and rejects a mismatch.
 
+The Geist and Geist Mono typefaces embedded in the executable are not Cargo
+packages. Their files, SIL Open Font License text and provenance (release tag,
+commit, archive and per-file SHA-256) live in `assets/fonts/`. The collector
+verifies those hashes and packages `OFL.txt` and `SOURCES.json` under
+`licenses/geist-font-<version>/`; the font binaries are not copied there.
+
 To verify coverage without building or changing `dist`, capture the same Cargo
 metadata the release script uses and run the collector into the ignored
 `target` directory. `target` does not exist in a checkout that was never built,

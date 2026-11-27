@@ -1,0 +1,31 @@
+{
+  "package": "geist-font-1.8.2",
+  "license": "OFL-1.1",
+  "repository": "https://github.com/vercel/geist-font",
+  "tag": "v1.8.2",
+  "commit": "1d6dfdb6e58c0ddd841c1e24e59aef01ec3916e4",
+  "archive": "https://github.com/vercel/geist-font/releases/download/v1.8.2/geist-font-v1.8.2.zip",
+  "archive_sha256": "43ffb66912b1c49e40c371d96e86b3b3dab42db83eb2d0c8a17321210394c4c7",
+  "files": [
+    {
+      "file": "Geist-Regular.ttf",
+      "archive_path": "geist-font/Geist/ttf/Geist-Regular.ttf",
+      "sha256": "6a5d5f9e7dcd8933883cdcb6c76eb99a1d4bae852d6ada979683b573af6adec9"
+    },
+    {
+      "file": "Geist-SemiBold.ttf",
+      "archive_path": "geist-font/Geist/ttf/Geist-SemiBold.ttf",
+      "sha256": "a690e797cf4addbdc7233ff6f1fb8d726a007a38807c5d797cfa2379cab321ac"
+    },
+    {
+      "file": "GeistMono-Regular.ttf",
+      "archive_path": "geist-font/GeistMono/ttf/GeistMono-Regular.ttf",
+      "sha256": "2c01278ad859e862b39d1f618c2272dfd0df7c23d5aab37ff7062cdd615abf83"
+    },
+    {
+      "file": "OFL.txt",
+      "archive_path": "geist-font/OFL.txt",
+      "sha256": "c683bfbcc7e087f5d37a54ef628f10387c451a83ddc459b151403a164ac46c90"
+    }
+  ]
+}

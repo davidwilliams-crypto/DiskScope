@@ -109,6 +109,28 @@ def main() -> int:
         f"[source provenance](licenses/{rust_label}/SOURCES.json). "
         "The compiler executable is not redistributed.\n"
     )
+    # Fonts embedded in the executable are not Cargo packages. Their licence
+    # and provenance travel with the notices; the font binaries do not.
+    fonts_root = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+    font_sources_path = fonts_root / "SOURCES.json"
+    font_sources = json.loads(font_sources_path.read_text(encoding="utf-8"))
+    for item in font_sources["files"]:
+        relative = Path(item["file"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Invalid bundled-font path: {relative}")
+        if hashlib.sha256((fonts_root / relative).read_bytes()).hexdigest() != item["sha256"]:
+            raise ValueError(f"Bundled-font checksum does not match: {relative}")
+    font_label = font_sources["package"]
+    font_target = destination / "licenses" / font_label
+    font_target.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(fonts_root / "OFL.txt", font_target / "OFL.txt")
+    shutil.copy2(font_sources_path, font_target / "SOURCES.json")
+    notice_count += 1
+    lines.append(
+        f"- **Geist and Geist Mono typefaces {font_sources['tag']}** (embedded in the executable): "
+        f"`{font_sources['license']}`; [notices](licenses/{font_label}/); "
+        f"{font_sources['repository']}\n"
+    )
     (destination / "THIRD_PARTY_NOTICES.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"Collected {notice_count} notice files for {len(packages)} packages.")
     if missing:
