@@ -85,8 +85,27 @@ pub enum RecycleBlock {
         size: u64,
         limit: u64,
     },
+    /// The path is too long for the Recycle Bin; Windows would not recycle it.
+    PathTooLong {
+        length: usize,
+        limit: usize,
+    },
     /// The Shell itself did not offer to recycle (the sink vetoed).
     ShellDeclined,
+}
+
+/// The path length, in UTF-16 units, from which Windows does not recycle a
+/// file. On Windows 11 build 26300 it either abandoned the operation or asked
+/// to delete the file permanently before any progress sink ran, so the veto
+/// could not act (docs/validation-recycle-bin-hardening.md, row 9).
+pub const MAX_RECYCLE_PATH_UNITS: usize = 260;
+
+/// `Some` when a path of `units` UTF-16 units is too long for the Recycle Bin.
+pub fn path_too_long(units: usize) -> Option<RecycleBlock> {
+    (units >= MAX_RECYCLE_PATH_UNITS).then_some(RecycleBlock::PathTooLong {
+        length: units,
+        limit: MAX_RECYCLE_PATH_UNITS,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,6 +213,9 @@ impl RecycleBlock {
                 "This file ({}) is too large for this drive's Recycle Bin (limit about {}), so Windows would delete it permanently.",
                 format_size(size),
                 format_size(limit)
+            ),
+            Self::PathTooLong { length, limit } => format!(
+                "Windows does not recycle a file whose path is this long ({length} characters; its limit is {limit}), so it would delete this file permanently or ask you to."
             ),
             Self::ShellDeclined => "Windows did not offer the Recycle Bin for this file (the drive may have no Recycle Bin, or Windows is set to delete files immediately), so it would delete the file permanently.".into(),
         }
@@ -420,6 +442,24 @@ mod tests {
     }
 
     #[test]
+    fn the_path_length_rule_starts_exactly_at_the_windows_limit() {
+        assert_eq!(path_too_long(0), None);
+        assert_eq!(path_too_long(MAX_RECYCLE_PATH_UNITS - 1), None);
+        assert_eq!(
+            path_too_long(MAX_RECYCLE_PATH_UNITS),
+            Some(RecycleBlock::PathTooLong {
+                length: MAX_RECYCLE_PATH_UNITS,
+                limit: MAX_RECYCLE_PATH_UNITS,
+            })
+        );
+        let reason = path_too_long(270).unwrap().reason();
+        assert!(
+            reason.contains("270 characters") && reason.contains("its limit is 260"),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn block_reasons_are_plain_and_truthful() {
         let blocks = [
             RecycleBlock::NoBinOnDrive,
@@ -430,6 +470,10 @@ mod tests {
                 limit: MIB,
             },
             RecycleBlock::TooLarge { size: 0, limit: 0 },
+            RecycleBlock::PathTooLong {
+                length: 270,
+                limit: MAX_RECYCLE_PATH_UNITS,
+            },
             RecycleBlock::ShellDeclined,
         ];
         for block in blocks {

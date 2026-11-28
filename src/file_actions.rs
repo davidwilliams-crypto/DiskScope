@@ -541,9 +541,18 @@ mod native {
         Some(String::from_utf16_lossy(&buffer[..end]))
     }
 
+    /// `HKCU` subkey holding the Recycle Bin settings of `path`'s volume, or
+    /// `None` when the volume cannot be resolved.
+    pub(super) fn recycle_volume_key(path: &Path) -> Option<String> {
+        let drive = path.as_os_str().encode_wide().next()?;
+        let root = [drive, 58, 92, 0];
+        let name = volume_name(&root)?;
+        recycle_policy::volume_guid_braced(&name).map(|guid| format!(r"{BITBUCKET_VOLUMES}\{guid}"))
+    }
+
     /// Gathers the Recycle Bin facts for the file's drive. Every environmental
     /// failure becomes `Unreadable` or `None`; none can refuse by itself.
-    fn recycle_facts(path: &Path) -> RecycleFacts {
+    pub(super) fn recycle_facts(path: &Path) -> RecycleFacts {
         let drive = path.as_os_str().encode_wide().next().unwrap_or(0);
         if drive == 0 {
             return RecycleFacts {
@@ -561,16 +570,12 @@ mod native {
         let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
         let policy_no_recycle = read_dword(HKEY_LOCAL_MACHINE, POLICY_KEY, "NoRecycleFiles")
             .combine(read_dword(HKEY_CURRENT_USER, POLICY_KEY, "NoRecycleFiles"));
-        let name = volume_name(&root);
-        let guid = name.as_deref().and_then(recycle_policy::volume_guid_braced);
-        let (volume_nuke_on_delete, volume_max_capacity_mb) = match guid {
-            Some(guid) => {
-                let key = format!(r"{BITBUCKET_VOLUMES}\{guid}");
-                (
-                    read_dword(HKEY_CURRENT_USER, &key, "NukeOnDelete"),
-                    read_dword(HKEY_CURRENT_USER, &key, "MaxCapacity"),
-                )
-            }
+        let key = recycle_volume_key(path);
+        let (volume_nuke_on_delete, volume_max_capacity_mb) = match key {
+            Some(ref key) => (
+                read_dword(HKEY_CURRENT_USER, key, "NukeOnDelete"),
+                read_dword(HKEY_CURRENT_USER, key, "MaxCapacity"),
+            ),
             None => (Setting::Absent, Setting::Absent),
         };
         let mut total = 0u64;
@@ -587,7 +592,7 @@ mod native {
         RecycleFacts {
             drive_type,
             policy_no_recycle,
-            volume_resolved: guid.is_some(),
+            volume_resolved: key.is_some(),
             volume_nuke_on_delete,
             volume_max_capacity_mb,
             volume_total_bytes: (ok != 0).then_some(total),
@@ -595,6 +600,10 @@ mod native {
     }
 
     pub(super) fn recycle_verdict(path: &Path, logical_size: u64) -> RecycleVerdict {
+        // First, because it needs no setting: a path Windows will not recycle.
+        if let Some(block) = recycle_policy::path_too_long(path.as_os_str().encode_wide().count()) {
+            return RecycleVerdict::Blocked(block);
+        }
         let facts = recycle_facts(path);
         #[cfg(test)]
         eprintln!("DiskScope fixture recycle facts: {facts:?}");
@@ -1123,7 +1132,8 @@ mod tests {
 
     // These fixtures create/read/remove their own workspace files only. They do
     // not invoke the Recycle Bin or inspect any user data.
-    fn fixture() -> (tempfile::TempDir, PathBuf, FileIdentity) {
+    /// A fresh fixture directory inside the verified workspace.
+    fn fixture_directory() -> tempfile::TempDir {
         let directory = tempfile::Builder::new()
             .prefix("DiskScope-recycle-test-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -1139,13 +1149,16 @@ mod tests {
                 .starts_with(&workspace),
             "fixtures must remain inside the verified workspace"
         );
-        let path = directory.path().join("disposable-fixture.txt");
-        fs::write(&path, b"DiskScope disposable recycle policy fixture").unwrap();
+        directory
+    }
+
+    /// The stable identity of an existing regular file, as the scanner records it.
+    fn identity_of(path: &Path) -> FileIdentity {
         let file = fs::OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)
+            .open(path)
             .unwrap();
         let mut info = FILE_ID_INFO::default();
         // SAFETY: live handle and correctly sized output buffer.
@@ -1160,14 +1173,38 @@ mod tests {
             },
             0
         );
-        (
-            directory,
-            path,
-            FileIdentity {
-                volume: info.VolumeSerialNumber,
-                id: info.FileId.Identifier,
-            },
-        )
+        FileIdentity {
+            volume: info.VolumeSerialNumber,
+            id: info.FileId.Identifier,
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, FileIdentity) {
+        fixture_sized(b"DiskScope disposable recycle policy fixture")
+    }
+
+    /// [`fixture`] with a file of exactly `bytes` bytes, for rows that need a size.
+    fn fixture_sized(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, FileIdentity) {
+        let directory = fixture_directory();
+        let path = directory.path().join("disposable-fixture.txt");
+        fs::write(&path, bytes).unwrap();
+        let identity = identity_of(&path);
+        (directory, path, identity)
+    }
+
+    /// Runs one Recycle Bin call on a worker with a deadline, so a prompt of
+    /// Windows' own fails the fixture instead of hanging it. `None` means the
+    /// deadline passed.
+    fn within_twenty_seconds(
+        work: impl FnOnce() -> Result<ActionOutcome, ActionError> + Send + 'static,
+    ) -> Option<Result<ActionOutcome, ActionError>> {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        outcome
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .ok()
     }
 
     #[test]
@@ -1556,6 +1593,307 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Rows 4, 5, 6 and 8 of docs/validation-recycle-bin-hardening.md, the
+    /// preflight half. Reads this host's settings and checks that each one a
+    /// standard user can set produces its own refusal, at the exact size
+    /// boundary. It never calls the Shell, so it is safe under every setting.
+    #[test]
+    #[ignore = "Reads this host's Recycle Bin settings; run on a standard fixed workspace volume"]
+    fn recycle_verdict_names_the_setting_that_refuses_and_stops_at_the_exact_boundary() {
+        use crate::recycle_policy::{MIB, Setting, default_capacity_bytes, recycle_verdict};
+        let (_directory, path, _identity) = fixture();
+        let facts = native::recycle_facts(&path);
+        eprintln!("DiskScope fixture recycle facts: {facts:?}");
+        let verdict = |size| recycle_verdict(&facts, size);
+        let too_large =
+            |size, limit| RecycleVerdict::Blocked(RecycleBlock::TooLarge { size, limit });
+        assert_eq!(
+            facts.drive_type, 3,
+            "run this fixture on a fixed workspace volume"
+        );
+        assert!(
+            facts.volume_resolved,
+            "the workspace volume must resolve to a GUID"
+        );
+        if facts.policy_no_recycle.nonzero() {
+            assert_eq!(
+                verdict(1),
+                RecycleVerdict::Blocked(RecycleBlock::DisabledByPolicy)
+            );
+        } else if facts.volume_nuke_on_delete.nonzero() {
+            assert_eq!(
+                verdict(1),
+                RecycleVerdict::Blocked(RecycleBlock::DeletesImmediately)
+            );
+        } else if let Setting::Value(mb) = facts.volume_max_capacity_mb {
+            // Row 5 is the 4 MiB file under a 1 MiB maximum; row 6 is the boundary.
+            let limit = u64::from(mb) * MIB;
+            eprintln!("DiskScope fixture explicit maximum: {limit} bytes");
+            assert_eq!(verdict(limit), too_large(limit, limit));
+            assert_eq!(verdict(limit + 1), too_large(limit + 1, limit));
+            let four_mib = 4 * MIB;
+            if limit <= four_mib {
+                assert_eq!(verdict(four_mib), too_large(four_mib, limit));
+            } else {
+                assert_eq!(verdict(four_mib), RecycleVerdict::Likely);
+            }
+            if limit > 0 {
+                assert!(!matches!(verdict(limit - 1), RecycleVerdict::Blocked(_)));
+            }
+        } else if let (Setting::Absent, Some(total)) =
+            (facts.volume_max_capacity_mb, facts.volume_total_bytes)
+        {
+            let limit = default_capacity_bytes(total) / MIB * MIB;
+            eprintln!("DiskScope fixture default maximum: {limit} bytes");
+            assert_eq!(verdict(1), RecycleVerdict::Likely);
+            assert_eq!(verdict(limit - 1), RecycleVerdict::Likely);
+            assert_eq!(verdict(limit), too_large(limit, limit));
+        } else {
+            assert_eq!(verdict(1), RecycleVerdict::Unverified);
+        }
+    }
+
+    /// Row 4 of the matrix, the Shell half. With "Remove files immediately" in
+    /// effect and the preflight deliberately bypassed, Windows must not offer
+    /// to recycle, and the sink's refusal must stop it with the file intact.
+    /// Runs only when that setting is already in effect on the workspace
+    /// volume; it changes nothing.
+    #[test]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization, with --test-threads=1"]
+    fn sink_veto_holds_when_windows_would_remove_the_file_immediately() {
+        if crate::admin::is_elevated().unwrap() {
+            eprintln!("elevated token: Recycle is refused earlier; nothing to prove");
+            return;
+        }
+        let (_directory, path, identity) = fixture();
+        let facts = native::recycle_facts(&path);
+        if !facts.volume_nuke_on_delete.nonzero() {
+            eprintln!(
+                "DiskScope fixture: the workspace volume is not set to remove files immediately; nothing to prove"
+            );
+            return;
+        }
+        let before = fs::read(&path).unwrap();
+        let plan = prepare(&path, &identity, before.len() as u64, None).unwrap();
+        assert_eq!(
+            plan.recycle_verdict(),
+            RecycleVerdict::Blocked(RecycleBlock::DeletesImmediately)
+        );
+        let approved = plan.snapshot.clone();
+        let target = plan.path().to_path_buf();
+        let file = native::open_recycle_file(&plan.path).unwrap();
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Bypasses the authoritative gate in file_actions::recycle on purpose.
+            let _ = done.send(
+                shell::recycle(plan, file, None)
+                    .and_then(|report| settle(report, native::presence(&target, &approved))),
+            );
+        });
+        let outcome = outcome.recv_timeout(std::time::Duration::from_secs(20));
+        eprintln!("DiskScope fixture with the preflight bypassed: {outcome:?}");
+        let outcome = outcome
+            .expect("Windows returned within 20 seconds; a prompt of its own would block here");
+        assert_eq!(
+            outcome.unwrap_err(),
+            ActionError::RecycleUnavailable(RecycleBlock::ShellDeclined)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// Row 9 of the matrix. One file at each exact path length around the
+    /// Windows limit: through 259 characters Windows recycles it, and from 260
+    /// the preflight refuses before Windows is asked, because Windows itself
+    /// abandoned the operation or asked to delete the file permanently before
+    /// any sink callback ran (docs/validation-recycle-bin-hardening.md).
+    #[test]
+    #[ignore = "Disposable Recycle Bin integration fixture: run only with explicit test authorization, with --test-threads=1"]
+    fn recycle_stops_at_the_path_length_where_windows_stops_recycling() {
+        use crate::recycle_policy::MAX_RECYCLE_PATH_UNITS;
+        use std::os::windows::ffi::OsStrExt;
+        if crate::admin::is_elevated().unwrap() {
+            eprintln!("elevated token: Recycle is refused earlier; nothing to prove");
+            return;
+        }
+        let (directory, _short, _identity) = fixture();
+        let first = "folder-with-a-long-name-0123456789";
+        let file = "disposable-fixture.txt";
+        let bytes = b"DiskScope disposable long-path recycle fixture";
+        // The plain path is what the product is given; its verbatim twin creates
+        // the folders without needing long-path support in this process.
+        let deep = directory.path().canonicalize().unwrap().join(first);
+        let plain = directory.path().join(first);
+        fs::create_dir(&deep).unwrap();
+        let base = plain.as_os_str().encode_wide().count() + 2 + file.encode_utf16().count();
+        let limit = MAX_RECYCLE_PATH_UNITS;
+        for length in [200, 250, limit - 1, limit, limit + 1, 300, 357] {
+            let second = "x".repeat(length - base);
+            fs::create_dir(deep.join(&second)).unwrap();
+            let target = deep.join(&second).join(file);
+            let shown = plain.join(&second).join(file);
+            fs::write(&target, bytes).unwrap();
+            assert_eq!(shown.as_os_str().encode_wide().count(), length);
+            let identity = identity_of(&target);
+            let plan = prepare(&shown, &identity, bytes.len() as u64, None).unwrap();
+            let verdict = plan.recycle_verdict();
+            eprintln!("DiskScope fixture length {length}: verdict {verdict:?}");
+            if length >= limit {
+                assert_eq!(
+                    verdict,
+                    RecycleVerdict::Blocked(RecycleBlock::PathTooLong { length, limit }),
+                    "a path of {length} characters must be refused before Windows is asked"
+                );
+                assert_eq!(fs::read(&target).unwrap(), bytes);
+                continue;
+            }
+            assert!(
+                !matches!(
+                    verdict,
+                    RecycleVerdict::Blocked(RecycleBlock::PathTooLong { .. })
+                ),
+                "{length} characters is below the limit"
+            );
+            let RecycleVerdict::Likely = verdict else {
+                // Another row's setting is in effect on this volume; not this
+                // fixture's question.
+                continue;
+            };
+            let outcome = within_twenty_seconds(move || recycle(plan, None)).expect(
+                "Windows returned within 20 seconds; no question is expected below the limit",
+            );
+            assert!(
+                matches!(outcome, Ok(ActionOutcome::Recycled { .. })),
+                "{length} characters: {outcome:?}"
+            );
+            assert!(!shown.exists());
+            eprintln!("DiskScope fixture length {length}: recycled");
+        }
+        let _ = fs::remove_dir_all(directory.path().canonicalize().unwrap());
+    }
+
+    /// Sets the per-volume Recycle Bin maximum (MiB) in the user's own registry.
+    fn set_bin_maximum(key: &str, mb: u32) {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, RegCloseKey, RegCreateKeyExW,
+            RegSetValueExW,
+        };
+        let subkey = key.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let name = "MaxCapacity"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: NUL-terminated key name and a writable handle out-parameter.
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut handle,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "the user's own Recycle Bin key must be writable");
+        // SAFETY: the handle was just created; the data is exactly one DWORD.
+        let status = unsafe {
+            RegSetValueExW(
+                handle,
+                name.as_ptr(),
+                0,
+                REG_DWORD,
+                std::ptr::from_ref(&mb).cast(),
+                size_of::<u32>() as u32,
+            )
+        };
+        unsafe { RegCloseKey(handle) };
+        assert_eq!(status, 0);
+    }
+
+    /// Puts the per-volume maximum back when the fixture ends, even by panic.
+    struct RestoreMaximum {
+        key: String,
+        mb: u32,
+    }
+    impl Drop for RestoreMaximum {
+        fn drop(&mut self) {
+            set_bin_maximum(&self.key, self.mb);
+        }
+    }
+
+    /// Row 14 of the matrix. The Bin maximum is raised while this process is
+    /// running, after it has already recycled under the old maximum, and a
+    /// file between the two limits then goes through the normal path. Records
+    /// whether Windows honours the new maximum at once; a stale, stricter
+    /// limit that destroys the file, or a prompt, fails the fixture. Runs only
+    /// when the maximum is already 1 MiB on the workspace volume, and puts
+    /// that value back afterwards.
+    #[test]
+    #[ignore = "Raises the workspace volume's Recycle Bin maximum while it runs; run only with explicit test authorization, with --test-threads=1"]
+    fn bin_maximum_raised_while_running_is_honoured_by_windows() {
+        use crate::recycle_policy::{MIB, Setting};
+        if crate::admin::is_elevated().unwrap() {
+            eprintln!("elevated token: Recycle is refused earlier; nothing to prove");
+            return;
+        }
+        let (directory, path, identity) = fixture();
+        let facts = native::recycle_facts(&path);
+        let Setting::Value(1) = facts.volume_max_capacity_mb else {
+            eprintln!(
+                "DiskScope fixture: the workspace volume's Recycle Bin maximum is not 1 MiB; nothing to prove"
+            );
+            return;
+        };
+        if facts.policy_no_recycle.nonzero() || facts.volume_nuke_on_delete.nonzero() {
+            eprintln!(
+                "DiskScope fixture: the Recycle Bin is switched off for this user; nothing to prove"
+            );
+            return;
+        }
+        let key = native::recycle_volume_key(&path).expect("a resolved volume has a settings key");
+        // Recycle once first, so whatever Windows keeps per process is filled
+        // in under the 1 MiB maximum.
+        let plan = prepare(&path, &identity, fs::metadata(&path).unwrap().len(), None).unwrap();
+        assert!(matches!(
+            within_twenty_seconds(move || recycle(plan, None))
+                .expect("the first recycle returned within 20 seconds")
+                .unwrap(),
+            ActionOutcome::Recycled { .. }
+        ));
+        set_bin_maximum(&key, 64);
+        let _restore = RestoreMaximum { key, mb: 1 };
+        let facts = native::recycle_facts(&path);
+        eprintln!("DiskScope fixture recycle facts after raising: {facts:?}");
+        assert_eq!(facts.volume_max_capacity_mb, Setting::Value(64));
+        drop(directory);
+        let (_directory, path, identity) = fixture_sized(&vec![0u8; 2 * MIB as usize]);
+        let bytes = fs::read(&path).unwrap();
+        let plan = prepare(&path, &identity, bytes.len() as u64, None).unwrap();
+        let verdict = plan.recycle_verdict();
+        eprintln!("DiskScope fixture verdict for 2 MiB under the raised maximum: {verdict:?}");
+        assert_eq!(verdict, RecycleVerdict::Likely);
+        let outcome = within_twenty_seconds(move || recycle(plan, None));
+        eprintln!("DiskScope fixture outcome under the raised maximum: {outcome:?}");
+        match outcome
+            .expect("Windows returned within 20 seconds; a prompt of its own would block here")
+        {
+            Ok(ActionOutcome::Recycled { .. }) => assert!(!path.exists()),
+            Err(
+                error @ (ActionError::DeletedNotRecycled | ActionError::RecycleOutcomeUnconfirmed),
+            ) => {
+                panic!("Windows kept the stale 1 MiB maximum and destroyed a 2 MiB file: {error:?}")
+            }
+            Err(error) => {
+                eprintln!("DiskScope fixture: refused with the file intact: {error:?}");
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+            Ok(other) => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
     #[test]
     #[ignore = "Disposable deletion integration fixture: run only with explicit test authorization"]
     fn permanent_delete_removes_only_the_confirmed_fixture() {
@@ -1927,6 +2265,16 @@ mod outcome_tests {
 
     #[test]
     fn error_messages_tell_the_truth() {
+        let long = ActionError::RecycleUnavailable(RecycleBlock::PathTooLong {
+            length: 270,
+            limit: crate::recycle_policy::MAX_RECYCLE_PATH_UNITS,
+        })
+        .to_string();
+        assert!(
+            long.contains("270 characters") && long.contains("ask you to"),
+            "{long}"
+        );
+        assert!(long.ends_with("Nothing was changed."), "{long}");
         let blocked = ActionError::RecycleUnavailable(RecycleBlock::DeletesImmediately).to_string();
         assert!(blocked.contains("remove files immediately"), "{blocked}");
         assert!(blocked.ends_with("Nothing was changed."), "{blocked}");

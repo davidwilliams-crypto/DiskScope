@@ -21,9 +21,18 @@ if ($IncludeRecycle) {
             throw 'Recycle qualification requires a standard-user interactive lab session.'
         }
     } finally { $identity.Dispose() }
+    # The last four act only when their row's Windows setting is already in
+    # effect (docs/validation-recycle-bin-hardening.md); under default settings
+    # the first checks the size boundary and the third recycles fixtures below
+    # the path-length limit and checks the refusal at and above it, while the
+    # other two report that there is nothing to prove.
     $tests += @('recycle_sends_only_the_confirmed_fixture_to_the_bin',
         'prepared_plan_carries_a_recycle_verdict_that_does_not_block_the_fixture',
-        'sink_veto_leaves_the_file_intact', 'recycle_with_an_owner_window_completes')
+        'sink_veto_leaves_the_file_intact', 'recycle_with_an_owner_window_completes',
+        'recycle_verdict_names_the_setting_that_refuses_and_stops_at_the_exact_boundary',
+        'sink_veto_holds_when_windows_would_remove_the_file_immediately',
+        'recycle_stops_at_the_path_length_where_windows_stops_recycling',
+        'bin_maximum_raised_while_running_is_honoured_by_windows')
 }
 Push-Location $projectRoot
 try {

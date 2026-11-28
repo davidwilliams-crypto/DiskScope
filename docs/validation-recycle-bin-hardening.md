@@ -2,7 +2,9 @@
 
 Date: 27 October 2026. Follows the [27 October 2026 360 review](review-360-2026-10-27.md), open item 1.
 
-**30 October update:** All 11 automated native file-action fixtures now pass on Windows, including real recycling, owned prompts and Shell veto preservation. See [current validation](validation-investigation-ux-2026-10-30.md). The historical evidence below is retained; the hardware/policy matrix remains pending and must not be treated as fully qualified.
+**30 October update:** All 11 automated native file-action fixtures now pass on Windows, including real recycling, owned prompts and Shell veto preservation. See [current validation](validation-investigation-ux-2026-10-30.md). The historical evidence below is retained.
+
+**27 November update:** rows 1, 4, 5, 6, 9 and 14 were run on a standard user's PC; results and the remaining checklist are at the end of this document. Row 9 changed the product: **Windows does not recycle a file whose path reaches 260 characters**, so the preflight now refuses such paths before Windows is asked. Rows 2, 3, 7, 8, 10, 11, 12, 13, 15 and 16 are still open and must not be treated as qualified.
 
 ## The problem
 
@@ -38,28 +40,28 @@ Flags are unchanged from the validated fixture. `FOF_NOCONFIRMATION` and `FOF_NO
 
 None of the Windows-only code was executed. It is type-checked and linted only.
 
-## Windows validation matrix — NOT YET RUN
+## Windows validation matrix
 
-Run on a disposable fixture. Record the Windows build, the DiskScope commit, and for each row the `PreDeleteItem` flags and `PostDeleteItem` destination that the fixture logs. The Observed and Pass columns are intentionally empty; do not fill them in without a run.
+Run on a disposable fixture. Record the Windows build, the DiskScope commit, and for each row the `PreDeleteItem` flags and `PostDeleteItem` destination that the fixture logs. The Observed and Pass columns stay empty for every row that has not been run.
 
 Automated first: `cargo test --locked -- --ignored --test-threads=1 file_actions::tests` (the veto hook is process-wide), then the manual rows.
 
 | # | Scenario | Expected | Observed | Pass |
 |---|---|---|---|---|
-| 1 | Ordinary file on `C:` with default settings | Verdict `Likely`; flags `0x282`; non-null destination; Bin count +1; no extra prompt | | |
+| 1 | Ordinary file on `C:` with default settings | Verdict `Likely`; flags `0x282`; non-null destination; Bin count +1; no extra prompt | 27 Nov 2026, fixed NTFS volume `D:`, Bin settings as Windows wrote them: `Likely`; flags `0x280` (no `0x2` bit on build 26300); `PostDeleteItem` `0x00027008` with a destination; one Bin record per file; no prompt, with and without an owner window | Yes |
 | 2 | USB flash drive reporting `DRIVE_REMOVABLE` | Refused at preparation with an acknowledgement; file intact | | |
 | 3 | USB hard disk reporting `DRIVE_FIXED` | Recycles, or record exactly what Windows does | | |
-| 4 | Volume with "Remove files immediately" (`NukeOnDelete=1`) | Refused at preparation; with the preflight bypassed the sink flag is `0x202` and the veto holds | | |
-| 5 | Bin maximum 1 MB and a 4 MB file; DiskScope started after the change | Refused as too large | | |
-| 6 | Exactly-at-limit and one-over files | Boundary measured; DiskScope refuses at the limit | | |
+| 4 | Volume with "Remove files immediately" (`NukeOnDelete=1`) | Refused at preparation; with the preflight bypassed the sink flag is `0x202` and the veto holds | 27 Nov 2026: `Blocked(DeletesImmediately)` at preparation. Preflight bypassed: `PreDeleteItem` flags `0x200` (the recycle bit is clear), `PostDeleteItem` `0x80004004`, no destination, `RecycleUnavailable(ShellDeclined)`, file unchanged, no prompt | Yes |
+| 5 | Bin maximum 1 MB and a 4 MB file; DiskScope started after the change | Refused as too large | 27 Nov 2026: `Blocked(TooLarge { size: 4194304, limit: 1048576 })` | Yes |
+| 6 | Exactly-at-limit and one-over files | Boundary measured; DiskScope refuses at the limit | 27 Nov 2026: with the maximum at 1 MiB, exactly 1,048,576 bytes and one byte more are refused, one byte less is `Likely` | Yes |
 | 7 | Bypass experiment: call the Shell directly for an oversized file | Record whether Windows prompts under `FOF_WANTNUKEWARNING` without `FOF_NOCONFIRMATION`, whether before or after `PreDeleteItem`, its default button, whether it is in front of DiskScope, and what No and close return. Answering No: `Cancelled`, file present. Answering Yes: `DeletedNotRecycled`, file gone, rescan | | |
-| 8 | `NoRecycleFiles=1` in HKCU, then HKLM | Refused with the policy message | | |
-| 9 | Path of 260 characters or more | Record only; no rule | | |
+| 8 | `NoRecycleFiles=1` in HKCU, then HKLM | Refused with the policy message | 27 Nov 2026: not run. On build 26300 a standard user cannot create the value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer` (access denied); both hives need an administrator | Not run |
+| 9 | Path of 260 characters or more | Record only; no rule | 27 Nov 2026: through 259 characters Windows recycles (flags `0x280`, destination present). From 260 Windows never called the sink: with one long folder name the operation was abandoned (`Cancelled`, file intact); with eight nested folders (357 characters) Windows showed its own "Delete File: Are you sure that you want to permanently delete this file?" with **Yes** first, unanswered after 20 s, file intact. Now refused by the preflight (`PathTooLong`, limit 260) | Recorded; rule added |
 | 10 | ReFS or Dev Drive volume | Record only; no rule | | |
 | 11 | exFAT or FAT32 fixed volume | Record only | | |
 | 12 | "Display delete confirmation dialog" enabled | Record whether an extra prompt appears on the happy path and whether it is owned | | |
 | 13 | Captured owner window on a real glow window | Non-null `HWND` belonging to this process | | |
-| 14 | Bin maximum raised while DiskScope runs | Record whether the Shell's cached value makes it stricter than DiskScope's read | | |
+| 14 | Bin maximum raised while DiskScope runs | Record whether the Shell's cached value makes it stricter than DiskScope's read | 27 Nov 2026: raised from 1 MiB to 64 MiB in the running process after one recycle; the preflight read 64, Windows recycled a 2 MiB file at once (flags `0x280`, destination present). No stricter cached value on build 26300 | Recorded |
 | 15 | Minimise DiskScope while a Shell prompt is up; close DiskScope while one is up | Record behaviour | | |
 | 16 | OneDrive-redirected known folder (Desktop or Documents) | Record only | | |
 
@@ -75,3 +77,34 @@ Decision rules after a run: if the veto test fails, the sink veto is advisory an
 - **Removable drives with a Bin.** The `RecycleBinDrives` policy makes Windows keep a Recycle Bin on removable drives. DiskScope refuses Recycle on any drive that is not fixed, so those users must use Delete permanently. The value's layout is community-sourced, so it is not honoured; refusing is the safe direction.
 - **Other limits.** The `RecycleBinSize` policy percentage and per-folder Bins for locally redirected known folders (`BitBucket\KnownFolder`) can lower the real limit below DiskScope's estimate; they are not read. The total used for the default limit is the quota-aware one from `GetDiskFreeSpaceExW`, as Windows documents, so a disk quota can lower it. Machines whose system drive reports `DRIVE_REMOVABLE` (Windows To Go style) are refused.
 - **Path, not identity.** Presence is checked by path. A path re-created by another process after a destroy reads as present and is reported as a generic failure, never as a false "deleted" claim.
+
+## Run of 27 November 2026
+
+Windows 11 build 10.0.26300, a standard interactive user, NTFS; DiskScope at the commit that adds this section (its fixtures ran on exactly that code). The fixtures lived on the `D:` volume of that PC, so the per-volume settings below are `D:`'s. The driver set one value at a time, ran that row's fixtures, and put the exact previous values back; restoration was proved by reading the values and by comparing `reg.exe query` output from before and after. Windows had already written `MaxCapacity` 50842 and `NukeOnDelete` 0 for that volume (and 99685 for a 1906.74 GiB `C:`; the default-capacity formula estimates 99673 there, so the estimate is the stricter of the two).
+
+| Row | Setting in effect | What the fixtures logged | Result |
+|---|---|---|---|
+| 1 | As Windows wrote them | `Likely`; `SetOperationFlags 0x2098f404`; `PreDeleteItem` flags `0x280`; `PostDeleteItem` `0x00027008`, destination present; with the recycle bit forced clear the sink's `0x80004004` stopped the Shell and the file stayed | Pass |
+| 4 | `NukeOnDelete=1` | Preparation: `Blocked(DeletesImmediately)`. With the preflight bypassed: `PreDeleteItem` flags `0x200`, `PostDeleteItem` `0x80004004`, no destination, `RecycleUnavailable(ShellDeclined)`, file unchanged | Pass |
+| 5, 6 | `MaxCapacity=1` | `TooLarge { size: 4194304, limit: 1048576 }`; the limit itself and one byte over are refused, one byte under is not | Pass |
+| 8 | `NoRecycleFiles` | Not runnable: the policy key is not writable by a standard user on this build | Not run |
+| 9 | Nothing | Lengths 200, 250 and 259: recycled, flags `0x280`. Lengths 260 to 357: no sink callback at all. Separately, a 357-character path of eight nested folders brought up Windows' own permanent-delete question, **Yes** first, before any callback | Recorded; rule added |
+| 14 | `MaxCapacity` 1, then 64 in the same process | After the raise the preflight read 64 and Windows recycled a 2 MiB file (flags `0x280`, destination present) | Recorded |
+
+Two things Windows did that are worth knowing:
+
+- It does not recycle a file whose path reaches 260 characters (`MAX_PATH`). Depending on the shape of the path it abandons the operation or asks to delete the file permanently first, and the sink veto never gets a turn because `PreDeleteItem` is not called. The preflight now refuses such paths (`RecycleBlock::PathTooLong`, limit `MAX_RECYCLE_PATH_UNITS`) and the acknowledgement points to **Delete permanently…**, which keeps its own checkbox and typed `DELETE`.
+- Using the Recycle Bin while a smaller maximum is in effect makes Windows write `NeedToPurge=1` on the volume key. The driver removed it afterwards so the key read as before.
+
+Four fixtures were added to `scripts/test-native-fixtures.ps1 -IncludeRecycle`. Each acts only when its row's setting is already in effect, so the gate is safe under default settings: `recycle_verdict_names_the_setting_that_refuses_and_stops_at_the_exact_boundary`, `sink_veto_holds_when_windows_would_remove_the_file_immediately`, `recycle_stops_at_the_path_length_where_windows_stops_recycling` and `bin_maximum_raised_while_running_is_honoured_by_windows` (the last writes the volume's maximum and puts it back; it runs only when the maximum is already 1 MiB).
+
+### Checklist for the rows still open
+
+Record for each: the Windows build, the DiskScope commit, and the `PreDeleteItem` flags and `PostDeleteItem` destination from the fixture logs (`-- --ignored --exact --test-threads=1 --nocapture`).
+
+1. **Other media** (rows 2 and 3): a USB flash drive that reports `DRIVE_REMOVABLE`, then a USB hard disk that reports `DRIVE_FIXED`, both NTFS. Put the checkout on that volume, or point the fixtures at it, and run the gate with `-IncludeRecycle`. Row 2 must be refused at preparation with the file intact; row 3 records what Windows does.
+2. **An administrator** (rows 8, 10 and 11): set `NoRecycleFiles=1` under `HKLM`, then under `HKCU`, and run the boundary fixture; create a ReFS or Dev Drive volume and an exFAT or FAT32 fixed volume and run the gate there, recording only. Do not use a cloud-sync virtual drive for row 11: it reports `DRIVE_FIXED` with FAT32 but belongs to the sync client.
+3. **A person at the screen** (rows 7, 12, 13 and 15): with `MaxCapacity` at 1 MiB, call the Shell directly for a 4 MiB file and answer the question No, then Yes, noting when it appears, its default button, whether it is in front of DiskScope, and what each answer returns; switch on "Display delete confirmation dialog" and note whether the happy path gains a prompt; pass the real main window as the owner and record its handle; minimise and close DiskScope while a Shell prompt is up.
+4. **OneDrive** (row 16): with Desktop or Documents redirected, record what Windows does with a placeholder.
+
+Decision rules from the first run still open: whether a removable drive with the `RecycleBinDrives` policy recycles (the preflight refuses it today, which stays the safe direction), and whether the default-capacity formula needs a correction factor for volumes of a few terabytes.
